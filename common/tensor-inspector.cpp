@@ -13,8 +13,63 @@ void inspect_tensors_after_loading(llama_model* model, bool inspect_enabled) {
     printf("\n================ Tensor Inspection ================\n");
     printf("Inspecting model tensors...\n");
     
-    // Use the public API to inspect the model tensors
+    // Step 1: Use the public API to inspect the model tensors for basic info
     if (inspect_model_tensors(model)) {
+        // Step 2: Collect tensor allocation information
+        std::vector<tensor_allocation_info> tensor_allocations;
+        
+        // Try to collect tensor info from the model using the llama API
+        // We can use the model's tensor count function if available
+        int tensor_count = llama_model_n_tensors(model);
+        printf("\nFound %d tensors in the model.\n", tensor_count);
+        
+        // Gather info about the largest tensors
+        for (int i = 0; i < tensor_count; i++) {
+            tensor_allocation_info info;
+            
+            // Get tensor name
+            const char* name = llama_model_tensor_name(model, i);
+            if (name) {
+                info.name = name;
+            } else {
+                info.name = "unknown_tensor_" + std::to_string(i);
+            }
+            
+            // Get tensor type and size
+            info.type = llama_model_tensor_type(model, i);
+            
+            // Get tensor dimensions
+            const uint32_t* ne = llama_model_tensor_ne(model, i);
+            int n_dims = llama_model_tensor_n_dims(model, i);
+            
+            // Calculate size
+            size_t size = llama_model_tensor_size(model, i);
+            info.size_bytes = size;
+            
+            // Store dimensions
+            info.ne.clear();
+            for (int d = 0; d < n_dims; d++) {
+                info.ne.push_back(ne[d]);
+            }
+            
+            // Buffer type - we'll assign a placeholder since we can't easily determine from public API
+            info.buffer_type = "CPU"; // Default assumption
+            
+            // We don't have access to the actual data pointer or view status from the public API
+            info.data = nullptr;
+            info.is_view = false;
+            info.view_src = "";
+            
+            tensor_allocations.push_back(info);
+        }
+        
+        // Step 3: Print the collected tensor information
+        if (!tensor_allocations.empty()) {
+            print_tensor_allocations(tensor_allocations);
+        } else {
+            printf("No tensor allocation information available through public API.\n");
+        }
+        
         printf("Tensor inspection completed.\n");
     } else {
         printf("Failed to inspect tensors.\n");
