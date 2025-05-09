@@ -88,7 +88,7 @@ bool common_arg::in_example(enum llama_example ex) {
 }
 
 bool common_arg::is_exclude(enum llama_example ex) {
-    return excludes.find(ex) != examples.end();
+    return excludes.find(ex) != excludes.end();
 }
 
 bool common_arg::get_value_from_env(std::string & output) {
@@ -220,7 +220,7 @@ struct curl_slist_ptr {
 static bool curl_perform_with_retry(const std::string & url, CURL * curl, int max_attempts, int retry_delay_seconds, const char * method_name) {
     int remaining_attempts = max_attempts;
 
-    while (remaining_attempts > > 0) {
+    while (remaining_attempts > 0) {
         LOG_INF("%s: %s %s (attempt %d of %d)...\n", __func__ , method_name, url.c_str(), max_attempts - remaining_attempts + 1, max_attempts);
 
         CURLcode res = curl_easy_perform(curl);
@@ -1471,6 +1471,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "prompt to start generation with; for system message, use -sys",
         [](common_params & params, const std::string & value) {
             params.prompt = value;
+
         }
     ).set_excludes({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
@@ -2329,31 +2330,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
 
             for (const auto & override : string_split<std::string>(value, ',')) {
-                // parse pattern=type
-                auto parts = string_split<std::string>(override, '=');
-                if (parts.size() != 2) {
-                    throw std::invalid_argument(string_format("invalid tensor override: %s, must be pattern=type", override.c_str()));
+                std::string::size_type pos = override.find('=');
+                if (pos == std::string::npos) {
+                    throw std::invalid_argument("invalid value");
                 }
-                const std::string & pattern = parts[0];
-                const std::string & type = parts[1];
+                std::string tensor_name = override.substr(0, pos);
+                std::string buffer_type = override.substr(pos + 1);
 
-                if (buft_list.find(type) == buft_list.end()) {
-                    std::string buft_list_str;
-                    for (const auto & buft : buft_list) {
-                        if (!buft_list_str.empty()) {
-                            buft_list_str += ", ";
-                        }
-                        buft_list_str += buft.first;
+                if (buft_list.find(buffer_type) == buft_list.end()) {
+                    printf("Available buffer types:\n");
+                    for (const auto & it : buft_list) {
+                        printf("  %s\n", ggml_backend_buft_name(it.second));
                     }
-                    throw std::invalid_argument(
-                        string_format("invalid tensor override type: %s, must be one of: %s",
-                        type.c_str(), buft_list_str.c_str()));
+                    throw std::invalid_argument("unknown buffer type");
                 }
-
-                params.tensor_buft_overrides.push_back(llama_model_tensor_buft_override{ pattern.c_str(), buft_list[type] });
+                // FIXME: this leaks memory
+                params.tensor_buft_overrides.push_back({strdup(tensor_name.c_str()), buft_list.at(buffer_type)});
             }
-
-            params.tensor_buft_overrides.push_back({nullptr, nullptr});
         }
     ));
 
@@ -2369,13 +2362,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("check model tensor data for invalid values (default: %s)", params.check_tensors ? "true" : "false"),
         [](common_params & params) {
             params.check_tensors = true;
-        }
-    ));
-    add_opt(common_arg(
-        {"--inspect-tensors"},
-        string_format("inspect tensor allocations and memory usage (default: %s)", params.inspect_tensors ? "true" : "false"),
-        [](common_params & params) {
-            params.inspect_tensors = true;
         }
     ));
     add_opt(common_arg(
