@@ -77,6 +77,8 @@ add_library(${TARGET} STATIC
     sampling.h
     speculative.cpp
     speculative.h
+    tensor-inspector.cpp
+    tensor-inspector.h
     )
 
 if (BUILD_SHARED_LIBS)

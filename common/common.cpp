@@ -8,6 +8,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "tensor-inspector.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -874,6 +875,11 @@ struct common_init_result common_init_from_params(common_params & params) {
         return iparams;
     }
 
+    // Run tensor inspection if requested
+    if (params.inspect_tensors) {
+        inspect_tensors_after_loading(model, true);
+    }
+    
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.reranking) {
