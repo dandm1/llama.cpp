@@ -1452,6 +1452,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s)\n", __func__, ml.use_mmap ? "true" : "false");
 
+    // Print header for tensor allocation table
+    LLAMA_LOG_DEBUG("\n%-50s | %6s | %-7s | %-12s | %-15s %s\n",
+                   "TENSOR NAME", "SIZE", "TYPE", "DEVICE", "BUFFER TYPE", "OVERRIDE");
+    LLAMA_LOG_DEBUG("--------------------------------------------------+--------+---------+--------------+----------------+----------\n");
+
+    // Initialize maps to track memory usage by device
+    std::map<ggml_backend_dev_t, size_t> mem_per_device;
+    std::map<ggml_backend_dev_t, int> tensors_per_device;
+
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices);
     for (auto * dev : devices) {
@@ -1681,10 +1690,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     std::regex pattern(overrides->pattern);
                     if (std::regex_search(tensor_name, pattern)) {
                         buft = overrides->buft;
-                        LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
-                                tensor_name.c_str(),
-                                ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
-                                ggml_backend_buft_name(buft));
+                        // Override debug moved to the tensor allocation table
                         break;
                     }
                 }
@@ -1707,13 +1713,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 buft = ggml_backend_dev_buffer_type(cpu_dev);
             }
 
-            // Log tensor allocation details - with safety checks
+            // Log tensor allocation details in a tabular format - with safety checks
             try {
                 std::string tensor_name = "unknown";
                 std::string type_name = "unknown";
                 std::string dev_name = "unknown";
                 std::string buft_name = "unknown";
                 size_t tensor_size = 0;
+                bool is_override = false;
 
                 try { tensor_name = tn.str(); } catch (...) {}
 
@@ -1729,14 +1736,58 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
                         if (dev) {
                             dev_name = ggml_backend_dev_name(dev) ? ggml_backend_dev_name(dev) : "unknown";
+                        } else {
+                            // Try to identify CPU devices from buffer type name
+                            buft_name = ggml_backend_buft_name(buft) ? ggml_backend_buft_name(buft) : "unknown";
+                            if (buft_name.find("CPU") != std::string::npos ||
+                                buft_name.find("cpu") != std::string::npos ||
+                                buft_name.find("host") != std::string::npos ||
+                                buft_name.find("mmap") != std::string::npos) {
+                                dev_name = "CPU";
+                            }
                         }
                         buft_name = ggml_backend_buft_name(buft) ? ggml_backend_buft_name(buft) : "unknown";
                     }
                 } catch (...) {}
 
-                LLAMA_LOG_DEBUG("Tensor %s: size: %zu MB, type: %s, assigned to device %s with buffer type %s\n",
-                    tensor_name.c_str(), tensor_size/1024/1024, type_name.c_str(),
-                    dev_name.c_str(), buft_name.c_str());
+                // Check if this is an override (buft is different from the first in the list)
+                try {
+                    if (buft_list && !buft_list->empty() && buft != buft_list->front().second) {
+                        is_override = true;
+                    }
+                } catch (...) {}
+
+                // Print in a fixed-width tabular format with override indicator
+                // Track memory per device for the summary at the end
+                ggml_backend_dev_t tracking_dev = nullptr;
+                try {
+                    if (buft) {
+                        tracking_dev = ggml_backend_buft_get_device(buft);
+
+                        // For CPU buffer types that might return NULL device
+                        if (!tracking_dev && (buft_name.find("CPU") != std::string::npos ||
+                                             buft_name.find("cpu") != std::string::npos ||
+                                             buft_name.find("host") != std::string::npos ||
+                                             buft_name.find("mmap") != std::string::npos)) {
+                            tracking_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                        }
+                    }
+                } catch (...) {}
+
+                // Add to device memory tracking if we have a valid device
+                if (tracking_dev && tensor_size > 0) {
+                    mem_per_device[tracking_dev] += tensor_size;
+                    tensors_per_device[tracking_dev]++;
+                }
+
+                // Print tensor info in tabular format
+                LLAMA_LOG_DEBUG("%-50s | %6.2f MB | %-7s | %-12s | %-15s %s\n",
+                    tensor_name.c_str(),
+                    tensor_size/1024.0/1024.0,
+                    type_name.c_str(),
+                    dev_name.c_str(),
+                    buft_name.c_str(),
+                    is_override ? "[OVERRIDE]" : "");
             } catch (...) {
                 LLAMA_LOG_DEBUG("Error logging tensor allocation details\n");
             }
@@ -4288,142 +4339,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // Log overall tensor memory usage by device
-    LLAMA_LOG_DEBUG("\n=== Tensor memory usage summary ===\n");
-    std::map<ggml_backend_dev_t, size_t> mem_per_device;
-    std::map<ggml_backend_dev_t, int> tensors_per_device;
-
-    // Helper function to add tensor memory to the count
-    auto account_tensor = [&](const char* name, ggml_tensor* tensor, ggml_backend_dev_t dev) {
-        if (tensor == nullptr) return;
-        if (dev == nullptr) return;
-
-        try {
-            size_t tensor_size = ggml_nbytes(tensor);
-            mem_per_device[dev] += tensor_size;
-            tensors_per_device[dev]++;
-
-            const char* dev_name = "unknown";
-            try {
-                dev_name = ggml_backend_dev_name(dev);
-                if (dev_name == nullptr) dev_name = "unnamed";
-            } catch (...) {
-                dev_name = "error";
-            }
-
-            LLAMA_LOG_DEBUG("  %-30s: %8.2f MB on device %s\n",
-                name, tensor_size/1024.0/1024.0, dev_name);
-        } catch (...) {
-            LLAMA_LOG_DEBUG("  %-30s: [ERROR processing tensor]\n", name);
-        }
-    };
-
-    // Helper to check the actual device of a tensor based on its buffer
-    auto get_actual_dev = [](ggml_tensor* tensor, ggml_backend_dev_t default_dev) -> ggml_backend_dev_t {
-        if (!tensor || !tensor->buffer) {
-            return default_dev;
-        }
-
-        try {
-            ggml_backend_buffer_type_t actual_buft = ggml_backend_buffer_get_type(tensor->buffer);
-            ggml_backend_dev_t tensor_dev = ggml_backend_buft_get_device(actual_buft);
-
-            if (tensor_dev) {
-                return tensor_dev;
-            }
-        } catch (...) {
-            // In case of error, use the default
-        }
-
-        return default_dev;
-    };
-
-    // Account for token embedding and output tensors - check for overrides
-    account_tensor("input.tok_embd", tok_embd, get_actual_dev(tok_embd, pimpl->dev_input.dev));
-    account_tensor("output.output", output, get_actual_dev(output, pimpl->dev_output.dev));
-    account_tensor("output.output_norm", output_norm, get_actual_dev(output_norm, pimpl->dev_output.dev));
-    if (output_norm_b) account_tensor("output.output_norm_b", output_norm_b, get_actual_dev(output_norm_b, pimpl->dev_output.dev));
-    if (output_b) account_tensor("output.output_b", output_b, get_actual_dev(output_b, pimpl->dev_output.dev));
-
-    // Helper to check and account for a tensor with proper layer info - including override checks
-    auto account_layer_tensor = [&](const char* base_name, ggml_tensor* tensor, ggml_backend_dev_t dev, int layer_idx) {
-        if (tensor) {
-            char full_name[128];
-            snprintf(full_name, sizeof(full_name), "layer_%03d.%s", layer_idx, base_name);
-
-            // Use our helper to determine the actual device by examining the tensor's buffer
-            ggml_backend_dev_t actual_dev = get_actual_dev(tensor, dev);
-
-            account_tensor(full_name, tensor, actual_dev);
-        }
-    };
-
-    // Account for tensors in each layer - more comprehensive and with layer numbers
-    for (int i = 0; i < (int)layers.size(); i++) {
-        auto& layer = layers[i];
-        ggml_backend_dev_t dev = pimpl->dev_layer[i].dev;
-
-        // Attention tensors - norm
-        account_layer_tensor("attn_norm", layer.attn_norm, dev, i);
-        account_layer_tensor("attn_norm_b", layer.attn_norm_b, dev, i);
-        account_layer_tensor("attn_q_norm", layer.attn_q_norm, dev, i);
-        account_layer_tensor("attn_k_norm", layer.attn_k_norm, dev, i);
-        account_layer_tensor("attn_out_norm", layer.attn_out_norm, dev, i);
-        account_layer_tensor("attn_norm_2", layer.attn_norm_2, dev, i);
-        account_layer_tensor("attn_norm_2_b", layer.attn_norm_2_b, dev, i);
-        account_layer_tensor("attn_q_norm_b", layer.attn_q_norm_b, dev, i);
-        account_layer_tensor("attn_k_norm_b", layer.attn_k_norm_b, dev, i);
-        account_layer_tensor("attn_out_norm_b", layer.attn_out_norm_b, dev, i);
-
-        // Attention tensors - main weights
-        account_layer_tensor("wq", layer.wq, dev, i);
-        account_layer_tensor("wk", layer.wk, dev, i);
-        account_layer_tensor("wv", layer.wv, dev, i);
-        account_layer_tensor("wo", layer.wo, dev, i);
-        account_layer_tensor("wqkv", layer.wqkv, dev, i);
-
-        // Attention biases
-        account_layer_tensor("bq", layer.bq, dev, i);
-        account_layer_tensor("bk", layer.bk, dev, i);
-        account_layer_tensor("bv", layer.bv, dev, i);
-        account_layer_tensor("bo", layer.bo, dev, i);
-        account_layer_tensor("bqkv", layer.bqkv, dev, i);
-
-        // FFN tensors - weights
-        account_layer_tensor("ffn_norm", layer.ffn_norm, dev, i);
-        account_layer_tensor("ffn_gate", layer.ffn_gate, dev, i);
-        account_layer_tensor("ffn_down", layer.ffn_down, dev, i);
-        account_layer_tensor("ffn_up", layer.ffn_up, dev, i);
-
-        // FFN biases
-        account_layer_tensor("ffn_norm_b", layer.ffn_norm_b, dev, i);
-        account_layer_tensor("ffn_gate_b", layer.ffn_gate_b, dev, i);
-        account_layer_tensor("ffn_down_b", layer.ffn_down_b, dev, i);
-        account_layer_tensor("ffn_up_b", layer.ffn_up_b, dev, i);
-
-        // MoE tensors
-        account_layer_tensor("ffn_gate_inp", layer.ffn_gate_inp, dev, i);
-        account_layer_tensor("ffn_gate_exps", layer.ffn_gate_exps, dev, i);
-        account_layer_tensor("ffn_down_exps", layer.ffn_down_exps, dev, i);
-        account_layer_tensor("ffn_up_exps", layer.ffn_up_exps, dev, i);
-
-        // Rope tensors
-        account_layer_tensor("rope_freqs", layer.rope_freqs, dev, i);
-        account_layer_tensor("rope_long", layer.rope_long, dev, i);
-        account_layer_tensor("rope_short", layer.rope_short, dev, i);
-
-        // Scale tensors for bitnet etc.
-        account_layer_tensor("wq_scale", layer.wq_scale, dev, i);
-        account_layer_tensor("wk_scale", layer.wk_scale, dev, i);
-        account_layer_tensor("wv_scale", layer.wv_scale, dev, i);
-        account_layer_tensor("wo_scale", layer.wo_scale, dev, i);
-        account_layer_tensor("ffn_gate_scale", layer.ffn_gate_scale, dev, i);
-        account_layer_tensor("ffn_up_scale", layer.ffn_up_scale, dev, i);
-        account_layer_tensor("ffn_down_scale", layer.ffn_down_scale, dev, i);
-
-        // Only report the 3 largest tensors per layer in the detailed log
-    }
-
     // Print summary by device - with added safety
     LLAMA_LOG_DEBUG("\n=== Memory usage by device ===\n");
 
@@ -4477,38 +4392,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // Print total
     LLAMA_LOG_DEBUG("\nTotal memory used: %.2f MB in %d tensors\n",
         total_memory/1024.0/1024.0, total_tensors);
-
-    // If tensor overrides are used, include that information in the summary
-    if (pimpl->has_tensor_overrides && ml.tensor_buft_overrides) {
-        LLAMA_LOG_DEBUG("\nTensor override patterns used:\n");
-
-        // Count how many patterns target each device for a concise summary
-        std::map<std::string, int> override_patterns_by_name;
-
-        for (const auto * overrides = ml.tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
-            try {
-                if (overrides->buft) {
-                    ggml_backend_dev_t dev = ggml_backend_buft_get_device(overrides->buft);
-                    if (dev) {
-                        std::string dev_name = ggml_backend_dev_name(dev) ? ggml_backend_dev_name(dev) : "unnamed";
-                        override_patterns_by_name[dev_name]++;
-                    }
-
-                    // Print each pattern for detailed debugging
-                    const char* buft_name = ggml_backend_buft_name(overrides->buft);
-                    LLAMA_LOG_DEBUG("  Pattern: %-40s -> %s\n",
-                        overrides->pattern,
-                        buft_name ? buft_name : "unknown");
-                }
-            } catch (...) {}
-        }
-
-        // Print a summary of patterns by device
-        LLAMA_LOG_DEBUG("\nOverride summary by device:\n");
-        for (const auto& [dev_name, count] : override_patterns_by_name) {
-            LLAMA_LOG_DEBUG("  %s: %d patterns\n", dev_name.c_str(), count);
-        }
-    }
 
     return true;
 }
@@ -13451,7 +13334,7 @@ llm_graph_result_ptr llama_model::build_graph(
     llm->build_pooling(gf, cls, cls_b, cls_out, cls_out_b);
 
     // Log tensor dependencies
-    bool debug_tensors = true; // Set to true to enable tensor dependency logging
+    bool debug_tensors = false; // Set to true to enable tensor dependency logging
     if (debug_tensors) {
         LLAMA_LOG_DEBUG("\n=== Tensor dependencies in computation graph ===\n");
 
