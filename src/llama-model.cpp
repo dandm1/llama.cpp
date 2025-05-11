@@ -4268,13 +4268,26 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // Helper function to add tensor memory to the count
     auto account_tensor = [&](const char* name, ggml_tensor* tensor, ggml_backend_dev_t dev) {
         if (tensor == nullptr) return;
+        if (dev == nullptr) return;
 
-        size_t tensor_size = ggml_nbytes(tensor);
-        mem_per_device[dev] += tensor_size;
-        tensors_per_device[dev]++;
+        try {
+            size_t tensor_size = ggml_nbytes(tensor);
+            mem_per_device[dev] += tensor_size;
+            tensors_per_device[dev]++;
 
-        LLAMA_LOG_DEBUG("  %-30s: %8.2f MB on device %s\n",
-            name, tensor_size/1024.0/1024.0, ggml_backend_dev_name(dev));
+            const char* dev_name = "unknown";
+            try {
+                dev_name = ggml_backend_dev_name(dev);
+                if (dev_name == nullptr) dev_name = "unnamed";
+            } catch (...) {
+                dev_name = "error";
+            }
+
+            LLAMA_LOG_DEBUG("  %-30s: %8.2f MB on device %s\n",
+                name, tensor_size/1024.0/1024.0, dev_name);
+        } catch (...) {
+            LLAMA_LOG_DEBUG("  %-30s: [ERROR processing tensor]\n", name);
+        }
     };
 
     // Account for token embedding and output tensors
@@ -4303,11 +4316,29 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         // Only report the 3 largest tensors per layer in the detailed log
     }
 
-    // Print summary by device
+    // Print summary by device - with added safety
     LLAMA_LOG_DEBUG("\nMemory usage by device:\n");
     for (const auto& [dev, mem] : mem_per_device) {
-        LLAMA_LOG_DEBUG("Device %s: %.2f MB in %d tensors\n",
-            ggml_backend_dev_name(dev), mem/1024.0/1024.0, tensors_per_device[dev]);
+        if (dev == nullptr) {
+            LLAMA_LOG_DEBUG("Unknown device: %.2f MB in %d tensors\n",
+                mem/1024.0/1024.0, tensors_per_device[dev]);
+            continue;
+        }
+
+        try {
+            const char* dev_name = "unknown_device";
+            try {
+                dev_name = ggml_backend_dev_name(dev);
+                if (dev_name == nullptr) dev_name = "unnamed_device";
+            } catch (...) {
+                dev_name = "error_device";
+            }
+
+            LLAMA_LOG_DEBUG("Device %s: %.2f MB in %d tensors\n",
+                dev_name, mem/1024.0/1024.0, tensors_per_device[dev]);
+        } catch (...) {
+            LLAMA_LOG_DEBUG("Error printing device info for device at %p\n", (void*)dev);
+        }
     }
 
     return true;
@@ -13255,72 +13286,144 @@ llm_graph_result_ptr llama_model::build_graph(
     if (debug_tensors) {
         LLAMA_LOG_DEBUG("\n=== Tensor dependencies in computation graph ===\n");
 
-        // Map of tensors already processed to avoid duplicates
+        // Only process a limited number of tensors to avoid deep recursion
         std::set<const ggml_tensor*> processed;
+        const int max_tensors = 100; // Safety limit
+        int tensor_count = 0;
 
-        // Helper function to log a tensor and its dependencies
+        // Helper function to log a tensor and its dependencies - with additional safety
         std::function<void(const ggml_tensor*, int)> log_tensor_deps = [&](const ggml_tensor* tensor, int depth) {
-            if (!tensor || processed.find(tensor) != processed.end()) {
+            // Safety checks to prevent segfaults
+            if (!tensor || processed.find(tensor) != processed.end() || depth > 2 || tensor_count >= max_tensors) {
                 return;
             }
 
-            processed.insert(tensor);
+            try {
+                processed.insert(tensor);
+                tensor_count++;
 
-            // Indent based on depth level
-            std::string indent(depth * 2, ' ');
+                // Indent based on depth level
+                std::string indent(depth * 2, ' ');
 
-            // Get tensor info
-            const char* tensor_name = ggml_get_name(tensor);
-            if (!tensor_name || tensor_name[0] == '\0') {
-                tensor_name = "unnamed";
-            }
-
-            size_t tensor_size = ggml_nbytes(tensor);
-
-            // Get op name
-            const char* op_name = "unknown";
-            switch (tensor->op) {
-                case GGML_OP_NONE:          op_name = "none"; break;
-                case GGML_OP_MUL_MAT:       op_name = "mul_mat"; break;
-                case GGML_OP_ADD:           op_name = "add"; break;
-                case GGML_OP_ROPE:          op_name = "rope"; break;
-                case GGML_OP_GET_ROWS:      op_name = "get_rows"; break;
-                case GGML_OP_NORM:          op_name = "norm"; break;
-                case GGML_OP_MUL:           op_name = "mul"; break;
-                case GGML_OP_DIAG_MASK_INF: op_name = "diag_mask_inf"; break;
-                case GGML_OP_SOFT_MAX:      op_name = "softmax"; break;
-                default:                    op_name = "other"; break;
-            }
-
-            LLAMA_LOG_DEBUG("%s%s (op: %s): %.2f MB, type: %s, dim: %d,%d,%d,%d\n",
-                indent.c_str(), tensor_name, op_name,
-                tensor_size/1024.0/1024.0,
-                ggml_type_name(tensor->type),
-                (int)tensor->ne[0], (int)tensor->ne[1], (int)tensor->ne[2], (int)tensor->ne[3]);
-
-            // Recursively log dependencies (src0, src1), but only go one level deep
-            if (depth < 1) {
-                if (tensor->src[0]) {
-                    log_tensor_deps((const ggml_tensor*)tensor->src[0], depth + 1);
+                // Get tensor info - safely
+                const char* tensor_name = "unnamed";
+                try {
+                    tensor_name = ggml_get_name(tensor);
+                    if (!tensor_name || tensor_name[0] == '\0') {
+                        tensor_name = "unnamed";
+                    }
+                } catch (...) {
+                    tensor_name = "error_tensor";
                 }
-                if (tensor->src[1]) {
-                    log_tensor_deps((const ggml_tensor*)tensor->src[1], depth + 1);
+
+                size_t tensor_size = 0;
+                try {
+                    tensor_size = ggml_nbytes(tensor);
+                } catch (...) {
+                    // Keep size as 0
                 }
-            } else if (tensor->src[0] || tensor->src[1]) {
-                LLAMA_LOG_DEBUG("%s  ... and more source tensors\n", indent.c_str());
+
+                // Get op name safely
+                const char* op_name = "unknown";
+                try {
+                    switch (tensor->op) {
+                        case GGML_OP_NONE:          op_name = "none"; break;
+                        case GGML_OP_MUL_MAT:       op_name = "mul_mat"; break;
+                        case GGML_OP_ADD:           op_name = "add"; break;
+                        case GGML_OP_ROPE:          op_name = "rope"; break;
+                        case GGML_OP_GET_ROWS:      op_name = "get_rows"; break;
+                        case GGML_OP_NORM:          op_name = "norm"; break;
+                        case GGML_OP_MUL:           op_name = "mul"; break;
+                        case GGML_OP_DIAG_MASK_INF: op_name = "diag_mask_inf"; break;
+                        case GGML_OP_SOFT_MAX:      op_name = "softmax"; break;
+                        default:                    op_name = "other"; break;
+                    }
+                } catch (...) {
+                    op_name = "error_op";
+                }
+
+                // Get dimensions safely
+                int ne0 = 0, ne1 = 0, ne2 = 0, ne3 = 0;
+                try {
+                    ne0 = (int)tensor->ne[0];
+                    ne1 = (int)tensor->ne[1];
+                    ne2 = (int)tensor->ne[2];
+                    ne3 = (int)tensor->ne[3];
+                } catch (...) {
+                    // Keep dimensions as 0
+                }
+
+                // Get type safely
+                const char* type_name = "unknown";
+                try {
+                    type_name = ggml_type_name(tensor->type);
+                    if (!type_name) type_name = "unknown";
+                } catch (...) {
+                    type_name = "error_type";
+                }
+
+                LLAMA_LOG_DEBUG("%s%s (op: %s): %.2f MB, type: %s, dim: %d,%d,%d,%d\n",
+                    indent.c_str(), tensor_name, op_name,
+                    tensor_size/1024.0/1024.0,
+                    type_name,
+                    ne0, ne1, ne2, ne3);
+
+                // Recursively log dependencies (src0, src1) - with additional safety and limits
+                if (depth < 1 && tensor_count < max_tensors) {
+                    const ggml_tensor *src0 = nullptr, *src1 = nullptr;
+
+                    try {
+                        if (tensor->src[0]) src0 = (const ggml_tensor*)tensor->src[0];
+                        if (tensor->src[1]) src1 = (const ggml_tensor*)tensor->src[1];
+                    } catch (...) {
+                        // Keep sources as nullptr if exception occurred
+                    }
+
+                    if (src0) {
+                        log_tensor_deps(src0, depth + 1);
+                    }
+
+                    if (src1) {
+                        log_tensor_deps(src1, depth + 1);
+                    }
+                } else if ((tensor->src[0] || tensor->src[1]) && depth <= 2) {
+                    LLAMA_LOG_DEBUG("%s  ... and more source tensors\n", indent.c_str());
+                }
+            } catch (...) {
+                LLAMA_LOG_DEBUG("Error processing tensor at depth %d\n", depth);
             }
         };
 
-        // Log the important output tensors and their direct dependencies
+        // Log the important output tensors and their direct dependencies - with safety
         LLAMA_LOG_DEBUG("--- Key output tensors and their dependencies ---\n");
-        if (llm->res->t_logits) {
-            log_tensor_deps(llm->res->t_logits, 0);
-        }
-        if (llm->res->t_embd) {
-            log_tensor_deps(llm->res->t_embd, 0);
+
+        try {
+            if (llm && llm->res) {
+                if (llm->res->t_logits) {
+                    LLAMA_LOG_DEBUG("Logits tensor:\n");
+                    try {
+                        log_tensor_deps(llm->res->t_logits, 0);
+                    } catch (...) {
+                        LLAMA_LOG_DEBUG("Error processing logits tensor\n");
+                    }
+                }
+
+                if (llm->res->t_embd) {
+                    LLAMA_LOG_DEBUG("\nEmbedding tensor:\n");
+                    try {
+                        log_tensor_deps(llm->res->t_embd, 0);
+                    } catch (...) {
+                        LLAMA_LOG_DEBUG("Error processing embedding tensor\n");
+                    }
+                }
+            } else {
+                LLAMA_LOG_DEBUG("No result tensors available\n");
+            }
+        } catch (...) {
+            LLAMA_LOG_DEBUG("Error accessing result tensors\n");
         }
 
-        LLAMA_LOG_DEBUG("\nGraph summary: approximately %zu nodes\n",
+        LLAMA_LOG_DEBUG("\nGraph summary: processed %zu tensors\n",
             processed.size());
     }
 
