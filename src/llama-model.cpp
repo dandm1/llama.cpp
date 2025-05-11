@@ -1707,11 +1707,39 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 buft = ggml_backend_dev_buffer_type(cpu_dev);
             }
 
-            // Log tensor allocation details
-            LLAMA_LOG_DEBUG("Tensor %s: size: %zu MB, type: %s, assigned to device %s with buffer type %s\n",
-                tn.str().c_str(), ggml_nbytes(t_meta)/1024/1024, ggml_type_name(t_meta->type),
-                ggml_backend_dev_name(ggml_backend_buft_get_device(buft)),
-                ggml_backend_buft_name(buft));
+            // Log tensor allocation details - with safety checks
+            try {
+                std::string tensor_name = "unknown";
+                std::string type_name = "unknown";
+                std::string dev_name = "unknown";
+                std::string buft_name = "unknown";
+                size_t tensor_size = 0;
+
+                try { tensor_name = tn.str(); } catch (...) {}
+
+                try {
+                    if (t_meta) {
+                        tensor_size = ggml_nbytes(t_meta);
+                        type_name = ggml_type_name(t_meta->type) ? ggml_type_name(t_meta->type) : "unknown";
+                    }
+                } catch (...) {}
+
+                try {
+                    if (buft) {
+                        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                        if (dev) {
+                            dev_name = ggml_backend_dev_name(dev) ? ggml_backend_dev_name(dev) : "unknown";
+                        }
+                        buft_name = ggml_backend_buft_name(buft) ? ggml_backend_buft_name(buft) : "unknown";
+                    }
+                } catch (...) {}
+
+                LLAMA_LOG_DEBUG("Tensor %s: size: %zu MB, type: %s, assigned to device %s with buffer type %s\n",
+                    tensor_name.c_str(), tensor_size/1024/1024, type_name.c_str(),
+                    dev_name.c_str(), buft_name.c_str());
+            } catch (...) {
+                LLAMA_LOG_DEBUG("Error logging tensor allocation details\n");
+            }
 
             if (buft != buft_list->front().second) {
                 n_moved_tensors++;
@@ -4291,37 +4319,115 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     };
 
     // Account for token embedding and output tensors
-    account_tensor("tok_embd", tok_embd, pimpl->dev_input.dev);
-    account_tensor("output", output, pimpl->dev_output.dev);
-    account_tensor("output_norm", output_norm, pimpl->dev_output.dev);
+    account_tensor("input.tok_embd", tok_embd, pimpl->dev_input.dev);
+    account_tensor("output.output", output, pimpl->dev_output.dev);
+    account_tensor("output.output_norm", output_norm, pimpl->dev_output.dev);
+    if (output_norm_b) account_tensor("output.output_norm_b", output_norm_b, pimpl->dev_output.dev);
+    if (output_b) account_tensor("output.output_b", output_b, pimpl->dev_output.dev);
 
-    // Account for tensors in each layer
+    // Helper to check and account for a tensor with proper layer info
+    auto account_layer_tensor = [&](const char* base_name, ggml_tensor* tensor, ggml_backend_dev_t dev, int layer_idx) {
+        if (tensor) {
+            char full_name[128];
+            snprintf(full_name, sizeof(full_name), "layer_%03d.%s", layer_idx, base_name);
+            account_tensor(full_name, tensor, dev);
+        }
+    };
+
+    // Account for tensors in each layer - more comprehensive and with layer numbers
     for (int i = 0; i < (int)layers.size(); i++) {
         auto& layer = layers[i];
         ggml_backend_dev_t dev = pimpl->dev_layer[i].dev;
 
-        // Attention tensors
-        account_tensor("wq", layer.wq, dev);
-        account_tensor("wk", layer.wk, dev);
-        account_tensor("wv", layer.wv, dev);
-        account_tensor("wo", layer.wo, dev);
-        account_tensor("attn_norm", layer.attn_norm, dev);
+        // Attention tensors - norm
+        account_layer_tensor("attn_norm", layer.attn_norm, dev, i);
+        account_layer_tensor("attn_norm_b", layer.attn_norm_b, dev, i);
+        account_layer_tensor("attn_q_norm", layer.attn_q_norm, dev, i);
+        account_layer_tensor("attn_k_norm", layer.attn_k_norm, dev, i);
+        account_layer_tensor("attn_out_norm", layer.attn_out_norm, dev, i);
+        account_layer_tensor("attn_norm_2", layer.attn_norm_2, dev, i);
+        account_layer_tensor("attn_norm_2_b", layer.attn_norm_2_b, dev, i);
+        account_layer_tensor("attn_q_norm_b", layer.attn_q_norm_b, dev, i);
+        account_layer_tensor("attn_k_norm_b", layer.attn_k_norm_b, dev, i);
+        account_layer_tensor("attn_out_norm_b", layer.attn_out_norm_b, dev, i);
 
-        // FFN tensors
-        account_tensor("ffn_gate", layer.ffn_gate, dev);
-        account_tensor("ffn_down", layer.ffn_down, dev);
-        account_tensor("ffn_up", layer.ffn_up, dev);
-        account_tensor("ffn_norm", layer.ffn_norm, dev);
+        // Attention tensors - main weights
+        account_layer_tensor("wq", layer.wq, dev, i);
+        account_layer_tensor("wk", layer.wk, dev, i);
+        account_layer_tensor("wv", layer.wv, dev, i);
+        account_layer_tensor("wo", layer.wo, dev, i);
+        account_layer_tensor("wqkv", layer.wqkv, dev, i);
+
+        // Attention biases
+        account_layer_tensor("bq", layer.bq, dev, i);
+        account_layer_tensor("bk", layer.bk, dev, i);
+        account_layer_tensor("bv", layer.bv, dev, i);
+        account_layer_tensor("bo", layer.bo, dev, i);
+        account_layer_tensor("bqkv", layer.bqkv, dev, i);
+
+        // FFN tensors - weights
+        account_layer_tensor("ffn_norm", layer.ffn_norm, dev, i);
+        account_layer_tensor("ffn_gate", layer.ffn_gate, dev, i);
+        account_layer_tensor("ffn_down", layer.ffn_down, dev, i);
+        account_layer_tensor("ffn_up", layer.ffn_up, dev, i);
+
+        // FFN biases
+        account_layer_tensor("ffn_norm_b", layer.ffn_norm_b, dev, i);
+        account_layer_tensor("ffn_gate_b", layer.ffn_gate_b, dev, i);
+        account_layer_tensor("ffn_down_b", layer.ffn_down_b, dev, i);
+        account_layer_tensor("ffn_up_b", layer.ffn_up_b, dev, i);
+
+        // MoE tensors
+        account_layer_tensor("ffn_gate_inp", layer.ffn_gate_inp, dev, i);
+        account_layer_tensor("ffn_gate_exps", layer.ffn_gate_exps, dev, i);
+        account_layer_tensor("ffn_down_exps", layer.ffn_down_exps, dev, i);
+        account_layer_tensor("ffn_up_exps", layer.ffn_up_exps, dev, i);
+
+        // Rope tensors
+        account_layer_tensor("rope_freqs", layer.rope_freqs, dev, i);
+        account_layer_tensor("rope_long", layer.rope_long, dev, i);
+        account_layer_tensor("rope_short", layer.rope_short, dev, i);
+
+        // Scale tensors for bitnet etc.
+        account_layer_tensor("wq_scale", layer.wq_scale, dev, i);
+        account_layer_tensor("wk_scale", layer.wk_scale, dev, i);
+        account_layer_tensor("wv_scale", layer.wv_scale, dev, i);
+        account_layer_tensor("wo_scale", layer.wo_scale, dev, i);
+        account_layer_tensor("ffn_gate_scale", layer.ffn_gate_scale, dev, i);
+        account_layer_tensor("ffn_up_scale", layer.ffn_up_scale, dev, i);
+        account_layer_tensor("ffn_down_scale", layer.ffn_down_scale, dev, i);
 
         // Only report the 3 largest tensors per layer in the detailed log
     }
 
     // Print summary by device - with added safety
-    LLAMA_LOG_DEBUG("\nMemory usage by device:\n");
+    LLAMA_LOG_DEBUG("\n=== Memory usage by device ===\n");
+
+    // Calculate total memory across all devices
+    size_t total_memory = 0;
+    int total_tensors = 0;
+
     for (const auto& [dev, mem] : mem_per_device) {
+        total_memory += mem;
+        total_tensors += tensors_per_device[dev];
+    }
+
+    // Sort devices by memory usage (descending)
+    std::vector<std::pair<ggml_backend_dev_t, size_t>> sorted_devices;
+    for (const auto& [dev, mem] : mem_per_device) {
+        sorted_devices.push_back({dev, mem});
+    }
+
+    std::sort(sorted_devices.begin(), sorted_devices.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    // Print the summary with percentages
+    for (const auto& [dev, mem] : sorted_devices) {
         if (dev == nullptr) {
-            LLAMA_LOG_DEBUG("Unknown device: %.2f MB in %d tensors\n",
-                mem/1024.0/1024.0, tensors_per_device[dev]);
+            LLAMA_LOG_DEBUG("Unknown device: %.2f MB (%.1f%%) in %d tensors\n",
+                mem/1024.0/1024.0,
+                total_memory > 0 ? (100.0f * mem) / total_memory : 0.0f,
+                tensors_per_device[dev]);
             continue;
         }
 
@@ -4334,12 +4440,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 dev_name = "error_device";
             }
 
-            LLAMA_LOG_DEBUG("Device %s: %.2f MB in %d tensors\n",
-                dev_name, mem/1024.0/1024.0, tensors_per_device[dev]);
+            LLAMA_LOG_DEBUG("Device %s: %.2f MB (%.1f%%) in %d tensors\n",
+                dev_name,
+                mem/1024.0/1024.0,
+                total_memory > 0 ? (100.0f * mem) / total_memory : 0.0f,
+                tensors_per_device[dev]);
         } catch (...) {
             LLAMA_LOG_DEBUG("Error printing device info for device at %p\n", (void*)dev);
         }
     }
+
+    // Print total
+    LLAMA_LOG_DEBUG("\nTotal memory used: %.2f MB in %d tensors\n",
+        total_memory/1024.0/1024.0, total_tensors);
 
     return true;
 }
