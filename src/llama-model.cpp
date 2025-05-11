@@ -4318,19 +4318,43 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     };
 
-    // Account for token embedding and output tensors
-    account_tensor("input.tok_embd", tok_embd, pimpl->dev_input.dev);
-    account_tensor("output.output", output, pimpl->dev_output.dev);
-    account_tensor("output.output_norm", output_norm, pimpl->dev_output.dev);
-    if (output_norm_b) account_tensor("output.output_norm_b", output_norm_b, pimpl->dev_output.dev);
-    if (output_b) account_tensor("output.output_b", output_b, pimpl->dev_output.dev);
+    // Helper to check the actual device of a tensor based on its buffer
+    auto get_actual_dev = [](ggml_tensor* tensor, ggml_backend_dev_t default_dev) -> ggml_backend_dev_t {
+        if (!tensor || !tensor->buffer) {
+            return default_dev;
+        }
 
-    // Helper to check and account for a tensor with proper layer info
+        try {
+            ggml_backend_buffer_type_t actual_buft = ggml_backend_buffer_get_type(tensor->buffer);
+            ggml_backend_dev_t tensor_dev = ggml_backend_buft_get_device(actual_buft);
+
+            if (tensor_dev) {
+                return tensor_dev;
+            }
+        } catch (...) {
+            // In case of error, use the default
+        }
+
+        return default_dev;
+    };
+
+    // Account for token embedding and output tensors - check for overrides
+    account_tensor("input.tok_embd", tok_embd, get_actual_dev(tok_embd, pimpl->dev_input.dev));
+    account_tensor("output.output", output, get_actual_dev(output, pimpl->dev_output.dev));
+    account_tensor("output.output_norm", output_norm, get_actual_dev(output_norm, pimpl->dev_output.dev));
+    if (output_norm_b) account_tensor("output.output_norm_b", output_norm_b, get_actual_dev(output_norm_b, pimpl->dev_output.dev));
+    if (output_b) account_tensor("output.output_b", output_b, get_actual_dev(output_b, pimpl->dev_output.dev));
+
+    // Helper to check and account for a tensor with proper layer info - including override checks
     auto account_layer_tensor = [&](const char* base_name, ggml_tensor* tensor, ggml_backend_dev_t dev, int layer_idx) {
         if (tensor) {
             char full_name[128];
             snprintf(full_name, sizeof(full_name), "layer_%03d.%s", layer_idx, base_name);
-            account_tensor(full_name, tensor, dev);
+
+            // Use our helper to determine the actual device by examining the tensor's buffer
+            ggml_backend_dev_t actual_dev = get_actual_dev(tensor, dev);
+
+            account_tensor(full_name, tensor, actual_dev);
         }
     };
 
@@ -4453,6 +4477,38 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // Print total
     LLAMA_LOG_DEBUG("\nTotal memory used: %.2f MB in %d tensors\n",
         total_memory/1024.0/1024.0, total_tensors);
+
+    // If tensor overrides are used, include that information in the summary
+    if (pimpl->has_tensor_overrides && ml.tensor_buft_overrides) {
+        LLAMA_LOG_DEBUG("\nTensor override patterns used:\n");
+
+        // Count how many patterns target each device for a concise summary
+        std::map<std::string, int> override_patterns_by_name;
+
+        for (const auto * overrides = ml.tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
+            try {
+                if (overrides->buft) {
+                    ggml_backend_dev_t dev = ggml_backend_buft_get_device(overrides->buft);
+                    if (dev) {
+                        std::string dev_name = ggml_backend_dev_name(dev) ? ggml_backend_dev_name(dev) : "unnamed";
+                        override_patterns_by_name[dev_name]++;
+                    }
+
+                    // Print each pattern for detailed debugging
+                    const char* buft_name = ggml_backend_buft_name(overrides->buft);
+                    LLAMA_LOG_DEBUG("  Pattern: %-40s -> %s\n",
+                        overrides->pattern,
+                        buft_name ? buft_name : "unknown");
+                }
+            } catch (...) {}
+        }
+
+        // Print a summary of patterns by device
+        LLAMA_LOG_DEBUG("\nOverride summary by device:\n");
+        for (const auto& [dev_name, count] : override_patterns_by_name) {
+            LLAMA_LOG_DEBUG("  %s: %d patterns\n", dev_name.c_str(), count);
+        }
+    }
 
     return true;
 }
