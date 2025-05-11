@@ -1471,6 +1471,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             size_t total;
             size_t free;
             ggml_backend_dev_memory(dev, &free, &total);
+            LLAMA_LOG_DEBUG("Device %s: Total memory: %zu MB, Free memory: %zu MB\n",
+                ggml_backend_dev_name(dev), total/1024/1024, free/1024/1024);
             splits[i] = free;
         }
     } else {
@@ -1517,6 +1519,26 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer);
+
+    // Add a summary table of layer allocation
+    LLAMA_LOG_DEBUG("\n=== Layer assignment summary ===\n");
+    std::map<ggml_backend_dev_t, int> layers_per_device;
+
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_backend_dev_t dev = pimpl->dev_layer[il].dev;
+        LLAMA_LOG_DEBUG("Layer %3d: assigned to device %s\n", il, ggml_backend_dev_name(dev));
+        layers_per_device[dev]++;
+    }
+
+    // Log the input and output layer device assignments
+    LLAMA_LOG_DEBUG("Input layer:  assigned to device %s\n", ggml_backend_dev_name(pimpl->dev_input.dev));
+    LLAMA_LOG_DEBUG("Output layer: assigned to device %s\n", ggml_backend_dev_name(pimpl->dev_output.dev));
+
+    LLAMA_LOG_DEBUG("\nDevice utilization summary:\n");
+    for (const auto& [dev, count] : layers_per_device) {
+        LLAMA_LOG_DEBUG("Device %s: %d layers (%.1f%%)\n",
+            ggml_backend_dev_name(dev), count, (100.0f * count) / n_layer);
+    }
 
     // one ggml context per buffer type
     int max_n_tensors = ml.n_tensors;
@@ -1684,6 +1706,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 }
                 buft = ggml_backend_dev_buffer_type(cpu_dev);
             }
+
+            // Log tensor allocation details
+            LLAMA_LOG_DEBUG("Tensor %s: size: %zu MB, type: %s, assigned to device %s with buffer type %s\n",
+                tn.str().c_str(), ggml_nbytes(t_meta)/1024/1024, ggml_type_name(t_meta->type),
+                ggml_backend_dev_name(ggml_backend_buft_get_device(buft)),
+                ggml_backend_buft_name(buft));
 
             if (buft != buft_list->front().second) {
                 n_moved_tensors++;
@@ -4230,6 +4258,56 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+    }
+
+    // Log overall tensor memory usage by device
+    LLAMA_LOG_DEBUG("\n=== Tensor memory usage summary ===\n");
+    std::map<ggml_backend_dev_t, size_t> mem_per_device;
+    std::map<ggml_backend_dev_t, int> tensors_per_device;
+
+    // Helper function to add tensor memory to the count
+    auto account_tensor = [&](const char* name, ggml_tensor* tensor, ggml_backend_dev_t dev) {
+        if (tensor == nullptr) return;
+
+        size_t tensor_size = ggml_nbytes(tensor);
+        mem_per_device[dev] += tensor_size;
+        tensors_per_device[dev]++;
+
+        LLAMA_LOG_DEBUG("  %-30s: %8.2f MB on device %s\n",
+            name, tensor_size/1024.0/1024.0, ggml_backend_dev_name(dev));
+    };
+
+    // Account for token embedding and output tensors
+    account_tensor("tok_embd", tok_embd, pimpl->dev_input.dev);
+    account_tensor("output", output, pimpl->dev_output.dev);
+    account_tensor("output_norm", output_norm, pimpl->dev_output.dev);
+
+    // Account for tensors in each layer
+    for (int i = 0; i < (int)layers.size(); i++) {
+        auto& layer = layers[i];
+        ggml_backend_dev_t dev = pimpl->dev_layer[i].dev;
+
+        // Attention tensors
+        account_tensor("wq", layer.wq, dev);
+        account_tensor("wk", layer.wk, dev);
+        account_tensor("wv", layer.wv, dev);
+        account_tensor("wo", layer.wo, dev);
+        account_tensor("attn_norm", layer.attn_norm, dev);
+
+        // FFN tensors
+        account_tensor("ffn_gate", layer.ffn_gate, dev);
+        account_tensor("ffn_down", layer.ffn_down, dev);
+        account_tensor("ffn_up", layer.ffn_up, dev);
+        account_tensor("ffn_norm", layer.ffn_norm, dev);
+
+        // Only report the 3 largest tensors per layer in the detailed log
+    }
+
+    // Print summary by device
+    LLAMA_LOG_DEBUG("\nMemory usage by device:\n");
+    for (const auto& [dev, mem] : mem_per_device) {
+        LLAMA_LOG_DEBUG("Device %s: %.2f MB in %d tensors\n",
+            ggml_backend_dev_name(dev), mem/1024.0/1024.0, tensors_per_device[dev]);
     }
 
     return true;
@@ -13171,6 +13249,80 @@ llm_graph_result_ptr llama_model::build_graph(
 
     // add on pooling layer
     llm->build_pooling(gf, cls, cls_b, cls_out, cls_out_b);
+
+    // Log tensor dependencies
+    bool debug_tensors = true; // Set to true to enable tensor dependency logging
+    if (debug_tensors) {
+        LLAMA_LOG_DEBUG("\n=== Tensor dependencies in computation graph ===\n");
+
+        // Map of tensors already processed to avoid duplicates
+        std::set<const ggml_tensor*> processed;
+
+        // Helper function to log a tensor and its dependencies
+        std::function<void(const ggml_tensor*, int)> log_tensor_deps = [&](const ggml_tensor* tensor, int depth) {
+            if (!tensor || processed.find(tensor) != processed.end()) {
+                return;
+            }
+
+            processed.insert(tensor);
+
+            // Indent based on depth level
+            std::string indent(depth * 2, ' ');
+
+            // Get tensor info
+            const char* tensor_name = ggml_get_name(tensor);
+            if (!tensor_name || tensor_name[0] == '\0') {
+                tensor_name = "unnamed";
+            }
+
+            size_t tensor_size = ggml_nbytes(tensor);
+
+            // Get op name
+            const char* op_name = "unknown";
+            switch (tensor->op) {
+                case GGML_OP_NONE:          op_name = "none"; break;
+                case GGML_OP_MUL_MAT:       op_name = "mul_mat"; break;
+                case GGML_OP_ADD:           op_name = "add"; break;
+                case GGML_OP_ROPE:          op_name = "rope"; break;
+                case GGML_OP_GET_ROWS:      op_name = "get_rows"; break;
+                case GGML_OP_NORM:          op_name = "norm"; break;
+                case GGML_OP_MUL:           op_name = "mul"; break;
+                case GGML_OP_DIAG_MASK_INF: op_name = "diag_mask_inf"; break;
+                case GGML_OP_SOFT_MAX:      op_name = "softmax"; break;
+                default:                    op_name = "other"; break;
+            }
+
+            LLAMA_LOG_DEBUG("%s%s (op: %s): %.2f MB, type: %s, dim: %d,%d,%d,%d\n",
+                indent.c_str(), tensor_name, op_name,
+                tensor_size/1024.0/1024.0,
+                ggml_type_name(tensor->type),
+                (int)tensor->ne[0], (int)tensor->ne[1], (int)tensor->ne[2], (int)tensor->ne[3]);
+
+            // Recursively log dependencies (src0, src1), but only go one level deep
+            if (depth < 1) {
+                if (tensor->src[0]) {
+                    log_tensor_deps((const ggml_tensor*)tensor->src[0], depth + 1);
+                }
+                if (tensor->src[1]) {
+                    log_tensor_deps((const ggml_tensor*)tensor->src[1], depth + 1);
+                }
+            } else if (tensor->src[0] || tensor->src[1]) {
+                LLAMA_LOG_DEBUG("%s  ... and more source tensors\n", indent.c_str());
+            }
+        };
+
+        // Log the important output tensors and their direct dependencies
+        LLAMA_LOG_DEBUG("--- Key output tensors and their dependencies ---\n");
+        if (llm->res->t_logits) {
+            log_tensor_deps(llm->res->t_logits, 0);
+        }
+        if (llm->res->t_embd) {
+            log_tensor_deps(llm->res->t_embd, 0);
+        }
+
+        LLAMA_LOG_DEBUG("\nGraph summary: approximately %zu nodes\n",
+            processed.size());
+    }
 
     return std::move(llm->res);
 }
