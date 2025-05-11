@@ -5773,6 +5773,8 @@ static void ggml_build_forward_impl(struct ggml_cgraph * cgraph, struct ggml_ten
         // the last added node should always be starting point
         GGML_ASSERT(cgraph->nodes[cgraph->n_nodes - 1] == tensor);
     }
+
+    ggml_graph_print(cgraph);
 }
 
 void ggml_build_forward_expand(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {
