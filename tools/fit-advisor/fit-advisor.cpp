@@ -376,9 +376,10 @@ int llama_fit_advisor(int argc, char ** argv) {
         mopts.kv_types.push_back(params.cache_type_v);
     }
     if (inv.head_size > 0) {
-        mopts.head_size = (int) inv.head_size;
-        mopts.n_head    = (int) inv.n_head;
-        mopts.n_head_kv = (int) inv.n_head_kv;
+        mopts.head_size   = (int) inv.head_size;
+        mopts.head_size_v = (int) inv.head_size_v;
+        mopts.n_head      = (int) inv.n_head;
+        mopts.n_head_kv   = (int) inv.n_head_kv;
     }
     mopts.n_batch_pp = params.n_ubatch;
     mopts.n_threads  = params.cpuparams.n_threads;
@@ -413,6 +414,8 @@ int llama_fit_advisor(int argc, char ** argv) {
     const fit_advisor_workload wl = [&]() {
         fit_advisor_workload w = fit_advisor_workload::preset(params.fit_advisor_workload);
         w.n_ubatch = (uint32_t) params.n_ubatch;
+        w.use_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                               COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
         return w;
     }();
 

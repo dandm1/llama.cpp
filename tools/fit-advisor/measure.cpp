@@ -198,7 +198,7 @@ bench_result bench_matmul(ggml_backend_t backend, ggml_type type, int64_t k, int
 }
 
 // attention over a KV cache of n_kv entries, with flash attention or through the explicit path
-bench_result bench_attn(ggml_backend_t backend, bool flash, ggml_type type_kv, int hd, int n_head, int n_head_kv, int n_kv, int n_q) {
+bench_result bench_attn(ggml_backend_t backend, bool flash, ggml_type type_kv, int hd, int hdv, int n_head, int n_head_kv, int n_kv, int n_q) {
     const float scale = 1.0f / std::sqrt((float) hd);
     return bench_graph(backend, [&](ggml_context * ctx) {
         ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, n_q, n_head);
@@ -209,15 +209,15 @@ bench_result bench_attn(ggml_backend_t backend, bool flash, ggml_type type_kv, i
         ggml_set_name(mask, "mask");
 
         if (flash) {
-            ggml_tensor * v = ggml_new_tensor_3d(ctx, type_kv, hd, n_kv, n_head_kv);
+            ggml_tensor * v = ggml_new_tensor_3d(ctx, type_kv, hdv, n_kv, n_head_kv);
             ggml_set_name(v, "v");
             ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
             ggml_set_name(out, "out");
             return out;
         }
 
-        // the non-flash path keeps V transposed in the cache: [n_kv, hd, n_head_kv]
-        ggml_tensor * vt = ggml_new_tensor_3d(ctx, type_kv, n_kv, hd, n_head_kv);
+        // the non-flash path keeps V transposed in the cache: [n_kv, hdv, n_head_kv]
+        ggml_tensor * vt = ggml_new_tensor_3d(ctx, type_kv, n_kv, hdv, n_head_kv);
         ggml_set_name(vt, "vt");
         ggml_tensor * kq = ggml_mul_mat(ctx, k, q);                        // [n_kv, n_q, n_head]
         kq = ggml_soft_max_ext(ctx, kq, mask, scale, 0.0f);
@@ -250,8 +250,8 @@ std::string now_string() {
     return buf;
 }
 
-std::string attn_key(int hd, ggml_type type_kv) {
-    return "hd" + std::to_string(hd) + "/" + ggml_type_name(type_kv);
+std::string attn_key(int hd, int hdv, ggml_type type_kv) {
+    return "hd" + std::to_string(hd) + (hdv != hd ? "v" + std::to_string(hdv) : "") + "/" + ggml_type_name(type_kv);
 }
 
 } // namespace
@@ -352,15 +352,16 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
         fit_advisor_attn_rate r;
         r.n_kv       = opts.n_kv;
         r.n_batch_pp = opts.n_batch_attn;
-        const double kv_bytes = 2.0 * ggml_row_size(type_kv, opts.head_size) * opts.n_kv * opts.n_head_kv;
+        const int hdv = opts.head_size_v > 0 ? opts.head_size_v : opts.head_size;
+        const double kv_bytes = (ggml_row_size(type_kv, opts.head_size) + ggml_row_size(type_kv, hdv)) * (double) opts.n_kv * opts.n_head_kv;
         LOG_INF("%s:   attn %-10s measuring (n_kv %d, %d heads / %d kv heads, batch 1 and %d, with and without flash attention) ...\n", __func__,
-            attn_key(opts.head_size, type_kv).c_str(), opts.n_kv, opts.n_head, opts.n_head_kv, opts.n_batch_attn);
+            attn_key(opts.head_size, hdv, type_kv).c_str(), opts.n_kv, opts.n_head, opts.n_head_kv, opts.n_batch_attn);
         const int64_t t_attn0 = ggml_time_us();
 
-        const bench_result fa1 = bench_attn(backend, true,  type_kv, opts.head_size, opts.n_head, opts.n_head_kv, opts.n_kv, 1);
-        const bench_result nf1 = bench_attn(backend, false, type_kv, opts.head_size, opts.n_head, opts.n_head_kv, opts.n_kv, 1);
-        const bench_result fap = bench_attn(backend, true,  type_kv, opts.head_size, opts.n_head, opts.n_head_kv, opts.n_kv, opts.n_batch_attn);
-        const bench_result nfp = bench_attn(backend, false, type_kv, opts.head_size, opts.n_head, opts.n_head_kv, opts.n_kv, opts.n_batch_attn);
+        const bench_result fa1 = bench_attn(backend, true,  type_kv, opts.head_size, hdv, opts.n_head, opts.n_head_kv, opts.n_kv, 1);
+        const bench_result nf1 = bench_attn(backend, false, type_kv, opts.head_size, hdv, opts.n_head, opts.n_head_kv, opts.n_kv, 1);
+        const bench_result fap = bench_attn(backend, true,  type_kv, opts.head_size, hdv, opts.n_head, opts.n_head_kv, opts.n_kv, opts.n_batch_attn);
+        const bench_result nfp = bench_attn(backend, false, type_kv, opts.head_size, hdv, opts.n_head, opts.n_head_kv, opts.n_kv, opts.n_batch_attn);
 
         r.supported_fa   = fa1.supported;
         r.supported_nofa = nf1.supported;
@@ -372,9 +373,9 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
         }
         r.us_pp_fa   = fap.supported ? fap.us_per_run : 0;
         r.us_pp_nofa = nfp.supported ? nfp.us_per_run : 0;
-        m.attn[attn_key(opts.head_size, type_kv)] = r;
+        m.attn[attn_key(opts.head_size, hdv, type_kv)] = r;
         LOG_INF("%s:   attn %-10s fa: tg %7.1f GB/s pp %8.0f us | no-fa: tg %7.1f GB/s pp %8.0f us (%.1f s)%s%s\n", __func__,
-            attn_key(opts.head_size, type_kv).c_str(),
+            attn_key(opts.head_size, hdv, type_kv).c_str(),
             r.kv_bytes_per_s_fa / 1e9, r.us_pp_fa, r.kv_bytes_per_s_nofa / 1e9, r.us_pp_nofa,
             (ggml_time_us() - t_attn0) * 1e-6,
             fa1.supported ? "" : (" [fa: " + fa1.reason + "]").c_str(),
@@ -547,8 +548,8 @@ bool fit_advisor_device_measurements::has_matmul_curve(ggml_type type) const {
     return it != matmul.end() && (!it->second.supported || it->second.s_per_byte_b4 > 0);
 }
 
-bool fit_advisor_device_measurements::has_attn(int head_size, ggml_type type_kv) const {
-    return attn.count(attn_key(head_size, type_kv)) > 0;
+bool fit_advisor_device_measurements::has_attn(int head_size, int head_size_v, ggml_type type_kv) const {
+    return attn.count(attn_key(head_size, head_size_v > 0 ? head_size_v : head_size, type_kv)) > 0;
 }
 
 std::string fit_advisor_measurements::default_path() {
@@ -632,7 +633,7 @@ const fit_advisor_device_measurements & fit_advisor_measurements::ensure(ggml_ba
         }
         todo.kv_types.clear();
         for (const ggml_type type : opts.kv_types) {
-            if (!have.has_attn(opts.head_size, type)) {
+            if (!have.has_attn(opts.head_size, opts.head_size_v, type)) {
                 todo.kv_types.push_back(type);
             }
         }

@@ -55,7 +55,9 @@ struct fit_advisor_inventory {
     uint32_t n_embd    = 0;
     uint32_t n_head    = 0;
     uint32_t n_head_kv = 0;
-    uint32_t head_size = 0;
+    uint32_t head_size = 0;   // K width per head as attention sees it (MLA: kv_lora_rank + rope dims)
+    uint32_t head_size_v = 0; // V width per head (MLA: kv_lora_rank), equal to head_size otherwise
+    bool     is_mla = false;  // one latent KV head shared by all query heads
 
     std::map<ggml_type, size_t> bytes_by_type; // over all tensors
 

@@ -19,6 +19,7 @@ struct fit_advisor_workload {
     uint32_t concurrency   = 1;    // requests in flight at once
     bool     throughput    = false; // optimise aggregate tokens/s instead of per-request latency
     uint32_t n_ubatch      = 512;  // prompt-processing micro-batch
+    bool     use_mtp       = false; // MTP layers are executed (speculative MTP drafting on), otherwise they are not even loaded
 
     static fit_advisor_workload preset(const std::string & name); // "chat", "rag", "batch", "agent"
 };

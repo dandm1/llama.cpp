@@ -144,6 +144,17 @@ static void add_shard(fit_advisor_inventory & inv, const std::string & path, boo
         inv.n_head_kv     = (uint32_t) get_kv_uint_or_arr_max(ctx, inv.arch + ".attention.head_count_kv", inv.n_head);
         inv.head_size     = (uint32_t) get_kv_uint(ctx, inv.arch + ".attention.key_length",
                                                    inv.n_head > 0 ? inv.n_embd / inv.n_head : 0);
+        inv.head_size_v   = (uint32_t) get_kv_uint(ctx, inv.arch + ".attention.value_length", inv.head_size);
+        // multi-head latent attention: the cache holds one latent head of kv_lora_rank + rope dims per token,
+        // attention runs over K of that width and V of kv_lora_rank, broadcast to every query head
+        const uint32_t kv_lora_rank = (uint32_t) get_kv_uint(ctx, inv.arch + ".attention.kv_lora_rank", 0);
+        if (kv_lora_rank > 0) {
+            const uint32_t n_rot = (uint32_t) get_kv_uint(ctx, inv.arch + ".rope.dimension_count", 64);
+            inv.is_mla      = true;
+            inv.head_size   = kv_lora_rank + n_rot;
+            inv.head_size_v = kv_lora_rank;
+            inv.n_head_kv   = 1;
+        }
         inv.n_ctx_train   = (uint32_t) get_kv_uint(ctx, inv.arch + ".context_length",       0);
         inv.n_split       = (uint32_t) get_kv_uint(ctx, "split.count",                      1);
         if (inv.n_split == 0) {
@@ -267,8 +278,8 @@ void fit_advisor_inventory_print(const fit_advisor_inventory & inv) {
         __func__, inv.arch.c_str(), inv.n_layer, inv.n_layer_nextn, inv.n_expert, inv.n_ctx_train, inv.n_split);
     LOG_INF("%s: %zu tensors, %.1f MiB total: token_embd %.1f, output %.1f, global %.1f\n",
         __func__, inv.tensors.size(), inv.total / MiB, inv.token_embd / MiB, inv.output / MiB, inv.global / MiB);
-    LOG_INF("%s: n_embd = %" PRIu32 ", n_head = %" PRIu32 ", n_head_kv = %" PRIu32 ", head_size = %" PRIu32 ", experts used/total = %" PRIu32 "/%" PRIu32 "\n",
-        __func__, inv.n_embd, inv.n_head, inv.n_head_kv, inv.head_size, inv.n_expert_used, inv.n_expert);
+    LOG_INF("%s: n_embd = %" PRIu32 ", n_head = %" PRIu32 ", n_head_kv = %" PRIu32 ", head_size k/v = %" PRIu32 "/%" PRIu32 "%s, experts used/total = %" PRIu32 "/%" PRIu32 "\n",
+        __func__, inv.n_embd, inv.n_head, inv.n_head_kv, inv.head_size, inv.head_size_v, inv.is_mla ? " (MLA)" : "", inv.n_expert_used, inv.n_expert);
     {
         std::string mix;
         for (const ggml_type type : inv.weight_types(0.0)) {

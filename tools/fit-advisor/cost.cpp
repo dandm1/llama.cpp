@@ -1,5 +1,7 @@
 #include "cost.h"
 
+#include "ggml.h"
+
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -75,15 +77,21 @@ double active_bytes(const fit_advisor_inventory & inv, const fit_advisor_tensor 
 double tensor_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, int dev_idx, int layer_dev,
                  const std::vector<fit_advisor_cost_device> & devices, uint32_t batch, std::string & error) {
     const fit_advisor_cost_device * dev = &devices[dev_idx < 0 ? devices.size() - 1 : (size_t) dev_idx];
-    const fit_advisor_cost_device * home = &devices[layer_dev < 0 ? devices.size() - 1 : (size_t) layer_dev];
+    GGML_UNUSED(layer_dev);
 
     double copy_us = 0;
-    if (dev->is_cpu && !home->is_cpu && home->offload_min_batch > 0 && batch >= (uint32_t) home->offload_min_batch) {
-        // op offload: the weight travels to the layer's device for this batch and runs there
-        if (home->meas->copy.h2d_gb_s > 0) {
-            copy_us = t.nbytes / (home->meas->copy.h2d_gb_s * 1e9) * 1e6;
+    if (dev->is_cpu) {
+        // op offload: the scheduler hands an op with a CPU-resident weight to the first device that wants it at this
+        // batch size, whatever layer it belongs to; the weight is copied there for every ubatch
+        for (const auto & d : devices) {
+            if (!d.is_cpu && d.meas && d.offload_min_batch > 0 && batch >= (uint32_t) d.offload_min_batch) {
+                if (d.meas->copy.h2d_gb_s > 0) {
+                    copy_us = t.nbytes / (d.meas->copy.h2d_gb_s * 1e9) * 1e6;
+                }
+                dev = &d;
+                break;
+            }
         }
-        dev = home;
     }
 
     const auto it = dev->meas ? dev->meas->matmul.find(ggml_type_name(t.type)) : dev->meas->matmul.end();
@@ -121,6 +129,9 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
         weights = attn = overhead = boundary = 0;
         for (size_t i = 0; i < inv.tensors.size(); i++) {
             const auto & t = inv.tensors[i];
+            if (t.layer >= (int32_t) inv.n_layer && !wl.use_mtp) {
+                continue; // MTP layer, not loaded and not executed
+            }
             const int layer_dev = t.layer >= 0 ? alloc.layer_device((uint32_t) t.layer, n_layer_all)
                                                : (t.kind == FIT_ADVISOR_TENSOR_TOKEN_EMBD ? fit_advisor_allocation::DEV_CPU
                                                                                             : alloc.layer_device(n_layer_all, n_layer_all));
@@ -162,6 +173,9 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
         const bool pp = batch > 4;
         const std::vector<uint32_t> & ops = pp ? gp.ops_per_layer_pp : gp.ops_per_layer_tg;
         for (uint32_t il = 0; il < n_layer_all && il < ops.size(); il++) {
+            if (il >= inv.n_layer && !wl.use_mtp) {
+                continue;
+            }
             const int d = alloc.layer_device(il, n_layer_all);
             const auto & cd = devices[d < 0 ? devices.size() - 1 : (size_t) d];
             if (cd.meas) {

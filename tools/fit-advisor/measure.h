@@ -76,14 +76,15 @@ struct fit_advisor_device_measurements {
 
     bool has_matmul(ggml_type type) const { return matmul.count(ggml_type_name(type)) > 0; }
     bool has_matmul_curve(ggml_type type) const; // measured with the batch-4 point too
-    bool has_attn(int head_size, ggml_type type_kv) const;
+    bool has_attn(int head_size, int head_size_v, ggml_type type_kv) const;
     fit_advisor_copy_rate copy;
 };
 
 struct fit_advisor_measure_options {
     std::vector<ggml_type> weight_types = { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
     std::vector<ggml_type> kv_types     = { GGML_TYPE_F16, GGML_TYPE_Q8_0 };
-    int  head_size  = 128;
+    int  head_size   = 128; // K width per head
+    int  head_size_v = 0;   // V width per head, 0 = same as K
     int  n_head     = 32;
     int  n_head_kv  = 8;
     int  n_kv          = 16384;
