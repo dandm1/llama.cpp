@@ -2917,6 +2917,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
     add_opt(common_arg(
+        {"--optimize-for"}, "PRESET",
+        "workload to optimise for: chat (default), rag, batch, agent",
+        [](common_params & params, const std::string & value) {
+            params.fit_advisor_workload = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
+    add_opt(common_arg(
         { "-fitt", "--fit-target" }, "MiB0,MiB1,MiB2,...",
         string_format("target margin per device for --fit, comma-separated list of values, "
             "single value is broadcast across all devices, default: %zu", params.fit_params_target[0]/(1024*1024)),

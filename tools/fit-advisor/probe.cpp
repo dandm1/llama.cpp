@@ -2,8 +2,10 @@
 
 #include "ggml-backend.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <sstream>
@@ -140,6 +142,62 @@ const fit_advisor_projection & fit_advisor_probe::run(const fit_advisor_candidat
     n_probes++;
 
     return memo.emplace(key, std::move(proj)).first->second;
+}
+
+// attribute graph nodes to layers: named nodes carry a "-<il>" suffix, unnamed ones follow the last named layer
+static void count_ops(ggml_cgraph * gf, uint32_t n_layer_all, std::vector<uint32_t> & per_layer, uint32_t & global, uint32_t & n_nodes) {
+    per_layer.assign(n_layer_all, 0);
+    global = 0;
+    n_nodes = (uint32_t) ggml_graph_n_nodes(gf);
+    int cur = -1;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        const char * name = ggml_get_name(ggml_graph_node(gf, i));
+        const char * dash = strrchr(name, '-');
+        if (dash && dash[1] >= '0' && dash[1] <= '9') {
+            const int il = atoi(dash + 1);
+            if (il >= 0 && il < (int) n_layer_all) {
+                cur = il;
+            }
+        }
+        if (cur >= 0) {
+            per_layer[cur]++;
+        } else {
+            global++;
+        }
+    }
+}
+
+fit_advisor_graph_profile fit_advisor_probe::graph_profile(uint32_t n_layer_all) {
+    fit_advisor_graph_profile gp;
+    gp.n_batch_pp = (uint32_t) base.n_ubatch;
+
+    common_params p = base;
+    llama_model_params   mparams = common_model_params_to_llama(p);
+    llama_context_params cparams = common_context_params_to_llama(p);
+    mparams.no_alloc  = true;
+    mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+
+    llama_model * model = llama_model_load_from_file(p.model.path.c_str(), mparams);
+    if (!model) {
+        gp.error = "no_alloc load failed";
+        return gp;
+    }
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        llama_model_free(model);
+        gp.error = "context creation failed";
+        return gp;
+    }
+    if (ggml_cgraph * gf = llama_graph_reserve(ctx, 1, 1, 1)) {
+        count_ops(gf, n_layer_all, gp.ops_per_layer_tg, gp.ops_global_tg, gp.n_nodes_tg);
+    }
+    if (ggml_cgraph * gf = llama_graph_reserve(ctx, gp.n_batch_pp, 1, gp.n_batch_pp)) {
+        count_ops(gf, n_layer_all, gp.ops_per_layer_pp, gp.ops_global_pp, gp.n_nodes_pp);
+    }
+    llama_free(ctx);
+    llama_model_free(model);
+    gp.ok = gp.n_nodes_tg > 0;
+    return gp;
 }
 
 common_params_fit_status fit_advisor_probe::fitter_choice(fit_advisor_candidate & out) {

@@ -60,12 +60,19 @@ struct fit_advisor_copy_rate {
     double latency_us   = 0; // one small host-to-device transfer including synchronization
 };
 
+// a transfer between two backends as the scheduler performs it, whatever path the hardware takes
+struct fit_advisor_pair_rate {
+    double latency_us = 0; // a small tensor, including synchronization
+    double gb_s       = 0; // a large tensor
+};
+
 struct fit_advisor_device_measurements {
     fit_advisor_device_fingerprint fingerprint;
     std::string measured_at;
 
     std::map<std::string, fit_advisor_matmul_rate> matmul; // keyed by ggml type name, e.g. "q4_K"
     std::map<std::string, fit_advisor_attn_rate>   attn;   // keyed by "hd<head size>/<kv type>", e.g. "hd128/f16"
+    double op_overhead_us = 0; // fixed cost per graph op inside a graph, from the slope of a chain of tiny ops
 
     bool has_matmul(ggml_type type) const { return matmul.count(ggml_type_name(type)) > 0; }
     bool has_matmul_curve(ggml_type type) const; // measured with the batch-4 point too
@@ -96,6 +103,7 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
 // cache of measurements keyed by fingerprint
 struct fit_advisor_measurements {
     std::map<std::string, fit_advisor_device_measurements> devices;
+    std::map<std::string, fit_advisor_pair_rate> pairs; // keyed by "<src key>-><dst key>"
 
     // cached entry for this device covering every type in opts, measuring only what is missing and saving;
     // with force set everything is measured again
@@ -103,6 +111,10 @@ struct fit_advisor_measurements {
 
     // the entry already cached for this device, or nullptr
     const fit_advisor_device_measurements * find(ggml_backend_dev_t dev, int n_threads) const;
+
+    // transfer rates between every ordered pair of the given devices, measuring the missing ones and saving
+    void ensure_pairs(const std::vector<ggml_backend_dev_t> & devs, int n_threads, bool force);
+    const fit_advisor_pair_rate * find_pair(ggml_backend_dev_t src, ggml_backend_dev_t dst, int n_threads) const;
 
     static std::string default_path();
     bool load(const std::string & path);
@@ -113,3 +125,6 @@ struct fit_advisor_measurements {
 
 // log the measurements of one device at info level
 void fit_advisor_measurements_print(const fit_advisor_device_measurements & m);
+
+// smallest batch at which this device runs CPU-resident weights itself via a copy (op offload), 0 if never
+int fit_advisor_offload_min_batch(ggml_backend_dev_t dev);

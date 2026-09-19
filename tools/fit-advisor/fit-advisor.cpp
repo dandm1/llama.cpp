@@ -4,6 +4,7 @@
 // milestones so far: framework, inventory, probe, measurement; no cost-based search yet
 
 #include "allocation.h"
+#include "cost.h"
 #include "inventory.h"
 #include "measure.h"
 #include "probe.h"
@@ -407,5 +408,94 @@ int llama_fit_advisor(int argc, char ** argv) {
     common_log_flush(common_log_main());
 
     print_layer_costs(inv, devs, meas);
+
+    // cost of every allocation under the workload
+    const fit_advisor_workload wl = [&]() {
+        fit_advisor_workload w = fit_advisor_workload::preset(params.fit_advisor_workload);
+        w.n_ubatch = (uint32_t) params.n_ubatch;
+        return w;
+    }();
+
+    // transfers between every pair of devices, and the model's op counts per layer
+    cache.ensure_pairs(devs, mopts.n_threads, params.fit_advisor_remeasure);
+
+    const fit_advisor_graph_profile gp = probe.graph_profile(inv.n_layer + inv.n_layer_nextn);
+    if (gp.ok) {
+        uint32_t sum_tg = 0, sum_pp = 0;
+        for (uint32_t x : gp.ops_per_layer_tg) sum_tg += x;
+        for (uint32_t x : gp.ops_per_layer_pp) sum_pp += x;
+        LOG_INF("%s: graph ops: %u nodes at batch 1 (%.1f per layer, %u global), %u nodes at batch %u (%.1f per layer, %u global)\n", __func__,
+            gp.n_nodes_tg, gp.ops_per_layer_tg.empty() ? 0.0 : (double) sum_tg / gp.ops_per_layer_tg.size(), gp.ops_global_tg,
+            gp.n_nodes_pp, gp.n_batch_pp, gp.ops_per_layer_pp.empty() ? 0.0 : (double) sum_pp / gp.ops_per_layer_pp.size(), gp.ops_global_pp);
+    } else {
+        LOG_WRN("%s: graph profile unavailable: %s\n", __func__, gp.error.c_str());
+    }
+
+    std::vector<fit_advisor_cost_device> cost_devs;
+    std::vector<ggml_backend_dev_t>      cost_dev_handles;
+    for (const auto & buft : device_bufts) {
+        fit_advisor_cost_device cd;
+        cd.name   = buft;
+        cd.n_embd = inv.n_embd;
+        ggml_backend_dev_t handle = nullptr;
+        for (size_t i = 0; i < devs.size(); i++) {
+            if (buft == ggml_backend_dev_name(devs[i])) {
+                cd.meas = meas[i];
+                cd.offload_min_batch = fit_advisor_offload_min_batch(devs[i]);
+                handle = devs[i];
+            }
+        }
+        cost_devs.push_back(cd);
+        cost_dev_handles.push_back(handle);
+    }
+    {
+        fit_advisor_cost_device cpu;
+        cpu.name   = "CPU";
+        cpu.is_cpu = true;
+        cpu.n_embd = inv.n_embd;
+        ggml_backend_dev_t handle = nullptr;
+        for (size_t i = 0; i < devs.size(); i++) {
+            if (ggml_backend_dev_type(devs[i]) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                cpu.meas = meas[i];
+                handle = devs[i];
+            }
+        }
+        cost_devs.push_back(cpu);
+        cost_dev_handles.push_back(handle);
+    }
+    fit_advisor_pair_table pair_table(cost_devs.size(), std::vector<fit_advisor_pair_rate>(cost_devs.size()));
+    for (size_t a = 0; a < cost_devs.size(); a++) {
+        for (size_t b = 0; b < cost_devs.size(); b++) {
+            if (a != b && cost_dev_handles[a] && cost_dev_handles[b]) {
+                if (const auto * r = cache.find_pair(cost_dev_handles[a], cost_dev_handles[b], mopts.n_threads)) {
+                    pair_table[a][b] = *r;
+                }
+            }
+        }
+    }
+
+    printf("\nestimated cost per request, workload '%s': %u prompt + %u generated tokens, %u concurrent, ubatch %u\n",
+        params.fit_advisor_workload.c_str(), wl.prompt_tokens, wl.gen_tokens, wl.concurrency, wl.n_ubatch);
+    for (const auto & cd : cost_devs) {
+        if (!cd.is_cpu) {
+            printf("  %s runs CPU-resident weights itself from batch %d\n", cd.name.c_str(), cd.offload_min_batch);
+        }
+    }
+    printf("%-16s %4s %9s %9s %9s  %9s %9s %9s %9s\n",
+        "candidate", "fit", "gen tok/s", "pp tok/s", "request s", "weights", "attn", "overhead", "boundary");
+    printf("%-16s %4s %9s %9s %9s  %9s %9s %9s %9s\n", "", "", "", "", "", "[us/step]", "", "", "");
+    for (const auto & na : allocs) {
+        const fit_advisor_candidate  cand = na.alloc.to_candidate(inv, device_bufts, na.name);
+        const fit_advisor_projection & pj = probe.run(cand);
+        const fit_advisor_cost cost = fit_advisor_cost_estimate(inv, na.alloc, pj, gp, cost_devs, pair_table, wl);
+        if (!cost.ok) {
+            printf("%-16s %4s cost unavailable: %s\n", na.name.c_str(), pj.fits_all() ? "yes" : "NO", cost.error.c_str());
+            continue;
+        }
+        printf("%-16s %4s %9.1f %9.0f %9.2f  %9.0f %9.0f %9.0f %9.0f%s\n",
+            na.name.c_str(), pj.fits_all() ? "yes" : "NO", cost.gen_tokens_per_s, cost.prompt_tokens_per_s, cost.t_request_us * 1e-6,
+            cost.step_weights_us, cost.step_attn_us, cost.step_overhead_us, cost.step_boundary_us,
+            cost.error.empty() ? "" : ("  (" + cost.error + ")").c_str());
+    }
     return 0;
 }

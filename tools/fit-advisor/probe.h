@@ -68,11 +68,27 @@ struct fit_advisor_projection {
     bool fits_all() const;
 };
 
+// op counts of the model's compute graph, from a reserved graph on a no_alloc context
+struct fit_advisor_graph_profile {
+    bool ok = false;
+    std::string error;
+    uint32_t n_batch_pp = 0;
+    std::vector<uint32_t> ops_per_layer_tg; // graph nodes attributed to each layer at batch 1
+    std::vector<uint32_t> ops_per_layer_pp; // same for a prompt ubatch
+    uint32_t ops_global_tg = 0;             // nodes outside any layer (embeddings, output, ...)
+    uint32_t ops_global_pp = 0;
+    uint32_t n_nodes_tg = 0;
+    uint32_t n_nodes_pp = 0;
+};
+
 struct fit_advisor_probe {
     explicit fit_advisor_probe(const common_params & params);
 
     // project a candidate, memoized on the candidate key
     const fit_advisor_projection & run(const fit_advisor_candidate & cand);
+
+    // op counts per layer for the base parameters (independent of placement)
+    fit_advisor_graph_profile graph_profile(uint32_t n_layer_all);
 
     // what the built-in fitter would choose for the same base parameters, as a candidate
     // returns the fitter status; the candidate is filled in on success and failure alike

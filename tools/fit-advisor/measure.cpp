@@ -116,13 +116,13 @@ bench_result bench_graph(ggml_backend_t backend, const std::function<ggml_tensor
     bench_result res;
 
     ggml_init_params ip = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * 64 + ggml_graph_overhead(),
+        /*.mem_size   =*/ ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(512, false),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
     ggml_context * ctx = ggml_init(ip);
     ggml_tensor * out = build(ctx);
-    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 512, false);
     ggml_build_forward_expand(gf, out);
 
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
@@ -227,6 +227,22 @@ bench_result bench_attn(ggml_backend_t backend, bool flash, ggml_type type_kv, i
     }, { "mask" });
 }
 
+// a chain of n tiny matmuls, each consuming the previous result: the slope in n is the per-op cost inside a graph
+bench_result bench_chain(ggml_backend_t backend, int n_ops) {
+    return bench_graph(backend, [&](ggml_context * ctx) {
+        constexpr int64_t k = 256;
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * cur = x;
+        for (int i = 0; i < n_ops; i++) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, k);
+            ggml_format_name(w, "w%d", i);
+            cur = ggml_mul_mat(ctx, w, cur);
+        }
+        return cur;
+    }, {}, 100.0, 5);
+}
+
 std::string now_string() {
     const std::time_t t = std::time(nullptr);
     char buf[64];
@@ -265,6 +281,18 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
     LOG_INF("%s: measuring %s (%s)%s\n", __func__, m.fingerprint.name.c_str(), m.fingerprint.description.c_str(),
         is_cpu ? (" with " + std::to_string(n_threads) + " threads").c_str() : "");
 
+    // per-op cost inside a graph: the slope of a chain of tiny ops, so thread start-up and launch setup are excluded
+    {
+        const bench_result c8  = bench_chain(backend, 8);
+        const bench_result c40 = bench_chain(backend, 40);
+        if (c8.supported && c40.supported && c40.us_per_run > c8.us_per_run) {
+            m.op_overhead_us = (c40.us_per_run - c8.us_per_run) / 32.0;
+        } else if (c40.supported) {
+            m.op_overhead_us = c40.us_per_run / 40.0;
+        }
+        LOG_INF("%s:   per-op overhead inside a graph %.1f us\n", __func__, m.op_overhead_us);
+    }
+
     // matmul per weight type: two weight sizes at batch 1 give slope (bandwidth) and intercept (overhead)
     // the weights are sized in bytes so that the larger one exceeds any on-chip cache and measures memory bandwidth
     constexpr int64_t k = 4096;
@@ -300,12 +328,11 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
         r.supported = true;
         if (dt_us > 0) {
             r.bytes_per_s = (bytes2 - bytes1) / (dt_us * 1e-6);
-            r.overhead_us = std::max(0.0, b1.us_per_run - bytes1 / r.bytes_per_s * 1e6);
         } else {
             // noise dominated, fall back to the throughput of the larger size
             r.bytes_per_s = bytes2 / (b2.us_per_run * 1e-6);
-            r.overhead_us = 0;
         }
+        r.overhead_us = m.op_overhead_us;
         if (bp.supported) {
             r.gflops_pp = 2.0 * k * m1 * opts.n_batch_pp / (bp.us_per_run * 1e-6) / 1e9;
             r.s_per_byte_bpp = bp.us_per_run * 1e-6 / bytes1;
@@ -436,6 +463,7 @@ static json device_to_json(const fit_advisor_device_measurements & m) {
     json j;
     j["fingerprint"] = fingerprint_to_json(m.fingerprint);
     j["measured_at"] = m.measured_at;
+    j["op_overhead_us"] = m.op_overhead_us;
     for (const auto & [type, r] : m.matmul) {
         j["matmul"][type] = {
             { "supported",   r.supported },
@@ -474,6 +502,7 @@ static fit_advisor_device_measurements device_from_json(const json & j) {
     fit_advisor_device_measurements m;
     m.fingerprint = fingerprint_from_json(j.at("fingerprint"));
     m.measured_at = j.value("measured_at", "");
+    m.op_overhead_us = j.value("op_overhead_us", 0.0);
     if (j.contains("matmul")) {
         for (const auto & [type, r] : j.at("matmul").items()) {
             fit_advisor_matmul_rate mr;
@@ -540,6 +569,11 @@ bool fit_advisor_measurements::load(const std::string & path) {
         for (const auto & [key, jd] : j.at("devices").items()) {
             devices[key] = device_from_json(jd);
         }
+        if (j.contains("pairs")) {
+            for (const auto & [key, jp] : j.at("pairs").items()) {
+                pairs[key] = { jp.value("latency_us", 0.0), jp.value("gb_s", 0.0) };
+            }
+        }
         return true;
     } catch (const std::exception & e) {
         LOG_WRN("%s: ignoring %s: %s\n", __func__, path.c_str(), e.what());
@@ -553,6 +587,10 @@ std::string fit_advisor_measurements::to_json() const {
     j["devices"] = json::object();
     for (const auto & [key, m] : devices) {
         j["devices"][key] = device_to_json(m);
+    }
+    j["pairs"] = json::object();
+    for (const auto & [key, r] : pairs) {
+        j["pairs"][key] = { { "latency_us", r.latency_us }, { "gb_s", r.gb_s } };
     }
     return j.dump(2);
 }
@@ -643,6 +681,107 @@ void fit_advisor_measurements_print(const fit_advisor_device_measurements & m) {
             key.c_str(), r.n_kv, r.kv_bytes_per_s_fa / 1e9, r.us_pp_fa, r.kv_bytes_per_s_nofa / 1e9, r.us_pp_nofa,
             r.supported_fa ? "" : " [fa unsupported]", r.supported_nofa ? "" : " [no-fa unsupported]");
     }
-    LOG_INF("%s:   copy h2d %6.2f GB/s, d2h %6.2f GB/s, small transfer %6.1f us\n", __func__,
-        m.copy.h2d_gb_s, m.copy.d2h_gb_s, m.copy.latency_us);
+    LOG_INF("%s:   per-op overhead %.1f us; copy h2d %6.2f GB/s, d2h %6.2f GB/s, small transfer %6.1f us\n", __func__,
+        m.op_overhead_us, m.copy.h2d_gb_s, m.copy.d2h_gb_s, m.copy.latency_us);
+}
+
+static std::string pair_key(ggml_backend_dev_t src, ggml_backend_dev_t dst, int n_threads) {
+    const bool src_cpu = ggml_backend_dev_type(src) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    const bool dst_cpu = ggml_backend_dev_type(dst) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    return fit_advisor_fingerprint(src, src_cpu ? n_threads : 0).key() + "->" + fit_advisor_fingerprint(dst, dst_cpu ? n_threads : 0).key();
+}
+
+const fit_advisor_pair_rate * fit_advisor_measurements::find_pair(ggml_backend_dev_t src, ggml_backend_dev_t dst, int n_threads) const {
+    const auto it = pairs.find(pair_key(src, dst, n_threads > 0 ? n_threads : common_cpu_get_num_math()));
+    return it == pairs.end() ? nullptr : &it->second;
+}
+
+void fit_advisor_measurements::ensure_pairs(const std::vector<ggml_backend_dev_t> & devs, int n_threads_in, bool force) {
+    const int n_threads = n_threads_in > 0 ? n_threads_in : common_cpu_get_num_math();
+    bool changed = false;
+
+    for (ggml_backend_dev_t src : devs) {
+        for (ggml_backend_dev_t dst : devs) {
+            if (src == dst) {
+                continue;
+            }
+            const std::string key = pair_key(src, dst, n_threads);
+            if (!force && pairs.count(key)) {
+                continue;
+            }
+            ggml_backend_t bsrc = ggml_backend_dev_init(src, nullptr);
+            ggml_backend_t bdst = ggml_backend_dev_init(dst, nullptr);
+            if (!bsrc || !bdst) {
+                if (bsrc) ggml_backend_free(bsrc);
+                if (bdst) ggml_backend_free(bdst);
+                continue;
+            }
+            fit_advisor_pair_rate r;
+            constexpr size_t big_bytes   = 64ull * 1024 * 1024;
+            constexpr size_t small_bytes = 16 * 1024;
+
+            for (const size_t bytes : { small_bytes, big_bytes }) {
+                ggml_init_params ip = { ggml_tensor_overhead() * 4, nullptr, true };
+                ggml_context * cs = ggml_init(ip);
+                ggml_context * cd = ggml_init(ip);
+                ggml_tensor * ts = ggml_new_tensor_1d(cs, GGML_TYPE_F32, bytes / sizeof(float));
+                ggml_tensor * td = ggml_new_tensor_1d(cd, GGML_TYPE_F32, bytes / sizeof(float));
+                ggml_backend_buffer_t bs = ggml_backend_alloc_ctx_tensors(cs, bsrc);
+                ggml_backend_buffer_t bd = ggml_backend_alloc_ctx_tensors(cd, bdst);
+                if (bs && bd) {
+                    // warm up, then time
+                    ggml_backend_tensor_copy_async(bsrc, bdst, ts, td);
+                    ggml_backend_synchronize(bsrc);
+                    ggml_backend_synchronize(bdst);
+                    const int n = bytes == small_bytes ? 100 : 5;
+                    const int64_t t0 = ggml_time_us();
+                    for (int i = 0; i < n; i++) {
+                        ggml_backend_tensor_copy_async(bsrc, bdst, ts, td);
+                        ggml_backend_synchronize(bsrc);
+                        ggml_backend_synchronize(bdst);
+                    }
+                    const double us = (double) (ggml_time_us() - t0) / n;
+                    if (bytes == small_bytes) {
+                        r.latency_us = us;
+                    } else {
+                        r.gb_s = bytes / (us * 1e-6) / 1e9;
+                    }
+                }
+                if (bs) ggml_backend_buffer_free(bs);
+                if (bd) ggml_backend_buffer_free(bd);
+                ggml_free(cs);
+                ggml_free(cd);
+            }
+            ggml_backend_free(bsrc);
+            ggml_backend_free(bdst);
+
+            LOG_INF("%s: copy %s -> %s: %.1f us small, %.2f GB/s large\n", __func__,
+                ggml_backend_dev_name(src), ggml_backend_dev_name(dst), r.latency_us, r.gb_s);
+            pairs[key] = r;
+            changed = true;
+        }
+    }
+    if (changed) {
+        save(default_path());
+    }
+}
+
+int fit_advisor_offload_min_batch(ggml_backend_dev_t dev) {
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return 0;
+    }
+    ggml_init_params ip = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    int ret = 0;
+    for (int b = 1; b <= 4096; b *= 2) {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 4096, 4096);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, b);
+        ggml_tensor * op = ggml_mul_mat(ctx, w, x);
+        if (ggml_backend_dev_offload_op(dev, op)) {
+            ret = b;
+            break;
+        }
+    }
+    ggml_free(ctx);
+    return ret;
 }
