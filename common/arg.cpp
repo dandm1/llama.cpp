@@ -2918,7 +2918,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
     add_opt(common_arg(
         {"--optimize-for"}, "PRESET",
-        "workload to optimise for: chat (default), rag, batch, agent",
+        "workload to optimise for: chat (default), rag, batch, agent, gen (generation speed above all)",
         [](common_params & params, const std::string & value) {
             params.fit_advisor_workload = value;
         }

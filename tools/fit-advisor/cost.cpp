@@ -28,6 +28,12 @@ fit_advisor_workload fit_advisor_workload::preset(const std::string & name) {
         w.gen_tokens    = 2048;
         return w;
     }
+    if (name == "gen") {
+        // generation speed above all: a short prompt and a long answer
+        w.prompt_tokens = 256;
+        w.gen_tokens    = 2048;
+        return w;
+    }
     return w;
 }
 
