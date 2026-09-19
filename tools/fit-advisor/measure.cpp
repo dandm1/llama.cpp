@@ -287,6 +287,7 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
 
         const bench_result b1 = bench_matmul(backend, type, k, m1, 1);
         const bench_result b2 = bench_matmul(backend, type, k, m2, 1);
+        const bench_result b4 = bench_matmul(backend, type, k, m2, 4);
         const bench_result bp = bench_matmul(backend, type, k, m1, opts.n_batch_pp);
         if (!b1.supported || !b2.supported) {
             LOG_WRN("%s: matmul %s not measurable: %s\n", __func__, ggml_type_name(type), (b1.supported ? b2 : b1).reason.c_str());
@@ -307,11 +308,16 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
         }
         if (bp.supported) {
             r.gflops_pp = 2.0 * k * m1 * opts.n_batch_pp / (bp.us_per_run * 1e-6) / 1e9;
+            r.s_per_byte_bpp = bp.us_per_run * 1e-6 / bytes1;
+        }
+        r.s_per_byte_b1 = b2.us_per_run * 1e-6 / bytes2;
+        if (b4.supported) {
+            r.s_per_byte_b4 = b4.us_per_run * 1e-6 / bytes2;
         }
         m.matmul[ggml_type_name(type)] = r;
-        LOG_INF("%s:   matmul %-6s tg %7.1f GB/s, overhead %6.1f us, pp %7.0f GFLOPS (%d/%d/%d runs, %.1f s)\n", __func__,
-            ggml_type_name(type), r.bytes_per_s / 1e9, r.overhead_us, r.gflops_pp, b1.n_runs, b2.n_runs, bp.n_runs,
-            (ggml_time_us() - t_type0) * 1e-6);
+        LOG_INF("%s:   matmul %-6s tg %7.1f GB/s, b4 %7.1f GB/s/token, overhead %6.1f us, pp %7.0f GFLOPS (%d/%d/%d/%d runs, %.1f s)\n", __func__,
+            ggml_type_name(type), r.bytes_per_s / 1e9, r.s_per_byte_b4 > 0 ? 1.0 / r.s_per_byte_b4 / 4 / 1e9 : 0.0, r.overhead_us, r.gflops_pp,
+            b1.n_runs, b2.n_runs, b4.n_runs, bp.n_runs, (ggml_time_us() - t_type0) * 1e-6);
     }
 
     // attention per KV type
@@ -439,6 +445,9 @@ static json device_to_json(const fit_advisor_device_measurements & m) {
             { "n_batch_pp",  r.n_batch_pp },
             { "bytes_small", r.bytes_small },
             { "bytes_large", r.bytes_large },
+            { "s_per_byte_b1",  r.s_per_byte_b1 },
+            { "s_per_byte_b4",  r.s_per_byte_b4 },
+            { "s_per_byte_bpp", r.s_per_byte_bpp },
         };
     }
     for (const auto & [key, r] : m.attn) {
@@ -475,6 +484,9 @@ static fit_advisor_device_measurements device_from_json(const json & j) {
             mr.n_batch_pp  = r.value("n_batch_pp", 0);
             mr.bytes_small = r.value("bytes_small", (size_t) 0);
             mr.bytes_large = r.value("bytes_large", (size_t) 0);
+            mr.s_per_byte_b1  = r.value("s_per_byte_b1", 0.0);
+            mr.s_per_byte_b4  = r.value("s_per_byte_b4", 0.0);
+            mr.s_per_byte_bpp = r.value("s_per_byte_bpp", 0.0);
             m.matmul[type] = mr;
         }
     }
@@ -499,6 +511,11 @@ static fit_advisor_device_measurements device_from_json(const json & j) {
         m.copy.latency_us = c.value("latency_us", 0.0);
     }
     return m;
+}
+
+bool fit_advisor_device_measurements::has_matmul_curve(ggml_type type) const {
+    const auto it = matmul.find(ggml_type_name(type));
+    return it != matmul.end() && (!it->second.supported || it->second.s_per_byte_b4 > 0);
 }
 
 bool fit_advisor_device_measurements::has_attn(int head_size, ggml_type type_kv) const {
@@ -571,7 +588,7 @@ const fit_advisor_device_measurements & fit_advisor_measurements::ensure(ggml_ba
         const fit_advisor_device_measurements & have = it->second;
         todo.weight_types.clear();
         for (const ggml_type type : opts.weight_types) {
-            if (!have.has_matmul(type)) {
+            if (!have.has_matmul_curve(type)) {
                 todo.weight_types.push_back(type);
             }
         }
@@ -618,8 +635,8 @@ void fit_advisor_measurements_print(const fit_advisor_device_measurements & m) {
             LOG_INF("%s:   matmul %-6s not supported\n", __func__, type.c_str());
             continue;
         }
-        LOG_INF("%s:   matmul %-6s tg %7.1f GB/s, overhead %6.1f us, pp %7.0f GFLOPS at batch %d\n", __func__,
-            type.c_str(), r.bytes_per_s / 1e9, r.overhead_us, r.gflops_pp, r.n_batch_pp);
+        LOG_INF("%s:   matmul %-6s tg %7.1f GB/s, b4 %7.1f GB/s/token, overhead %6.1f us, pp %7.0f GFLOPS at batch %d\n", __func__,
+            type.c_str(), r.bytes_per_s / 1e9, r.s_per_byte_b4 > 0 ? 1.0 / r.s_per_byte_b4 / 4 / 1e9 : 0.0, r.overhead_us, r.gflops_pp, r.n_batch_pp);
     }
     for (const auto & [key, r] : m.attn) {
         LOG_INF("%s:   attn %-10s n_kv %d: fa tg %7.1f GB/s pp %8.0f us | no-fa tg %7.1f GB/s pp %8.0f us%s%s\n", __func__,

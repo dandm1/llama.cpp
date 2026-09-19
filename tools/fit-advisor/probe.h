@@ -20,7 +20,8 @@ struct fit_advisor_candidate {
     std::string name;
 
     int32_t  n_gpu_layers = -1;             // -1: all layers
-    uint32_t n_ctx        = 0;              // 0: from the model
+    uint32_t n_ctx        = 0;              // 0: from the model, total across slots
+    uint32_t n_slots      = 1;              // parallel sequences
     std::vector<float> tensor_split;        // empty: default split
     std::vector<fit_advisor_override> overrides;
 

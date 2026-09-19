@@ -34,6 +34,11 @@ struct fit_advisor_matmul_rate {
     double overhead_us = 0; // fixed cost per op at batch 1, the intercept
     double gflops_pp   = 0; // at the prompt-processing batch size, using the small weight
     int    n_batch_pp  = 0;
+
+    // seconds per weight byte at three batch sizes, the curve the cost model interpolates on
+    double s_per_byte_b1   = 0; // large weight, batch 1
+    double s_per_byte_b4   = 0; // large weight, batch 4
+    double s_per_byte_bpp  = 0; // small weight, batch n_batch_pp
     size_t bytes_small = 0; // weight sizes used, the large one is chosen to exceed on-chip caches
     size_t bytes_large = 0;
 };
@@ -63,6 +68,7 @@ struct fit_advisor_device_measurements {
     std::map<std::string, fit_advisor_attn_rate>   attn;   // keyed by "hd<head size>/<kv type>", e.g. "hd128/f16"
 
     bool has_matmul(ggml_type type) const { return matmul.count(ggml_type_name(type)) > 0; }
+    bool has_matmul_curve(ggml_type type) const; // measured with the batch-4 point too
     bool has_attn(int head_size, ggml_type type_kv) const;
     fit_advisor_copy_rate copy;
 };

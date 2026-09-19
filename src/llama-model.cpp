@@ -2840,6 +2840,14 @@ int32_t llama_model_n_layer(const llama_model * model) {
     return model->hparams.n_layer();
 }
 
+void llama_model_for_each_tensor(const llama_model * model, bool (*cb)(const ggml_tensor * t, void * ud), void * ud) {
+    for (const auto & [name, t] : model->tensors_by_name) {
+        if (!cb(t, ud)) {
+            return;
+        }
+    }
+}
+
 int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
 }

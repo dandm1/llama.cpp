@@ -132,3 +132,7 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+// visit every model tensor; the callback returns false to stop
+// in no_alloc mode t->buffer is a dummy buffer of the buffer type the tensor would be allocated in
+LLAMA_API void llama_model_for_each_tensor(const struct llama_model * model, bool (*cb)(const struct ggml_tensor * t, void * ud), void * ud);

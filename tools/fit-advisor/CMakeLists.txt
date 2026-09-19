@@ -2,7 +2,7 @@
 
 set(TARGET llama-fit-advisor-impl)
 
-add_library(${TARGET} inventory.cpp probe.cpp measure.cpp fit-advisor.cpp)
+add_library(${TARGET} inventory.cpp probe.cpp allocation.cpp measure.cpp fit-advisor.cpp)
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

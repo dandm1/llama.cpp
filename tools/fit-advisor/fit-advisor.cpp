@@ -3,6 +3,7 @@
 //
 // milestones so far: framework, inventory, probe, measurement; no cost-based search yet
 
+#include "allocation.h"
 #include "inventory.h"
 #include "measure.h"
 #include "probe.h"
@@ -27,89 +28,102 @@
 // satisfies -Wmissing-declarations
 int llama_fit_advisor(int argc, char ** argv);
 
-// regex alternation matching the layer indices [il_begin, il_end)
-static std::string layer_range_pattern(uint32_t il_begin, uint32_t il_end) {
-    std::string ret = "(";
-    for (uint32_t il = il_begin; il < il_end; il++) {
-        ret += (il > il_begin ? "|" : "") + std::to_string(il);
-    }
-    return ret + ")";
-}
+// candidate allocations for this milestone: a fixed set, later replaced by the search
+// each is an explicit allocation turned into loader arguments by the emitter
+struct named_allocation {
+    std::string name;
+    fit_advisor_allocation alloc;
+};
 
-// the fixed candidate set for this milestone
-static std::vector<fit_advisor_candidate> build_candidates(const common_params & params, const fit_advisor_inventory & inv) {
-    std::vector<fit_advisor_candidate> ret;
-
+static std::vector<named_allocation> build_allocations(const common_params & params, const fit_advisor_inventory & inv,
+                                                       const std::vector<std::string> & device_bufts, const fit_advisor_candidate & user) {
+    std::vector<named_allocation> ret;
     const uint32_t n_layer_all = inv.n_layer + inv.n_layer_nextn;
     const uint32_t ngl_max     = n_layer_all + 1; // +1 for the output layer
+    const size_t   nd          = device_bufts.size();
+    const uint32_t n_slots     = (uint32_t) std::max(1, params.n_parallel);
 
-    // exactly what the user asked for, i.e. what -fit off would load
-    {
-        fit_advisor_candidate c;
-        c.name         = "user";
-        c.n_gpu_layers = params.n_gpu_layers;
-        c.n_ctx        = params.n_ctx;
-        for (size_t i = 0; i < llama_max_devices(); i++) {
-            if (params.tensor_split[i] != 0.0f) {
-                c.tensor_split.assign(params.tensor_split, params.tensor_split + i + 1);
+    // split a number of GPU layers across the devices in the proportion of the user's -ts, or evenly
+    auto split = [&](uint32_t ngl) -> std::vector<uint32_t> {
+        std::vector<uint32_t> per(nd, 0);
+        if (nd == 0) {
+            return per;
+        }
+        std::vector<float> w(nd, 1.0f);
+        if (!user.tensor_split.empty()) {
+            for (size_t d = 0; d < nd && d < user.tensor_split.size(); d++) {
+                w[d] = user.tensor_split[d];
             }
         }
-        for (const auto & o : params.tensor_buft_overrides) {
-            if (o.pattern) {
-                c.overrides.push_back({ o.pattern, ggml_backend_buft_name(o.buft) });
-            }
+        float sum = 0;
+        for (float x : w) { sum += x; }
+        uint32_t assigned = 0;
+        for (size_t d = 0; d < nd; d++) {
+            per[d] = (uint32_t) std::lround(ngl * w[d] / sum);
+            assigned += per[d];
         }
-        ret.push_back(c);
-    }
+        // fix rounding on the last device
+        per[nd - 1] += ngl - std::min(ngl, assigned);
+        if (assigned > ngl) {
+            per[nd - 1] -= std::min(per[nd - 1], assigned - ngl);
+        }
+        return per;
+    };
+
+    auto add = [&](const std::string & name, uint32_t ngl, uint32_t n_ctx) {
+        ret.push_back({ name, fit_advisor_allocation::from_layer_split(inv, device_bufts, split(ngl), n_ctx, n_slots) });
+    };
 
     // everything on device with the minimum context the fitter would accept
-    {
-        fit_advisor_candidate c;
-        c.name         = "ctx-min";
-        c.n_gpu_layers = -1;
-        c.n_ctx        = (uint32_t) params.fit_params_min_ctx == UINT32_MAX ? 0 : (uint32_t) params.fit_params_min_ctx;
-        ret.push_back(c);
-    }
+    add("ctx-min", ngl_max, (uint32_t) params.fit_params_min_ctx == UINT32_MAX ? 0 : (uint32_t) params.fit_params_min_ctx);
 
     // whole-layer offload at a few fractions, what -ngl gives
     for (const double frac : { 0.75, 0.5, 0.25 }) {
-        fit_advisor_candidate c;
-        c.n_gpu_layers = (int32_t) std::lround(ngl_max * frac);
-        c.n_ctx        = params.n_ctx;
-        c.name         = "ngl-" + std::to_string(c.n_gpu_layers);
-        ret.push_back(c);
+        const uint32_t ngl = (uint32_t) std::lround(ngl_max * frac);
+        add("ngl-" + std::to_string(ngl), ngl, params.n_ctx);
     }
 
+    // tensor-level moves: all layers on device, selected weights on the CPU
+    auto move_kind = [&](const std::string & name, fit_advisor_tensor_kind kind, uint32_t il_begin, uint32_t il_end) {
+        fit_advisor_allocation a = fit_advisor_allocation::from_layer_split(inv, device_bufts, split(ngl_max), params.n_ctx, n_slots);
+        for (size_t i = 0; i < inv.tensors.size(); i++) {
+            const auto & t = inv.tensors[i];
+            if (t.kind == kind && t.layer >= (int32_t) il_begin && t.layer < (int32_t) il_end) {
+                a.tensor_device[i] = fit_advisor_allocation::DEV_CPU;
+            }
+        }
+        ret.push_back({ name, a });
+    };
     if (inv.is_moe()) {
-        // all experts in host memory, dense parts on device
-        fit_advisor_candidate c;
-        c.name         = "exps-cpu";
-        c.n_gpu_layers = -1;
-        c.n_ctx        = params.n_ctx;
-        c.overrides.push_back({ R"(blk\.\d+\.ffn_(up|down|gate|gate_up)_(ch|)exps)", "CPU" });
-        ret.push_back(c);
-
-        // experts of the second half of the layers in host memory
-        fit_advisor_candidate h;
-        h.name         = "exps-cpu-half";
-        h.n_gpu_layers = -1;
-        h.n_ctx        = params.n_ctx;
-        h.overrides.push_back({ R"(blk\.)" + layer_range_pattern(inv.n_layer / 2, inv.n_layer) + R"(\.ffn_(up|down|gate|gate_up)_(ch|)exps)", "CPU" });
-        ret.push_back(h);
+        move_kind("exps-cpu",      FIT_ADVISOR_TENSOR_FFN_EXPS, 0,                inv.n_layer);
+        move_kind("exps-cpu-half", FIT_ADVISOR_TENSOR_FFN_EXPS, inv.n_layer / 2,  inv.n_layer);
     } else {
-        // dense FFN tensors of the last quarter / half of the layers in host memory, KV cache stays on device
         for (const double frac : { 0.25, 0.5 }) {
             const uint32_t n_move = (uint32_t) std::lround(inv.n_layer * frac);
-            fit_advisor_candidate c;
-            c.name         = "ffn-cpu-" + std::to_string(n_move);
-            c.n_gpu_layers = -1;
-            c.n_ctx        = params.n_ctx;
-            c.overrides.push_back({ R"(blk\.)" + layer_range_pattern(inv.n_layer - n_move, inv.n_layer) + R"(\.ffn_(gate|up|down|gate_up)\.weight)", "CPU" });
-            ret.push_back(c);
+            move_kind("ffn-cpu-" + std::to_string(n_move), FIT_ADVISOR_TENSOR_FFN, inv.n_layer - n_move, inv.n_layer);
         }
     }
-
     return ret;
+}
+
+// the user's own arguments, i.e. what -fit off would load
+static fit_advisor_candidate user_candidate(const common_params & params) {
+    fit_advisor_candidate c;
+    c.name         = "user";
+    c.n_gpu_layers = params.n_gpu_layers;
+    c.n_ctx        = params.n_ctx;
+    c.n_slots      = (uint32_t) std::max(1, params.n_parallel);
+    for (size_t i = 0; i < llama_max_devices(); i++) {
+        if (params.tensor_split[i] != 0.0f) {
+            c.tensor_split.assign(params.tensor_split, params.tensor_split + i + 1);
+        }
+    }
+    for (const auto & o : params.tensor_buft_overrides) {
+        if (o.pattern) {
+            c.overrides.push_back({ o.pattern, ggml_backend_buft_name(o.buft) });
+        }
+    }
+    return c;
 }
 
 static std::string mib(double bytes) {
@@ -120,8 +134,8 @@ static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_ad
     constexpr double MiB = 1024.0 * 1024.0;
 
     printf("\n");
-    printf("%-16s %8s %5s  %-34s %9s %9s %9s %9s  %-4s %6s\n",
-        "candidate", "n_ctx", "ngl", "device", "free", "model", "ctx+cmp", "left", "fit", "t[s]");
+    printf("%-16s %8s %3s %5s  %-34s %9s %9s %9s %9s  %-4s %6s\n",
+        "candidate", "n_ctx", "np", "ngl", "device", "free", "model", "ctx+cmp", "left", "fit", "t[s]");
 
     for (const auto & c : cands) {
         const fit_advisor_projection & proj = probe.run(c);
@@ -134,15 +148,15 @@ static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_ad
         }
 
         if (!proj.ok) {
-            printf("%-16s %8s %5d  probe failed: %s\n", c.name.c_str(), ctx_buf, c.n_gpu_layers, proj.error.c_str());
+            printf("%-16s %8s %3u %5d  probe failed: %s\n", c.name.c_str(), ctx_buf, c.n_slots, c.n_gpu_layers, proj.error.c_str());
             continue;
         }
 
         const std::string host_total = "total " + mib(proj.host.total);
 
         if (proj.devices.empty()) {
-            printf("%-16s %8s %5d  %-34.34s %9s %9.0f %9.0f %9s  %-4s %6.2f\n",
-                c.name.c_str(), ctx_buf, c.n_gpu_layers, "Host (RAM)", host_total.c_str(),
+            printf("%-16s %8s %3u %5d  %-34.34s %9s %9.0f %9.0f %9s  %-4s %6.2f\n",
+                c.name.c_str(), ctx_buf, c.n_slots, c.n_gpu_layers, "Host (RAM)", host_total.c_str(),
                 proj.host.model / MiB, (proj.host.context + proj.host.compute) / MiB, "-", "-", proj.t_s);
             continue;
         }
@@ -150,15 +164,15 @@ static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_ad
         for (size_t id = 0; id < proj.devices.size(); id++) {
             const auto & d = proj.devices[id];
             const bool first = id == 0;
-            printf("%-16s %8s %5d  %-34.34s %9.0f %9.0f %9.0f %9.0f  %-4s %6s\n",
-                first ? c.name.c_str() : "", first ? ctx_buf : "", c.n_gpu_layers,
+            printf("%-16s %8s %3u %5d  %-34.34s %9.0f %9.0f %9.0f %9.0f  %-4s %6s\n",
+                first ? c.name.c_str() : "", first ? ctx_buf : "", c.n_slots, c.n_gpu_layers,
                 d.name.c_str(), d.free / MiB, d.model / MiB, (d.context + d.compute) / MiB, d.projected_free() / MiB,
                 d.fits() ? "yes" : "NO",
                 first ? std::to_string(proj.t_s).substr(0, 5).c_str() : "");
         }
         // host: total RAM only, the CPU backend cannot report a trustworthy free figure
-        printf("%-16s %8s %5s  %-34.34s %9s %9.0f %9.0f %9s  %-4s\n",
-            "", "", "", "Host (RAM)", host_total.c_str(),
+        printf("%-16s %8s %3s %5s  %-34.34s %9s %9.0f %9.0f %9s  %-4s\n",
+            "", "", "", "", "Host (RAM)", host_total.c_str(),
             proj.host.model / MiB, (proj.host.context + proj.host.compute) / MiB, "-", "-");
     }
 
@@ -288,9 +302,15 @@ int llama_fit_advisor(int argc, char ** argv) {
     }
     fit_advisor_inventory_print(inv);
 
-    std::vector<fit_advisor_candidate> cands = build_candidates(params, inv);
-
     fit_advisor_probe probe(params);
+
+    // the user's own arguments come first; their probe also reveals the model's devices for the allocations
+    std::vector<fit_advisor_candidate> cands = { user_candidate(params) };
+    const std::vector<std::string> device_bufts = fit_advisor_device_bufts(probe.run(cands[0]));
+    const std::vector<named_allocation> allocs = build_allocations(params, inv, device_bufts, cands[0]);
+    for (const auto & na : allocs) {
+        cands.push_back(na.alloc.to_candidate(inv, device_bufts, na.name));
+    }
 
     // the built-in fitter's answer for the same arguments, for comparison
     {
@@ -317,6 +337,16 @@ int llama_fit_advisor(int argc, char ** argv) {
 
     print_table(cands, probe);
     LOG_INF("%s: %zu probes executed\n", __func__, probe.n_probes);
+
+    if (params.fit_advisor_verify) {
+        LOG_INF("%s: verifying that the loader honours each allocation ...\n", __func__);
+        int n_bad_total = 0;
+        for (const auto & na : allocs) {
+            const int n_bad = fit_advisor_verify_allocation(params, inv, na.alloc, device_bufts, na.alloc.to_candidate(inv, device_bufts, na.name));
+            n_bad_total += std::max(0, n_bad);
+        }
+        LOG_INF("%s: verification done, %d misplaced tensors in total\n", __func__, n_bad_total);
+    }
 
     if (params.fit_advisor_no_measure) {
         return 0;
