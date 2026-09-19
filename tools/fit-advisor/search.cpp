@@ -257,17 +257,31 @@ struct searcher {
         base.n_ubatch = ub;
         const std::vector<group> groups = build_groups(wl);
 
-        // floor: every movable group with a positive gain on the CPU, probe for the overheads
-        fit_advisor_allocation floor = base;
-        for (const group & g : groups) {
-            const int home = base.tensor_device[g.idx[0]];
-            if (home >= 0 && group_gain(g, home, wl, slots) > 0) {
+        // floor: the expert groups on the CPU, dense weights stay with their layers; only if that does not fit are the
+        // dense groups moved off too. (with everything on the CPU and a large batch every op is offloaded and the compute
+        // buffer holds far more weight copies at once, so that floor can fail where a real allocation would not)
+        auto make_floor = [&](bool experts_only) {
+            fit_advisor_allocation f = base;
+            for (const group & g : groups) {
+                const int home = base.tensor_device[g.idx[0]];
+                if (home < 0 || group_gain(g, home, wl, slots) <= 0) {
+                    continue;
+                }
+                if (experts_only && inv.tensors[g.idx[0]].kind != FIT_ADVISOR_TENSOR_FFN_EXPS) {
+                    continue;
+                }
                 for (const size_t i : g.idx) {
-                    floor.tensor_device[i] = fit_advisor_allocation::DEV_CPU;
+                    f.tensor_device[i] = fit_advisor_allocation::DEV_CPU;
                 }
             }
-        }
+            return f;
+        };
+        fit_advisor_allocation floor = make_floor(true);
         const fit_advisor_projection * pj = &probe_alloc(floor, name);
+        if (pj->ok && !pj->fits_all()) {
+            floor = make_floor(false);
+            pj = &probe_alloc(floor, name);
+        }
         if (!pj->ok) {
             r.proj = *pj;
             return r;
