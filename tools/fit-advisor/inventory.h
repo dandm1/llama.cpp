@@ -6,6 +6,7 @@
 #include "ggml.h"
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -46,8 +47,17 @@ struct fit_advisor_inventory {
     uint32_t n_layer       = 0; // regular transformer layers
     uint32_t n_layer_nextn = 0; // MTP layers stored after the regular ones (blk.n_layer, ...)
     uint32_t n_expert      = 0;
+    uint32_t n_expert_used = 0; // experts read per token, 0 for dense models
     uint32_t n_ctx_train   = 0;
     uint32_t n_split       = 1; // number of GGUF shards
+
+    // attention geometry, for sizing the attention measurements
+    uint32_t n_embd    = 0;
+    uint32_t n_head    = 0;
+    uint32_t n_head_kv = 0;
+    uint32_t head_size = 0;
+
+    std::map<ggml_type, size_t> bytes_by_type; // over all tensors
 
     std::vector<fit_advisor_tensor> tensors;
     std::vector<fit_advisor_layer>  layers; // n_layer + n_layer_nextn entries
@@ -61,6 +71,12 @@ struct fit_advisor_inventory {
 
     // bytes of a given kind across the layers [il_begin, il_end)
     size_t layer_bytes(uint32_t il_begin, uint32_t il_end, fit_advisor_tensor_kind kind) const;
+
+    // tensor types that account for at least min_share of all bytes, largest first
+    std::vector<ggml_type> weight_types(double min_share) const;
+
+    // fraction of the expert bytes read per token, 1 for dense models
+    double expert_active_fraction() const { return n_expert > 0 && n_expert_used > 0 ? (double) n_expert_used / n_expert : 1.0; }
 };
 
 // throws std::runtime_error on failure

@@ -125,6 +125,7 @@ const fit_advisor_projection & fit_advisor_probe::run(const fit_advisor_candidat
             d.margin  = id < base.fit_params_target.size() ? (int64_t) base.fit_params_target[id] : 0;
             proj.devices.push_back(d);
         }
+        proj.host.total   = dmds.back().total;
         proj.host.model   = dmds.back().model;
         proj.host.context = dmds.back().context;
         proj.host.compute = dmds.back().compute;

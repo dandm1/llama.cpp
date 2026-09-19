@@ -4,6 +4,7 @@
 #include "llama.h"
 #include "log.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <regex>
 #include <stdexcept>
@@ -39,6 +40,37 @@ static uint64_t get_kv_uint(const gguf_context * ctx, const std::string & key, u
         default:
             throw std::runtime_error("metadata key '" + key + "' is not an integer");
     }
+}
+
+// like get_kv_uint but accepts an array of integers too, returning the maximum (some architectures store per-layer head counts)
+static uint64_t get_kv_uint_or_arr_max(const gguf_context * ctx, const std::string & key, uint64_t def) {
+    const int64_t id = gguf_find_key(ctx, key.c_str());
+    if (id < 0) {
+        return def;
+    }
+    if (gguf_get_kv_type(ctx, id) != GGUF_TYPE_ARRAY) {
+        return get_kv_uint(ctx, key, def);
+    }
+    const int64_t n = gguf_get_arr_n(ctx, id);
+    const gguf_type at = gguf_get_arr_type(ctx, id);
+    const void * data = gguf_get_arr_data(ctx, id);
+    uint64_t ret = 0;
+    for (int64_t i = 0; i < n; i++) {
+        uint64_t v = 0;
+        switch (at) {
+            case GGUF_TYPE_UINT8:  v = ((const uint8_t  *) data)[i]; break;
+            case GGUF_TYPE_INT8:   v = ((const int8_t   *) data)[i]; break;
+            case GGUF_TYPE_UINT16: v = ((const uint16_t *) data)[i]; break;
+            case GGUF_TYPE_INT16:  v = ((const int16_t  *) data)[i]; break;
+            case GGUF_TYPE_UINT32: v = ((const uint32_t *) data)[i]; break;
+            case GGUF_TYPE_INT32:  v = ((const int32_t  *) data)[i]; break;
+            case GGUF_TYPE_UINT64: v = ((const uint64_t *) data)[i]; break;
+            case GGUF_TYPE_INT64:  v = ((const int64_t  *) data)[i]; break;
+            default: return def;
+        }
+        ret = std::max(ret, v);
+    }
+    return ret;
 }
 
 static std::string get_kv_str(const gguf_context * ctx, const std::string & key, const std::string & def) {
@@ -103,6 +135,12 @@ static void add_shard(fit_advisor_inventory & inv, const std::string & path, boo
         inv.n_layer       = (uint32_t) get_kv_uint(ctx, inv.arch + ".block_count",          0);
         inv.n_layer_nextn = (uint32_t) get_kv_uint(ctx, inv.arch + ".nextn_predict_layers", 0);
         inv.n_expert      = (uint32_t) get_kv_uint(ctx, inv.arch + ".expert_count",         0);
+        inv.n_expert_used = (uint32_t) get_kv_uint(ctx, inv.arch + ".expert_used_count",    0);
+        inv.n_embd        = (uint32_t) get_kv_uint(ctx, inv.arch + ".embedding_length",     0);
+        inv.n_head        = (uint32_t) get_kv_uint_or_arr_max(ctx, inv.arch + ".attention.head_count",    0);
+        inv.n_head_kv     = (uint32_t) get_kv_uint_or_arr_max(ctx, inv.arch + ".attention.head_count_kv", inv.n_head);
+        inv.head_size     = (uint32_t) get_kv_uint(ctx, inv.arch + ".attention.key_length",
+                                                   inv.n_head > 0 ? inv.n_embd / inv.n_head : 0);
         inv.n_ctx_train   = (uint32_t) get_kv_uint(ctx, inv.arch + ".context_length",       0);
         inv.n_split       = (uint32_t) get_kv_uint(ctx, "split.count",                      1);
         if (inv.n_split == 0) {
@@ -159,6 +197,7 @@ fit_advisor_inventory fit_advisor_inventory_load(const std::string & path) {
 
     for (const auto & t : inv.tensors) {
         inv.total += t.nbytes;
+        inv.bytes_by_type[t.type] += t.nbytes;
         switch (t.kind) {
             case FIT_ADVISOR_TENSOR_ATTN:        inv.layers[t.layer].attn     += t.nbytes; break;
             case FIT_ADVISOR_TENSOR_FFN:         inv.layers[t.layer].ffn      += t.nbytes; break;
@@ -187,6 +226,18 @@ size_t fit_advisor_inventory::layer_bytes(uint32_t il_begin, uint32_t il_end, fi
     return ret;
 }
 
+std::vector<ggml_type> fit_advisor_inventory::weight_types(double min_share) const {
+    std::vector<std::pair<ggml_type, size_t>> v(bytes_by_type.begin(), bytes_by_type.end());
+    std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+    std::vector<ggml_type> ret;
+    for (const auto & [type, bytes] : v) {
+        if (total > 0 && (double) bytes / total >= min_share) {
+            ret.push_back(type);
+        }
+    }
+    return ret;
+}
+
 void fit_advisor_inventory_print(const fit_advisor_inventory & inv) {
     constexpr double MiB = 1024.0 * 1024.0;
 
@@ -195,6 +246,17 @@ void fit_advisor_inventory_print(const fit_advisor_inventory & inv) {
         __func__, inv.arch.c_str(), inv.n_layer, inv.n_layer_nextn, inv.n_expert, inv.n_ctx_train, inv.n_split);
     LOG_INF("%s: %zu tensors, %.1f MiB total: token_embd %.1f, output %.1f, global %.1f\n",
         __func__, inv.tensors.size(), inv.total / MiB, inv.token_embd / MiB, inv.output / MiB, inv.global / MiB);
+    LOG_INF("%s: n_embd = %" PRIu32 ", n_head = %" PRIu32 ", n_head_kv = %" PRIu32 ", head_size = %" PRIu32 ", experts used/total = %" PRIu32 "/%" PRIu32 "\n",
+        __func__, inv.n_embd, inv.n_head, inv.n_head_kv, inv.head_size, inv.n_expert_used, inv.n_expert);
+    {
+        std::string mix;
+        for (const ggml_type type : inv.weight_types(0.0)) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%s%s %.1f%%", mix.empty() ? "" : ", ", ggml_type_name(type), 100.0 * inv.bytes_by_type.at(type) / inv.total);
+            mix += buf;
+        }
+        LOG_INF("%s: types by bytes: %s\n", __func__, mix.c_str());
+    }
 
     const uint32_t n_all = (uint32_t) inv.layers.size();
     LOG_INF("%s: per layer [MiB]: attn %.1f, ffn %.1f, ffn_exps %.1f, other %.1f (sums over %" PRIu32 " layers)\n",

@@ -46,6 +46,7 @@ struct fit_advisor_device_projection {
 };
 
 struct fit_advisor_host_projection {
+    int64_t total  = 0; // physical RAM; free is not shown because the CPU backend reports all of it as free
     size_t model   = 0;
     size_t context = 0;
     size_t compute = 0;

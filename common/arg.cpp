@@ -2889,6 +2889,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_FIT_ESTIMATE"));
     add_opt(common_arg(
+        {"--remeasure"},
+        "discard cached device performance measurements and measure again",
+        [](common_params & params) {
+            params.fit_advisor_remeasure = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
+    add_opt(common_arg(
+        {"--no-measure"},
+        "skip device performance measurements, only project memory",
+        [](common_params & params) {
+            params.fit_advisor_no_measure = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
+    add_opt(common_arg(
         { "-fitt", "--fit-target" }, "MiB0,MiB1,MiB2,...",
         string_format("target margin per device for --fit, comma-separated list of values, "
             "single value is broadcast across all devices, default: %zu", params.fit_params_target[0]/(1024*1024)),
