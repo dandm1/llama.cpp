@@ -13,7 +13,7 @@
 
 std::string fit_advisor_candidate::key() const {
     std::ostringstream ss;
-    ss << "ngl=" << n_gpu_layers << " ctx=" << n_ctx << " np=" << n_slots;
+    ss << "ngl=" << n_gpu_layers << " ctx=" << n_ctx << " np=" << n_slots << " ub=" << n_ubatch;
     if (!tensor_split.empty()) {
         ss << " ts=";
         for (size_t i = 0; i < tensor_split.size(); i++) {
@@ -83,6 +83,10 @@ const fit_advisor_projection & fit_advisor_probe::run(const fit_advisor_candidat
     p.n_gpu_layers = cand.n_gpu_layers;
     p.n_ctx        = cand.n_ctx;
     p.n_parallel   = (int32_t) cand.n_slots;
+    if (cand.n_ubatch > 0) {
+        p.n_ubatch = (int32_t) cand.n_ubatch;
+        p.n_batch  = std::max(p.n_batch, p.n_ubatch);
+    }
 
     std::memset(p.tensor_split, 0, sizeof(p.tensor_split));
     for (size_t i = 0; i < cand.tensor_split.size() && i < llama_max_devices(); i++) {

@@ -20,8 +20,9 @@
 struct fit_advisor_allocation {
     static constexpr int DEV_CPU = -1;
 
-    uint32_t n_ctx   = 0; // total across slots, 0 = model default
-    uint32_t n_slots = 1;
+    uint32_t n_ctx    = 0; // total across slots, 0 = model default
+    uint32_t n_slots  = 1;
+    uint32_t n_ubatch = 0; // 0 = the base parameters' ubatch
 
     // number of layers on each device in device order, the output layer counts as one layer on the last used device
     // the remaining leading layers are on the CPU

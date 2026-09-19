@@ -62,6 +62,7 @@ fit_advisor_candidate fit_advisor_allocation::to_candidate(const fit_advisor_inv
     c.name         = name;
     c.n_ctx        = n_ctx;
     c.n_slots      = n_slots;
+    c.n_ubatch     = n_ubatch;
     c.n_gpu_layers = n_gpu_layers();
 
     // -ts as integer layer counts reproduces the blocks exactly, see get_layer_buft_list in llama-model.cpp
@@ -153,6 +154,10 @@ int fit_advisor_verify_allocation(const common_params & params, const fit_adviso
     p.n_gpu_layers = cand.n_gpu_layers;
     p.n_ctx        = cand.n_ctx;
     p.n_parallel   = (int32_t) cand.n_slots;
+    if (cand.n_ubatch > 0) {
+        p.n_ubatch = (int32_t) cand.n_ubatch;
+        p.n_batch  = std::max(p.n_batch, p.n_ubatch);
+    }
     std::fill(p.tensor_split, p.tensor_split + llama_max_devices(), 0.0f);
     for (size_t i = 0; i < cand.tensor_split.size() && i < llama_max_devices(); i++) {
         p.tensor_split[i] = cand.tensor_split[i];

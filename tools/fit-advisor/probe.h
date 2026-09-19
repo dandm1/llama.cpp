@@ -22,6 +22,7 @@ struct fit_advisor_candidate {
     int32_t  n_gpu_layers = -1;             // -1: all layers
     uint32_t n_ctx        = 0;              // 0: from the model, total across slots
     uint32_t n_slots      = 1;              // parallel sequences
+    uint32_t n_ubatch     = 0;              // 0: the base parameters' ubatch
     std::vector<float> tensor_split;        // empty: default split
     std::vector<fit_advisor_override> overrides;
 

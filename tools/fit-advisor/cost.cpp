@@ -117,6 +117,21 @@ double tensor_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t
 
 } // namespace
 
+double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, int dev_idx,
+                                  const std::vector<fit_advisor_cost_device> & devices, uint32_t batch) {
+    std::string err;
+    return tensor_us(inv, t, dev_idx, dev_idx, devices, batch, err);
+}
+
+double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, int dev_idx,
+                                     const std::vector<fit_advisor_cost_device> & devices, const fit_advisor_workload & wl, uint32_t n_slots) {
+    const uint32_t batch_gen = std::max<uint32_t>(1, std::min(wl.concurrency, n_slots));
+    const uint32_t n_ub      = std::max<uint32_t>(1, wl.n_ubatch);
+    const double n_pp_steps  = std::ceil((double) wl.prompt_tokens / n_ub);
+    return wl.gen_tokens * fit_advisor_tensor_cost_us(inv, t, dev_idx, devices, batch_gen)
+         + n_pp_steps    * fit_advisor_tensor_cost_us(inv, t, dev_idx, devices, n_ub);
+}
+
 fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, const fit_advisor_allocation & alloc,
                                            const fit_advisor_projection & proj, const fit_advisor_graph_profile & gp,
                                            const std::vector<fit_advisor_cost_device> & devices, const fit_advisor_pair_table & pairs,

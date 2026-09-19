@@ -482,6 +482,7 @@ struct common_params {
     std::string fit_advisor_measure_types;  // llama-fit-advisor: extra weight types to measure, comma-separated
     bool    fit_advisor_verify     = false; // llama-fit-advisor: verify each candidate's placement through a no_alloc load
     std::string fit_advisor_workload = "chat"; // llama-fit-advisor: workload preset to optimise for
+    int32_t fit_advisor_search_iters = 20000;  // llama-fit-advisor: simulated annealing iterations, 0 = seeds only
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
