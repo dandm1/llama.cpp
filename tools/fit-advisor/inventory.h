@@ -75,6 +75,10 @@ struct fit_advisor_inventory {
     // tensor types that account for at least min_share of all bytes, largest first
     std::vector<ggml_type> weight_types(double min_share) const;
 
+    // types used by any tensor of at least min_bytes, largest first: what has to be measured to price every layer
+    // norms and biases fall under the threshold
+    std::vector<ggml_type> matmul_types(size_t min_bytes) const;
+
     // fraction of the expert bytes read per token, 1 for dense models
     double expert_active_fraction() const { return n_expert > 0 && n_expert_used > 0 ? (double) n_expert_used / n_expert : 1.0; }
 };

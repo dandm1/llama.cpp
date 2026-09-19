@@ -324,7 +324,7 @@ int llama_fit_advisor(int argc, char ** argv) {
 
     // measure the devices for the types this model actually uses
     fit_advisor_measure_options mopts;
-    mopts.weight_types = inv.weight_types(0.01); // every type holding at least 1% of the bytes
+    mopts.weight_types = inv.matmul_types(1024 * 1024); // every type used by a weight tensor of at least 1 MiB
     for (const auto & name : string_split<std::string>(params.fit_advisor_measure_types, ',')) {
         bool found = false;
         for (int t = 0; t < GGML_TYPE_COUNT && !found; t++) {

@@ -132,8 +132,11 @@ static void add_shard(fit_advisor_inventory & inv, const std::string & path, boo
             gguf_free(ctx);
             throw std::runtime_error("GGUF has no general.architecture key: " + path);
         }
-        inv.n_layer       = (uint32_t) get_kv_uint(ctx, inv.arch + ".block_count",          0);
+        // block_count includes the MTP layers, which are the last nextn_predict_layers blocks (same as llama-hparams)
+        const uint32_t n_layer_all = (uint32_t) get_kv_uint(ctx, inv.arch + ".block_count",          0);
         inv.n_layer_nextn = (uint32_t) get_kv_uint(ctx, inv.arch + ".nextn_predict_layers", 0);
+        inv.n_layer_nextn = std::min(inv.n_layer_nextn, n_layer_all);
+        inv.n_layer       = n_layer_all - inv.n_layer_nextn;
         inv.n_expert      = (uint32_t) get_kv_uint(ctx, inv.arch + ".expert_count",         0);
         inv.n_expert_used = (uint32_t) get_kv_uint(ctx, inv.arch + ".expert_used_count",    0);
         inv.n_embd        = (uint32_t) get_kv_uint(ctx, inv.arch + ".embedding_length",     0);
@@ -190,7 +193,7 @@ fit_advisor_inventory fit_advisor_inventory_load(const std::string & path) {
     }
     const uint32_t n_layers_seen = (uint32_t) (il_max + 1);
     if (n_layers_seen > inv.n_layer + inv.n_layer_nextn) {
-        // metadata did not declare the extra blocks, trust the tensors
+        // more blocks than the metadata declares, trust the tensors and treat the extra ones as MTP
         inv.n_layer_nextn = n_layers_seen - inv.n_layer;
     }
     inv.layers.assign(inv.n_layer + inv.n_layer_nextn, {});
@@ -222,6 +225,24 @@ size_t fit_advisor_inventory::layer_bytes(uint32_t il_begin, uint32_t il_end, fi
             case FIT_ADVISOR_TENSOR_LAYER_OTHER: ret += layers[il].other;    break;
             default: break;
         }
+    }
+    return ret;
+}
+
+std::vector<ggml_type> fit_advisor_inventory::matmul_types(size_t min_bytes) const {
+    // size rather than kind: norms and biases are kilobytes, anything larger is a weight that gets multiplied,
+    // including the recurrent-state projections of hybrid models that the classifier files under "other"
+    std::map<ggml_type, size_t> bytes;
+    for (const auto & t : tensors) {
+        if (t.nbytes >= min_bytes) {
+            bytes[t.type] += t.nbytes;
+        }
+    }
+    std::vector<std::pair<ggml_type, size_t>> v(bytes.begin(), bytes.end());
+    std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+    std::vector<ggml_type> ret;
+    for (const auto & [type, b] : v) {
+        ret.push_back(type);
     }
     return ret;
 }
