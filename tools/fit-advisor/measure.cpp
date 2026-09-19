@@ -770,7 +770,8 @@ int fit_advisor_offload_min_batch(ggml_backend_dev_t dev) {
     if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
         return 0;
     }
-    ggml_init_params ip = { ggml_tensor_overhead() * 8, nullptr, true };
+    // three tensors per probed batch size, thirteen sizes
+    ggml_init_params ip = { ggml_tensor_overhead() * 64, nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     int ret = 0;
     for (int b = 1; b <= 4096; b *= 2) {
