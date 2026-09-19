@@ -51,6 +51,8 @@ struct common_device_memory_data {
     size_t  model;
     size_t  context;
     size_t  compute;
+    size_t  scratch;         // backend-internal scratch outside the compute buffer, estimated; 0 with scratch_unknown when unavailable
+    bool    scratch_unknown;
 };
 
 using common_device_memory_data_vec = std::vector<common_device_memory_data>;

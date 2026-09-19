@@ -80,6 +80,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             ret.back().mb.model   += mb.model;
             ret.back().mb.context += mb.context;
             ret.back().mb.compute += mb.compute;
+            ret.back().mb.scratch  = std::max(ret.back().mb.scratch, mb.scratch);
+            ret.back().mb.scratch_unknown = ret.back().mb.scratch_unknown || mb.scratch_unknown;
             continue;
         }
 
@@ -92,6 +94,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 ret[i].mb.model   += mb.model;
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
+                ret[i].mb.scratch  = std::max(ret[i].mb.scratch, mb.scratch);
+                ret[i].mb.scratch_unknown = ret[i].mb.scratch_unknown || mb.scratch_unknown;
                 break;
             }
         }
@@ -172,6 +176,8 @@ common_device_memory_data_vec common_get_device_memory_data(
         ret[i].model   = impl[i].mb.model;
         ret[i].context = impl[i].mb.context;
         ret[i].compute = impl[i].mb.compute;
+        ret[i].scratch = impl[i].mb.scratch;
+        ret[i].scratch_unknown = impl[i].mb.scratch_unknown;
     }
     return ret;
 }

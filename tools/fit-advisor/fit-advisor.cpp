@@ -135,8 +135,8 @@ static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_ad
     constexpr double MiB = 1024.0 * 1024.0;
 
     printf("\n");
-    printf("%-16s %8s %3s %5s  %-34s %9s %9s %9s %9s  %-4s %6s\n",
-        "candidate", "n_ctx", "np", "ngl", "device", "free", "model", "ctx+cmp", "left", "fit", "t[s]");
+    printf("%-16s %8s %3s %5s  %-34s %9s %9s %9s %8s %9s  %-4s %6s\n",
+        "candidate", "n_ctx", "np", "ngl", "device", "free", "model", "ctx+cmp", "scratch", "left", "fit", "t[s]");
 
     for (const auto & c : cands) {
         const fit_advisor_projection & proj = probe.run(c);
@@ -156,28 +156,32 @@ static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_ad
         const std::string host_total = "total " + mib(proj.host.total);
 
         if (proj.devices.empty()) {
-            printf("%-16s %8s %3u %5d  %-34.34s %9s %9.0f %9.0f %9s  %-4s %6.2f\n",
+            printf("%-16s %8s %3u %5d  %-34.34s %9s %9.0f %9.0f %7.0f%s %9s  %-4s %6.2f\n",
                 c.name.c_str(), ctx_buf, c.n_slots, c.n_gpu_layers, "Host (RAM)", host_total.c_str(),
-                proj.host.model / MiB, (proj.host.context + proj.host.compute) / MiB, "-", "-", proj.t_s);
+                proj.host.model / MiB, (proj.host.context + proj.host.compute) / MiB,
+                proj.host.scratch / MiB, proj.host.scratch_unknown ? "?" : " ", "-", "-", proj.t_s);
             continue;
         }
 
         for (size_t id = 0; id < proj.devices.size(); id++) {
             const auto & d = proj.devices[id];
             const bool first = id == 0;
-            printf("%-16s %8s %3u %5d  %-34.34s %9.0f %9.0f %9.0f %9.0f  %-4s %6s\n",
+            printf("%-16s %8s %3u %5d  %-34.34s %9.0f %9.0f %9.0f %7.0f%s %9.0f  %-4s %6s\n",
                 first ? c.name.c_str() : "", first ? ctx_buf : "", c.n_slots, c.n_gpu_layers,
-                d.name.c_str(), d.free / MiB, d.model / MiB, (d.context + d.compute) / MiB, d.projected_free() / MiB,
+                d.name.c_str(), d.free / MiB, d.model / MiB, (d.context + d.compute) / MiB,
+                d.scratch / MiB, d.scratch_unknown ? "?" : " ", d.projected_free() / MiB,
                 d.fits() ? "yes" : "NO",
                 first ? std::to_string(proj.t_s).substr(0, 5).c_str() : "");
         }
         // host: total RAM only, the CPU backend cannot report a trustworthy free figure
-        printf("%-16s %8s %3s %5s  %-34.34s %9s %9.0f %9.0f %9s  %-4s\n",
+        printf("%-16s %8s %3s %5s  %-34.34s %9s %9.0f %9.0f %7.0f%s %9s  %-4s\n",
             "", "", "", "", "Host (RAM)", host_total.c_str(),
-            proj.host.model / MiB, (proj.host.context + proj.host.compute) / MiB, "-", "-");
+            proj.host.model / MiB, (proj.host.context + proj.host.compute) / MiB,
+            proj.host.scratch / MiB, proj.host.scratch_unknown ? "?" : " ", "-", "-");
     }
 
     printf("\n[MiB] free: device memory free when probed; model/ctx+cmp: projected weights and context+compute buffers;\n");
+    printf("scratch: backend pool memory the graph's ops need outside those buffers, estimated per op (? = some op had no estimate);\n");
     printf("left: free - projected use; fit: left >= --fit-target margin; Host row: projected host-side use, free RAM unknown\n");
 
     printf("\narguments per candidate (llama-bench takes the same flags, with ';' instead of ',' between -ot entries):\n");

@@ -125,6 +125,8 @@ const fit_advisor_projection & fit_advisor_probe::run(const fit_advisor_candidat
             d.model   = dmds[id].model;
             d.context = dmds[id].context;
             d.compute = dmds[id].compute;
+            d.scratch = dmds[id].scratch;
+            d.scratch_unknown = dmds[id].scratch_unknown;
             d.margin  = id < base.fit_params_target.size() ? (int64_t) base.fit_params_target[id] : 0;
             proj.devices.push_back(d);
         }
@@ -132,6 +134,8 @@ const fit_advisor_projection & fit_advisor_probe::run(const fit_advisor_candidat
         proj.host.model   = dmds.back().model;
         proj.host.context = dmds.back().context;
         proj.host.compute = dmds.back().compute;
+        proj.host.scratch = dmds.back().scratch;
+        proj.host.scratch_unknown = dmds.back().scratch_unknown;
         proj.ok = true;
     } catch (const std::exception & e) {
         proj.ok    = false;

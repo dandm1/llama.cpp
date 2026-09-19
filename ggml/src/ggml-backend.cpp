@@ -650,6 +650,15 @@ bool ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_te
     return false;
 }
 
+size_t ggml_backend_dev_get_op_scratch_size(ggml_backend_dev_t device, const struct ggml_tensor * op) {
+    GGML_ASSERT(device);
+    if (device->iface.get_op_scratch_size != NULL) {
+        return device->iface.get_op_scratch_size(device, op);
+    }
+
+    return GGML_BACKEND_SCRATCH_UNKNOWN;
+}
+
 // Backend (reg)
 
 const char * ggml_backend_reg_name(ggml_backend_reg_t reg) {
@@ -1970,6 +1979,35 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_backend_sched_split_graph(sched, measure_graph);
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+}
+
+void ggml_backend_sched_get_scratch_sizes(ggml_backend_sched_t sched, size_t * sizes, bool * unknown) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(sizes);
+    GGML_ASSERT(unknown);
+
+    for (int b = 0; b < sched->n_backends; b++) {
+        sizes[b]   = 0;
+        unknown[b] = false;
+    }
+
+    for (int i = 0; i < sched->graph.n_nodes; i++) {
+        const int b = sched->node_backend_ids[i];
+        if (b < 0 || b >= sched->n_backends) {
+            continue;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+        if (dev == NULL) {
+            unknown[b] = true;
+            continue;
+        }
+        const size_t size = ggml_backend_dev_get_op_scratch_size(dev, sched->graph.nodes[i]);
+        if (size == GGML_BACKEND_SCRATCH_UNKNOWN) {
+            unknown[b] = true;
+        } else {
+            sizes[b] = std::max(sizes[b], size);
+        }
+    }
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {

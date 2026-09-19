@@ -1587,6 +1587,7 @@ static const struct ggml_backend_device_i ggml_backend_openvino_device_interface
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
+    /* .get_op_scratch_size    = */ NULL,
 };
 
 namespace {

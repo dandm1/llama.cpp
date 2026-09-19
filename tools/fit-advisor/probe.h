@@ -39,9 +39,11 @@ struct fit_advisor_device_projection {
     size_t  model   = 0;
     size_t  context = 0;
     size_t  compute = 0;
+    size_t  scratch = 0;         // backend-internal scratch outside the compute buffer, estimated
+    bool    scratch_unknown = false; // some op had no estimate, the margin has to cover it
     int64_t margin  = 0; // target margin from --fit-target
 
-    int64_t used()           const { return (int64_t) (model + context + compute); }
+    int64_t used()           const { return (int64_t) (model + context + compute + scratch); }
     int64_t projected_free() const { return free - used(); }
     bool    fits()           const { return projected_free() >= margin; }
 };
@@ -51,8 +53,10 @@ struct fit_advisor_host_projection {
     size_t model   = 0;
     size_t context = 0;
     size_t compute = 0;
+    size_t scratch = 0;
+    bool   scratch_unknown = false;
 
-    size_t used() const { return model + context + compute; }
+    size_t used() const { return model + context + compute + scratch; }
 };
 
 struct fit_advisor_projection {

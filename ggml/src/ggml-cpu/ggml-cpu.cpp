@@ -504,6 +504,7 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
+    /* .get_op_scratch_size    = */ NULL,
 };
 
 // CPU backend - backend (reg)

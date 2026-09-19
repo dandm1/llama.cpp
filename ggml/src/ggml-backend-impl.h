@@ -215,6 +215,10 @@ extern "C" {
         ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
         void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
         void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+
+        // (optional) bytes of backend-internal scratch memory (temporary pool allocations outside the compute buffer)
+        // that computing this op on this device needs; return GGML_BACKEND_SCRATCH_UNKNOWN when there is no estimate
+        size_t (*get_op_scratch_size)(ggml_backend_dev_t dev, const struct ggml_tensor * op);
     };
 
     struct ggml_backend_device {

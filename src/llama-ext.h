@@ -68,9 +68,14 @@ struct llama_memory_breakdown_data {
     size_t model   = 0; // memory allocated for the model
     size_t context = 0; // memory allocated for the context
     size_t compute = 0; // memory allocated for temporary compute buffers
+    size_t scratch = 0; // backend-internal scratch memory the graph's ops need outside the compute buffer (estimate)
+    bool   scratch_unknown = false; // some op on this buffer type's device had no scratch estimate
 
     size_t total() const {
         return model + context + compute;
+    }
+    size_t total_with_scratch() const {
+        return model + context + compute + scratch;
     }
 };
 

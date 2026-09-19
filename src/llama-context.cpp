@@ -402,6 +402,8 @@ llama_context::llama_context(
         backend_buft.clear();
         backend_ptrs.clear();
         backend_buf_exp_size.clear();
+        backend_scratch_exp_size.clear();
+        backend_scratch_unknown.clear();
 
         for (auto & backend : backends) {
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
@@ -419,6 +421,8 @@ llama_context::llama_context(
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
             backend_buf_exp_size.push_back(0);
+            backend_scratch_exp_size.push_back(0);
+            backend_scratch_unknown.push_back(false);
         }
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
@@ -632,6 +636,22 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
+    // in no_alloc mode also collect the scratch (pool) memory the split graphs need, the maximum over the graphs
+    auto fold_scratch_sizes = [&]() {
+        if (!model.hparams.no_alloc) {
+            return;
+        }
+        std::vector<size_t> sizes(backend_ptrs.size(), 0);
+        std::vector<char>   unknown(backend_ptrs.size(), 0);
+        ggml_backend_sched_get_scratch_sizes(sched.get(), sizes.data(), (bool *) unknown.data());
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            backend_scratch_exp_size[i] = std::max(backend_scratch_exp_size[i], sizes[i]);
+            if (unknown[i]) {
+                backend_scratch_unknown[i] = true;
+            }
+        }
+    };
+
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
@@ -650,6 +670,7 @@ void llama_context::sched_reserve() {
 
         n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_pp  = ggml_graph_n_nodes(gf);
+        fold_scratch_sizes();
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
@@ -661,6 +682,7 @@ void llama_context::sched_reserve() {
 
         n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_tg  = ggml_graph_n_nodes(gf);
+        fold_scratch_sizes();
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -683,6 +705,7 @@ void llama_context::sched_reserve() {
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
+        fold_scratch_sizes();
     }
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -3399,6 +3422,12 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += backend_buf_exp_size[i];
+            if (i < backend_scratch_exp_size.size()) {
+                ret[buft].scratch = std::max(ret[buft].scratch, backend_scratch_exp_size[i]);
+                if (backend_scratch_unknown[i]) {
+                    ret[buft].scratch_unknown = true;
+                }
+            }
         }
     } else {
         for (const auto & backend_ptr : backends) {

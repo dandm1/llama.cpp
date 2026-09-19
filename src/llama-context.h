@@ -366,6 +366,8 @@ private:
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+    std::vector<size_t>                     backend_scratch_exp_size; // expected scratch (pool) sizes, no_alloc only
+    std::vector<bool>                       backend_scratch_unknown;  // some op on the backend had no scratch estimate
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
     std::array<llm_graph_result_ptr, 2> gf_res_prev;

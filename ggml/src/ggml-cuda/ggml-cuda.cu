@@ -5540,6 +5540,163 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
     }
 }
 
+// scratch (pool) memory estimates, mirroring the dispatch decisions of the compute paths above
+// the pool is a stack that is emptied after every op, so the scheduler takes the maximum over the graph's nodes
+
+static size_t ggml_cuda_scratch_q8_1(const ggml_tensor * src1, int64_t n_rows_override = -1) {
+    // src1 quantized to q8_1 with the row length padded, as mmvq/mmq do
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    const int64_t n_rows = n_rows_override >= 0 ? n_rows_override : src1->ne[1] * src1->ne[2] * src1->ne[3];
+    return (size_t) n_rows * ne10_padded * sizeof(block_q8_1) / QK8_1;
+}
+
+static size_t ggml_cuda_scratch_cublas(int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    ggml_type compute_type = src0->type;
+    if (ggml_is_quantized(compute_type)) {
+        compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
+        compute_type = GGML_TYPE_F32;
+    } else if (compute_type == GGML_TYPE_BF16 && !fast_bf16_hardware_available(cc)) {
+        if (GGML_CUDA_CC_IS_AMD(cc) && src1->ne[1] > 32) {
+            compute_type = GGML_TYPE_F32;
+        }
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && src1->ne[1] > (cc >= GGML_CUDA_CC_VOLTA ? 8 : 128)) {
+            compute_type = GGML_TYPE_F32;
+        }
+    }
+    if (dst->op_params[0] == GGML_PREC_F32) {
+        compute_type = GGML_TYPE_F32;
+    }
+    const size_t ts = ggml_type_size(compute_type);
+    size_t ret = 0;
+    if (src0->type != compute_type) {
+        ret += (size_t) ggml_nelements(src0) * ts; // whole weight converted
+    }
+    if (src1->type != compute_type) {
+        ret += (size_t) ggml_nelements(src1) * ts;
+    }
+    if (compute_type != GGML_TYPE_F32) {
+        ret += (size_t) ggml_nelements(dst) * ts;  // output computed in the compute type, then converted
+    }
+    return ret;
+}
+
+static size_t ggml_cuda_scratch_mul_mat(int device, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int cc        = ggml_cuda_info().devices[device].cc;
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int64_t ne11  = src1->ne[1];
+
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return ggml_cuda_scratch_cublas(cc, src0, src1, dst);
+    }
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+        return 0;
+    }
+    if (src0->ne[1] == 1 && ne11 > MMVF_MAX_BATCH_SIZE && dst->ne[2] == 1 && dst->ne[3] == 1 && src0->type == GGML_TYPE_F32) {
+        return 0;
+    }
+    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        return 0;
+    }
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        return ggml_cuda_scratch_q8_1(src1);
+    }
+    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        return ggml_cuda_scratch_q8_1(src1) + 8u*1024*1024; // plus the J_max tail block and scales
+    }
+    return ggml_cuda_scratch_cublas(cc, src0, src1, dst);
+}
+
+static size_t ggml_cuda_scratch_mul_mat_id(int device, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    const int cc = ggml_cuda_info().devices[device].cc;
+
+    const int64_t n_tokens      = dst->ne[2];
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t ne_get_rows   = src1->ne[2] * n_expert_used;
+
+    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        if (n_tokens <= MMVQ_MAX_BATCH_SIZE) {
+            if (ggml_is_quantized(src0->type)) {
+                if (n_tokens <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+                    return ggml_cuda_scratch_q8_1(src1);
+                }
+            } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                return 0;
+            }
+        }
+        if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/ src0->ne[2])) {
+            return (size_t) ne_get_rows * 2 * sizeof(int32_t) + (src0->ne[2] + 1) * sizeof(int32_t)
+                 + ggml_cuda_scratch_q8_1(src1, ne_get_rows) + 8u*1024*1024;
+        }
+        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/ true)) {
+            return (size_t) ne_get_rows * 2 * sizeof(int32_t) + (src0->ne[2] + 1) * sizeof(int32_t);
+        }
+    }
+
+    // generic path: gather the rows per expert, run one matmul per expert, scatter back
+    const ggml_type type_src1_sorted = (src0->type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc))
+        || ggml_is_quantized(src0->type) ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    size_t ret = (size_t) 2 * ne_get_rows * sizeof(int32_t);
+    ret += (size_t) ne_get_rows * src1->ne[0] * ggml_type_size(type_src1_sorted);
+    ret += (size_t) n_tokens * n_expert_used * dst->ne[0] * sizeof(float);
+
+    // the per-expert matmul may convert one expert slice on the cuBLAS path; bound it by the slice in f16
+    ret += (size_t) src0->ne[0] * src0->ne[1] * sizeof(ggml_fp16_t);
+    return ret;
+}
+
+static size_t ggml_cuda_scratch_flash_attn(int device, const ggml_tensor * dst) {
+    // K/V conversions to f16 live in the tensor allocation (see ggml_cuda_flash_attn_ext_get_alloc_size), the pool
+    // holds the split-K partial results: parallel_blocks copies of the output, bounded by the number of KV tiles
+    if (!ggml_cuda_flash_attn_ext_supported(device, dst)) {
+        return 0;
+    }
+    const ggml_tensor * K = dst->src[1];
+    const int64_t n_kv = K->ne[1];
+    const int64_t parallel_blocks = std::min<int64_t>((n_kv + 63) / 64, 512);
+    return (size_t) parallel_blocks * (ggml_nelements(dst) * sizeof(float) + ggml_nrows(dst) * sizeof(float2))
+         + (size_t) dst->ne[1] * dst->ne[3] * sizeof(int32_t); // KV_max
+}
+
+static size_t ggml_backend_cuda_device_get_op_scratch_size(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    const int device = dev_ctx->device;
+
+    switch (op->op) {
+        case GGML_OP_MUL_MAT:
+            return ggml_cuda_scratch_mul_mat(device, op);
+        case GGML_OP_MUL_MAT_ID:
+            return ggml_cuda_scratch_mul_mat_id(device, op);
+        case GGML_OP_FLASH_ATTN_EXT:
+            return ggml_cuda_scratch_flash_attn(device, op);
+        case GGML_OP_ARGSORT:
+        case GGML_OP_TOP_K:
+            // keys, indices and the radix/CUB temporary storage
+            return (size_t) ggml_nelements(op->src[0]) * 12 + 4u*1024*1024;
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_SOFT_MAX_BACK:
+        case GGML_OP_CUMSUM:
+        case GGML_OP_MEAN:
+        case GGML_OP_SUM:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_SSM_SCAN:
+        case GGML_OP_OUT_PROD:
+        case GGML_OP_SOLVE_TRI:
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+            // reductions and scans keep at most an output-sized temporary plus library workspace
+            return (size_t) ggml_nbytes(op) * 2 + 4u*1024*1024;
+        default:
+            // every other op computes in place into the compute buffer
+            return 0;
+    }
+}
+
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
@@ -5593,6 +5750,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .event_new               = */ ggml_backend_cuda_device_event_new,
     /* .event_free              = */ ggml_backend_cuda_device_event_free,
     /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
+    /* .get_op_scratch_size    = */ ggml_backend_cuda_device_get_op_scratch_size,
 };
 
 // backend reg

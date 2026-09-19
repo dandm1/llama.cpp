@@ -192,6 +192,10 @@ extern "C" {
     GGML_API bool                          ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
     GGML_API bool                          ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
     GGML_API bool                          ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
+    // bytes of backend-internal scratch memory needed to compute op on this device, outside the compute buffer;
+    // GGML_BACKEND_SCRATCH_UNKNOWN when the backend has no estimate for this op
+#define GGML_BACKEND_SCRATCH_UNKNOWN SIZE_MAX
+    GGML_API size_t                        ggml_backend_dev_get_op_scratch_size(ggml_backend_dev_t device, const struct ggml_tensor * op);
 
     //
     // Backend (reg)
@@ -321,6 +325,10 @@ extern "C" {
 
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
+    // after ggml_backend_sched_reserve_size or ggml_backend_sched_split_graph: the scratch memory each backend needs for the
+    // split graph, the maximum over its nodes since scratch is released after every op; unknown[i] is set when some node
+    // on backend i had no estimate. sizes and unknown need one entry per backend
+    GGML_API void                 ggml_backend_sched_get_scratch_sizes(ggml_backend_sched_t sched, size_t * sizes, bool * unknown);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
