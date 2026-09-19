@@ -576,7 +576,14 @@ bool fit_advisor_measurements::load(const std::string & path) {
         }
         if (j.contains("pairs")) {
             for (const auto & [key, jp] : j.at("pairs").items()) {
-                pairs[key] = { jp.value("latency_us", 0.0), jp.value("gb_s", 0.0) };
+                fit_advisor_pair_rate pr;
+                pr.latency_us       = jp.value("latency_us", 0.0);
+                pr.gb_s             = jp.value("gb_s", 0.0);
+                pr.split_us_b1      = jp.value("split_us_b1", 0.0);
+                pr.split_us_bpp     = jp.value("split_us_bpp", 0.0);
+                pr.split_bytes_bpp  = jp.value("split_bytes_bpp", (size_t) 0);
+                pr.split_n_batch_pp = jp.value("split_n_batch_pp", 0);
+                pairs[key] = pr;
             }
         }
         return true;
@@ -595,7 +602,11 @@ std::string fit_advisor_measurements::to_json() const {
     }
     j["pairs"] = json::object();
     for (const auto & [key, r] : pairs) {
-        j["pairs"][key] = { { "latency_us", r.latency_us }, { "gb_s", r.gb_s } };
+        j["pairs"][key] = {
+            { "latency_us", r.latency_us }, { "gb_s", r.gb_s },
+            { "split_us_b1", r.split_us_b1 }, { "split_us_bpp", r.split_us_bpp },
+            { "split_bytes_bpp", r.split_bytes_bpp }, { "split_n_batch_pp", r.split_n_batch_pp },
+        };
     }
     return j.dump(2);
 }
@@ -693,6 +704,91 @@ void fit_advisor_measurements_print(const fit_advisor_device_measurements & m) {
         m.op_overhead_us, m.launch_us, m.copy.h2d_gb_s, m.copy.d2h_gb_s, m.copy.latency_us);
 }
 
+// time one scheduler round: a chain of n_ops tiny matmuls whose weights live on backend a, except every 4th which lives
+// on backend b; with n_b = 0 the whole chain is on a, with n_b = n_ops on b. returns microseconds per graph compute
+static double bench_sched_chain(ggml_backend_t ba, ggml_backend_t bb, int n_ops, int every, int batch, bool all_on_b) {
+    constexpr int64_t k = 256;
+    ggml_init_params ip = { ggml_tensor_overhead() * (size_t) (n_ops + 8), nullptr, true };
+    ggml_context * ctx_a = ggml_init(ip);
+    ggml_context * ctx_b = ggml_init(ip);
+    ggml_context * ctx_x = ggml_init(ip);
+    ggml_context * ctx_g = ggml_init({ ggml_tensor_overhead() * (size_t) (n_ops + 8) + ggml_graph_overhead_custom(512, false), nullptr, true });
+
+    std::vector<ggml_tensor *> w(n_ops);
+    for (int i = 0; i < n_ops; i++) {
+        const bool on_b = all_on_b || (every > 0 && i % every == every - 1);
+        w[i] = ggml_new_tensor_2d(on_b ? ctx_b : ctx_a, GGML_TYPE_F16, k, k);
+        ggml_format_name(w[i], "w%d", i);
+    }
+    ggml_tensor * x = ggml_new_tensor_2d(ctx_x, GGML_TYPE_F32, k, batch);
+    ggml_set_name(x, "x");
+
+    ggml_backend_buffer_t buf_a = ggml_backend_alloc_ctx_tensors(ctx_a, ba);
+    ggml_backend_buffer_t buf_b = ggml_backend_alloc_ctx_tensors(ctx_b, bb);
+    ggml_backend_buffer_t buf_x = ggml_backend_alloc_ctx_tensors(ctx_x, ba);
+    double ret = -1;
+    if ((buf_a || ggml_get_first_tensor(ctx_a) == nullptr) && (buf_b || ggml_get_first_tensor(ctx_b) == nullptr) && buf_x) {
+        if (buf_a) ggml_backend_buffer_set_usage(buf_a, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        if (buf_b) ggml_backend_buffer_set_usage(buf_b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::mt19937 rng(7);
+        for (int i = 0; i < n_ops; i++) {
+            fill_random(w[i], rng);
+        }
+        fill_random(x, rng);
+
+        ggml_tensor * cur = x;
+        for (int i = 0; i < n_ops; i++) {
+            cur = ggml_mul_mat(ctx_g, w[i], cur);
+        }
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx_g, 512, false);
+        ggml_build_forward_expand(gf, cur);
+
+        ggml_backend_t backends[2] = { ba, bb };
+        ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, 512, false, true);
+        if (ggml_backend_sched_reserve(sched, gf)) {
+            for (int i = 0; i < 3; i++) {
+                ggml_backend_sched_graph_compute(sched, gf);
+            }
+            ggml_backend_sched_synchronize(sched);
+            int n = 0;
+            int64_t total = 0;
+            while (n < 10 || total < 200 * 1000) {
+                const int64_t t0 = ggml_time_us();
+                ggml_backend_sched_graph_compute(sched, gf);
+                ggml_backend_sched_synchronize(sched);
+                total += ggml_time_us() - t0;
+                n++;
+                if (n >= 2000) break;
+            }
+            ret = (double) total / n;
+        }
+        ggml_backend_sched_free(sched);
+    }
+    if (buf_a) ggml_backend_buffer_free(buf_a);
+    if (buf_b) ggml_backend_buffer_free(buf_b);
+    if (buf_x) ggml_backend_buffer_free(buf_x);
+    ggml_free(ctx_g);
+    ggml_free(ctx_x);
+    ggml_free(ctx_b);
+    ggml_free(ctx_a);
+    return ret;
+}
+
+// per-split round trip a -> b -> a at a batch size: the mixed chain minus what its ops cost on their own devices
+static double measure_split(ggml_backend_t ba, ggml_backend_t bb, int batch) {
+    constexpr int n_ops = 40;
+    constexpr int every = 4; // 10 excursions
+    const double t_a     = bench_sched_chain(ba, bb, n_ops, 0, batch, false);
+    const double t_b     = bench_sched_chain(ba, bb, n_ops, 0, batch, true);
+    const double t_mixed = bench_sched_chain(ba, bb, n_ops, every, batch, false);
+    if (t_a < 0 || t_b < 0 || t_mixed < 0) {
+        return 0;
+    }
+    const int n_b = n_ops / every;
+    const double own = (n_ops - n_b) * (t_a / n_ops) + n_b * (t_b / n_ops);
+    return std::max(0.0, (t_mixed - own) / n_b);
+}
+
 static std::string pair_key(ggml_backend_dev_t src, ggml_backend_dev_t dst, int n_threads) {
     const bool src_cpu = ggml_backend_dev_type(src) == GGML_BACKEND_DEVICE_TYPE_CPU;
     const bool dst_cpu = ggml_backend_dev_type(dst) == GGML_BACKEND_DEVICE_TYPE_CPU;
@@ -714,7 +810,8 @@ void fit_advisor_measurements::ensure_pairs(const std::vector<ggml_backend_dev_t
                 continue;
             }
             const std::string key = pair_key(src, dst, n_threads);
-            if (!force && pairs.count(key)) {
+            const bool have = pairs.count(key) > 0;
+            if (!force && have && pairs[key].split_n_batch_pp > 0) {
                 continue;
             }
             ggml_backend_t bsrc = ggml_backend_dev_init(src, nullptr);
@@ -724,7 +821,25 @@ void fit_advisor_measurements::ensure_pairs(const std::vector<ggml_backend_dev_t
                 if (bdst) ggml_backend_free(bdst);
                 continue;
             }
-            fit_advisor_pair_rate r;
+            if (ggml_backend_dev_type(src) == GGML_BACKEND_DEVICE_TYPE_CPU) ggml_backend_cpu_set_n_threads(bsrc, n_threads);
+            if (ggml_backend_dev_type(dst) == GGML_BACKEND_DEVICE_TYPE_CPU) ggml_backend_cpu_set_n_threads(bdst, n_threads);
+            fit_advisor_pair_rate r = have ? pairs[key] : fit_advisor_pair_rate{};
+            {
+                constexpr int n_batch_pp = 512;
+                r.split_us_b1      = measure_split(bsrc, bdst, 1);
+                r.split_us_bpp     = measure_split(bsrc, bdst, n_batch_pp);
+                r.split_bytes_bpp  = (size_t) 256 * n_batch_pp * sizeof(float);
+                r.split_n_batch_pp = n_batch_pp;
+            }
+            if (have && !force) {
+                LOG_INF("%s: split %s -> %s -> %s: %.1f us at batch 1, %.1f us at batch %d\n", __func__,
+                    ggml_backend_dev_name(src), ggml_backend_dev_name(dst), ggml_backend_dev_name(src), r.split_us_b1, r.split_us_bpp, r.split_n_batch_pp);
+                pairs[key] = r;
+                changed = true;
+                ggml_backend_free(bsrc);
+                ggml_backend_free(bdst);
+                continue;
+            }
             constexpr size_t big_bytes   = 64ull * 1024 * 1024;
             constexpr size_t small_bytes = 16 * 1024;
 
@@ -763,8 +878,8 @@ void fit_advisor_measurements::ensure_pairs(const std::vector<ggml_backend_dev_t
             ggml_backend_free(bsrc);
             ggml_backend_free(bdst);
 
-            LOG_INF("%s: copy %s -> %s: %.1f us small, %.2f GB/s large\n", __func__,
-                ggml_backend_dev_name(src), ggml_backend_dev_name(dst), r.latency_us, r.gb_s);
+            LOG_INF("%s: copy %s -> %s: %.1f us small, %.2f GB/s large; split round trip %.1f us at batch 1, %.1f us at batch %d\n", __func__,
+                ggml_backend_dev_name(src), ggml_backend_dev_name(dst), r.latency_us, r.gb_s, r.split_us_b1, r.split_us_bpp, r.split_n_batch_pp);
             pairs[key] = r;
             changed = true;
         }

@@ -500,7 +500,14 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         searcher::state nxt = cur;
         const double mv = uni(rng);
 
-        if (mv < 0.55) {
+        if (mv < 0.10) {
+            // toggle a single tensor of a multi-tensor group: a partial layer, worth it only if the split is cheap
+            const searcher::group & g = movable[(size_t) (uni(rng) * movable.size()) % movable.size()];
+            if (g.idx.size() < 2) continue;
+            const size_t i = g.idx[(size_t) (uni(rng) * g.idx.size()) % g.idx.size()];
+            fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots);
+            nxt.alloc.tensor_device[i] = nxt.alloc.tensor_device[i] == fit_advisor_allocation::DEV_CPU ? home.tensor_device[i] : fit_advisor_allocation::DEV_CPU;
+        } else if (mv < 0.55) {
             // toggle one group between its home and the CPU
             const searcher::group & g = movable[(size_t) (uni(rng) * movable.size()) % movable.size()];
             fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots);
