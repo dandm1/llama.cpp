@@ -198,6 +198,7 @@ static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_ad
         }
         printf("  %-16s %s\n", c.name.c_str(), args.c_str());
     }
+    fflush(stdout); // stdout is block-buffered when redirected, keep the tables separate from the log lines
 }
 
 // devices to measure: the model's devices plus the CPU, which is always a placement target
@@ -288,6 +289,7 @@ static void print_layer_costs(const fit_advisor_inventory & inv, const std::vect
         }
         printf("\n");
     }
+    fflush(stdout);
 }
 
 int llama_fit_advisor(int argc, char ** argv) {
@@ -508,5 +510,6 @@ int llama_fit_advisor(int argc, char ** argv) {
             cost.step_weights_us, cost.step_attn_us, cost.step_overhead_us, cost.step_boundary_us,
             cost.error.empty() ? "" : ("  (" + cost.error + ")").c_str());
     }
+    fflush(stdout);
     return 0;
 }
