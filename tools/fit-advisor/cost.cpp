@@ -260,7 +260,17 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
                 away[{ t.layer, alloc.tensor_device[i] }]++;
             }
         }
+        // a tensor on the CPU whose batch reaches the offload threshold is computed on a device instead, no split
+        int offload_min = 0;
+        for (const auto & d : devices) {
+            if (!d.is_cpu && d.offload_min_batch > 0) {
+                offload_min = offload_min == 0 ? d.offload_min_batch : std::min(offload_min, d.offload_min_batch);
+            }
+        }
         for (const auto & [key, n] : away) {
+            if (key.second == fit_advisor_allocation::DEV_CPU && offload_min > 0 && batch >= (uint32_t) offload_min) {
+                continue;
+            }
             const int home = alloc.layer_device((uint32_t) key.first, n_layer_all);
             boundary += hop_us(home, key.second) + hop_us(key.second, home);
         }
