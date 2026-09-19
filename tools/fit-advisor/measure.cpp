@@ -24,8 +24,10 @@ using json = nlohmann::ordered_json;
 //
 
 std::string fit_advisor_device_fingerprint::key() const {
+    // the build commit is recorded but not part of the key: kernel changes are rare enough that --remeasure covers them,
+    // and keying on the commit re-measured everything on every push
     std::ostringstream ss;
-    ss << backend << "|" << name << "|" << description << "|" << device_id << "|" << total_memory << "|" << build_commit;
+    ss << backend << "|" << name << "|" << description << "|" << device_id << "|" << total_memory;
     if (n_threads > 0) {
         ss << "|t" << n_threads;
     }
@@ -567,7 +569,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
     }
     try {
         const json j = json::parse(f);
-        if (j.value("version", 0) != 1) {
+        if (j.value("version", 0) != 2) {
             LOG_WRN("%s: ignoring %s, unknown version\n", __func__, path.c_str());
             return false;
         }
@@ -595,7 +597,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
 
 std::string fit_advisor_measurements::to_json() const {
     json j;
-    j["version"] = 1;
+    j["version"] = 2;
     j["devices"] = json::object();
     for (const auto & [key, m] : devices) {
         j["devices"][key] = device_to_json(m);
