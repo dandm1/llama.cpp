@@ -325,6 +325,21 @@ int llama_fit_advisor(int argc, char ** argv) {
     // measure the devices for the types this model actually uses
     fit_advisor_measure_options mopts;
     mopts.weight_types = inv.weight_types(0.01); // every type holding at least 1% of the bytes
+    for (const auto & name : string_split<std::string>(params.fit_advisor_measure_types, ',')) {
+        bool found = false;
+        for (int t = 0; t < GGML_TYPE_COUNT && !found; t++) {
+            const char * tn = ggml_type_name((ggml_type) t);
+            if (tn && name == tn) {
+                if (std::find(mopts.weight_types.begin(), mopts.weight_types.end(), (ggml_type) t) == mopts.weight_types.end()) {
+                    mopts.weight_types.push_back((ggml_type) t);
+                }
+                found = true;
+            }
+        }
+        if (!found) {
+            LOG_WRN("%s: --measure-types: unknown type '%s' ignored\n", __func__, name.c_str());
+        }
+    }
     mopts.kv_types     = { params.cache_type_k };
     if (params.cache_type_v != params.cache_type_k) {
         mopts.kv_types.push_back(params.cache_type_v);

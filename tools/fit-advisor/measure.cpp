@@ -60,40 +60,48 @@ struct bench_result {
     std::string reason;
 };
 
-// fill a leaf tensor with random data of its type; quantized types go through the reference quantizer
+// fill a leaf tensor with random data of its type
+// only a block of rows is generated and converted, then tiled across the tensor: kernel speed does not depend on
+// the values, and the search-based quantizers (IQ types) would take minutes on a 512 MiB weight
 void fill_random(ggml_tensor * t, std::mt19937 & rng) {
-    const int64_t nels = ggml_nelements(t);
+    const int64_t n_per_row = t->ne[0];
+    const int64_t nrows     = ggml_nelements(t) / n_per_row;
+    // the importance-matrix quantizers are search based and slow, keep their block small
+    const int64_t nrows_blk = std::min<int64_t>(nrows, ggml_quantize_requires_imatrix(t->type) ? 4 : 64);
+    const size_t  row_bytes = ggml_row_size(t->type, n_per_row);
+    const size_t  blk_bytes = row_bytes * nrows_blk;
+
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    std::vector<float> data(nels);
+    std::vector<float> data(n_per_row * nrows_blk);
     for (auto & x : data) {
         x = dist(rng);
     }
 
+    std::vector<uint8_t> blk(blk_bytes);
     if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_set(t, data.data(), 0, nels * sizeof(float));
-        return;
+        std::memcpy(blk.data(), data.data(), blk_bytes);
+    } else if (t->type == GGML_TYPE_F16) {
+        ggml_fp32_to_fp16_row(data.data(), (ggml_fp16_t *) blk.data(), data.size());
+    } else if (t->type == GGML_TYPE_BF16) {
+        ggml_fp32_to_bf16_row(data.data(), (ggml_bf16_t *) blk.data(), data.size());
+    } else if (ggml_is_quantized(t->type)) {
+        // types that need an importance matrix get a flat one: it only steers codebook choice, not kernel speed
+        std::vector<float> imatrix;
+        const float * im = nullptr;
+        if (ggml_quantize_requires_imatrix(t->type)) {
+            imatrix.assign(n_per_row, 1.0f);
+            im = imatrix.data();
+        }
+        ggml_quantize_chunk(t->type, data.data(), blk.data(), 0, nrows_blk, n_per_row, im);
+    } else {
+        GGML_ABORT("unsupported tensor type for fill_random: %s", ggml_type_name(t->type));
     }
-    if (t->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> buf(nels);
-        ggml_fp32_to_fp16_row(data.data(), buf.data(), nels);
-        ggml_backend_tensor_set(t, buf.data(), 0, nels * sizeof(ggml_fp16_t));
-        return;
+
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    for (size_t off = 0; off < buf.size(); off += blk_bytes) {
+        std::memcpy(buf.data() + off, blk.data(), std::min(blk_bytes, buf.size() - off));
     }
-    if (t->type == GGML_TYPE_BF16) {
-        std::vector<ggml_bf16_t> buf(nels);
-        ggml_fp32_to_bf16_row(data.data(), buf.data(), nels);
-        ggml_backend_tensor_set(t, buf.data(), 0, nels * sizeof(ggml_bf16_t));
-        return;
-    }
-    if (ggml_is_quantized(t->type)) {
-        const int64_t n_per_row = t->ne[0];
-        const int64_t nrows     = nels / n_per_row;
-        std::vector<uint8_t> buf(ggml_nbytes(t));
-        ggml_quantize_chunk(t->type, data.data(), buf.data(), 0, nrows, n_per_row, nullptr);
-        ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
-        return;
-    }
-    GGML_ABORT("unsupported tensor type for fill_random: %s", ggml_type_name(t->type));
+    ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
 }
 
 void fill_zero(ggml_tensor * t) {
@@ -268,16 +276,14 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
     for (const ggml_type type : opts.weight_types) {
         fit_advisor_matmul_rate r;
         r.n_batch_pp = opts.n_batch_pp;
-        if (ggml_quantize_requires_imatrix(type)) {
-            LOG_WRN("%s: skipping %s, it needs an importance matrix to quantize test data\n", __func__, ggml_type_name(type));
-            m.matmul[ggml_type_name(type)] = r;
-            continue;
-        }
         const size_t  row_bytes = ggml_row_size(type, k);
         const int64_t m1 = (int64_t) (bytes_small / row_bytes);
         const int64_t m2 = (int64_t) (bytes_large / row_bytes);
         r.bytes_small = row_bytes * m1;
         r.bytes_large = row_bytes * m2;
+        LOG_INF("%s:   matmul %-6s measuring (%zu and %zu MiB weights, batch 1 and %d) ...\n", __func__,
+            ggml_type_name(type), r.bytes_small / (1024 * 1024), r.bytes_large / (1024 * 1024), opts.n_batch_pp);
+        const int64_t t_type0 = ggml_time_us();
 
         const bench_result b1 = bench_matmul(backend, type, k, m1, 1);
         const bench_result b2 = bench_matmul(backend, type, k, m2, 1);
@@ -303,11 +309,9 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
             r.gflops_pp = 2.0 * k * m1 * opts.n_batch_pp / (bp.us_per_run * 1e-6) / 1e9;
         }
         m.matmul[ggml_type_name(type)] = r;
-        if (opts.verbose) {
-            LOG_INF("%s:   matmul %-6s tg %7.1f GB/s, overhead %6.1f us, pp %7.0f GFLOPS (%d/%d/%d runs, %zu/%zu MiB)\n", __func__,
-                ggml_type_name(type), r.bytes_per_s / 1e9, r.overhead_us, r.gflops_pp, b1.n_runs, b2.n_runs, bp.n_runs,
-                r.bytes_small / (1024 * 1024), r.bytes_large / (1024 * 1024));
-        }
+        LOG_INF("%s:   matmul %-6s tg %7.1f GB/s, overhead %6.1f us, pp %7.0f GFLOPS (%d/%d/%d runs, %.1f s)\n", __func__,
+            ggml_type_name(type), r.bytes_per_s / 1e9, r.overhead_us, r.gflops_pp, b1.n_runs, b2.n_runs, bp.n_runs,
+            (ggml_time_us() - t_type0) * 1e-6);
     }
 
     // attention per KV type
@@ -316,6 +320,9 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
         r.n_kv       = opts.n_kv;
         r.n_batch_pp = opts.n_batch_attn;
         const double kv_bytes = 2.0 * ggml_row_size(type_kv, opts.head_size) * opts.n_kv * opts.n_head_kv;
+        LOG_INF("%s:   attn %-10s measuring (n_kv %d, %d heads / %d kv heads, batch 1 and %d, with and without flash attention) ...\n", __func__,
+            attn_key(opts.head_size, type_kv).c_str(), opts.n_kv, opts.n_head, opts.n_head_kv, opts.n_batch_attn);
+        const int64_t t_attn0 = ggml_time_us();
 
         const bench_result fa1 = bench_attn(backend, true,  type_kv, opts.head_size, opts.n_head, opts.n_head_kv, opts.n_kv, 1);
         const bench_result nf1 = bench_attn(backend, false, type_kv, opts.head_size, opts.n_head, opts.n_head_kv, opts.n_kv, 1);
@@ -333,13 +340,12 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
         r.us_pp_fa   = fap.supported ? fap.us_per_run : 0;
         r.us_pp_nofa = nfp.supported ? nfp.us_per_run : 0;
         m.attn[attn_key(opts.head_size, type_kv)] = r;
-        if (opts.verbose) {
-            LOG_INF("%s:   attn %-10s fa: tg %7.1f GB/s pp %8.0f us | no-fa: tg %7.1f GB/s pp %8.0f us%s%s\n", __func__,
-                attn_key(opts.head_size, type_kv).c_str(),
-                r.kv_bytes_per_s_fa / 1e9, r.us_pp_fa, r.kv_bytes_per_s_nofa / 1e9, r.us_pp_nofa,
-                fa1.supported ? "" : (" [fa: " + fa1.reason + "]").c_str(),
-                nf1.supported ? "" : (" [no-fa: " + nf1.reason + "]").c_str());
-        }
+        LOG_INF("%s:   attn %-10s fa: tg %7.1f GB/s pp %8.0f us | no-fa: tg %7.1f GB/s pp %8.0f us (%.1f s)%s%s\n", __func__,
+            attn_key(opts.head_size, type_kv).c_str(),
+            r.kv_bytes_per_s_fa / 1e9, r.us_pp_fa, r.kv_bytes_per_s_nofa / 1e9, r.us_pp_nofa,
+            (ggml_time_us() - t_attn0) * 1e-6,
+            fa1.supported ? "" : (" [fa: " + fa1.reason + "]").c_str(),
+            nf1.supported ? "" : (" [no-fa: " + nf1.reason + "]").c_str());
     }
 
     // copies: one large transfer each way, then many small ones for latency
@@ -384,10 +390,8 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
             LOG_WRN("%s: could not allocate copy test buffers on %s\n", __func__, m.fingerprint.name.c_str());
         }
         ggml_free(ctx);
-        if (opts.verbose) {
-            LOG_INF("%s:   copy h2d %6.2f GB/s, d2h %6.2f GB/s, small transfer %6.1f us\n", __func__,
-                m.copy.h2d_gb_s, m.copy.d2h_gb_s, m.copy.latency_us);
-        }
+        LOG_INF("%s:   copy h2d %6.2f GB/s, d2h %6.2f GB/s, small transfer %6.1f us\n", __func__,
+            m.copy.h2d_gb_s, m.copy.d2h_gb_s, m.copy.latency_us);
     }
 
     ggml_backend_free(backend);

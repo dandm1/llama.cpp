@@ -479,6 +479,7 @@ struct common_params {
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
     bool    fit_advisor_remeasure  = false; // llama-fit-advisor: discard cached device measurements and measure again
     bool    fit_advisor_no_measure = false; // llama-fit-advisor: skip device measurements, only project memory
+    std::string fit_advisor_measure_types;  // llama-fit-advisor: extra weight types to measure, comma-separated
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
