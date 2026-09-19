@@ -61,15 +61,24 @@ double fit_advisor_s_per_byte(const fit_advisor_matmul_rate & r, uint32_t batch)
 
 namespace {
 
-// bytes of a tensor read per token at a given batch: experts are read for the active fraction at batch 1 and
-// approach all of them as the batch grows
-double active_bytes(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, uint32_t batch) {
+// expert tensors: at batch b each token routes to n_used of n_expert experts, so an expert sees on average
+// b * n_used / n_expert tokens. below one token per expert only that fraction of the experts is touched at all;
+// above it every expert is touched and runs at that smaller effective batch
+struct expert_view {
+    double frac_touched = 1; // share of the tensor's bytes read
+    double batch        = 1; // tokens each touched expert processes
+};
+
+expert_view expert_batch(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, uint32_t batch) {
+    expert_view v;
+    v.batch = batch;
     if (t.kind != FIT_ADVISOR_TENSOR_FFN_EXPS || inv.n_expert == 0 || inv.n_expert_used == 0) {
-        return (double) t.nbytes;
+        return v;
     }
-    const double per_token = (double) inv.n_expert_used / inv.n_expert;
-    const double frac = std::min(1.0, per_token * batch);
-    return t.nbytes * frac;
+    const double per_expert = (double) batch * inv.n_expert_used / inv.n_expert;
+    v.frac_touched = std::min(1.0, per_expert);
+    v.batch        = std::max(1.0, per_expert);
+    return v;
 }
 
 // time for one op over a tensor: per-token cost times tokens plus the fixed overhead
@@ -101,8 +110,9 @@ double tensor_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t
         }
         return copy_us; // norms and biases: negligible
     }
-    const double bytes = active_bytes(inv, t, batch);
-    return copy_us + bytes * fit_advisor_s_per_byte(it->second, batch) * 1e6 * batch;
+    const expert_view ev = expert_batch(inv, t, batch);
+    const uint32_t b_eff = (uint32_t) std::lround(ev.batch);
+    return copy_us + t.nbytes * ev.frac_touched * fit_advisor_s_per_byte(it->second, b_eff) * 1e6 * ev.batch;
 }
 
 } // namespace
