@@ -5650,19 +5650,6 @@ static size_t ggml_cuda_scratch_mul_mat_id(int device, const ggml_tensor * dst) 
     return ret;
 }
 
-static size_t ggml_cuda_scratch_flash_attn(int device, const ggml_tensor * dst) {
-    // K/V conversions to f16 live in the tensor allocation (see ggml_cuda_flash_attn_ext_get_alloc_size), the pool
-    // holds the split-K partial results: parallel_blocks copies of the output, bounded by the number of KV tiles
-    if (!ggml_cuda_flash_attn_ext_supported(device, dst)) {
-        return 0;
-    }
-    const ggml_tensor * K = dst->src[1];
-    const int64_t n_kv = K->ne[1];
-    const int64_t parallel_blocks = std::min<int64_t>((n_kv + 63) / 64, 512);
-    return (size_t) parallel_blocks * (ggml_nelements(dst) * sizeof(float) + ggml_nrows(dst) * sizeof(float2))
-         + (size_t) dst->ne[1] * dst->ne[3] * sizeof(int32_t); // KV_max
-}
-
 static size_t ggml_backend_cuda_device_get_op_scratch_size(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const int device = dev_ctx->device;
@@ -5673,7 +5660,7 @@ static size_t ggml_backend_cuda_device_get_op_scratch_size(ggml_backend_dev_t de
         case GGML_OP_MUL_MAT_ID:
             return ggml_cuda_scratch_mul_mat_id(device, op);
         case GGML_OP_FLASH_ATTN_EXT:
-            return ggml_cuda_scratch_flash_attn(device, op);
+            return ggml_cuda_flash_attn_ext_scratch_size(device, op);
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
             // keys, indices and the radix/CUB temporary storage

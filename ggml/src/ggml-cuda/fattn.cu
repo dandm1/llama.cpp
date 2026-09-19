@@ -740,6 +740,32 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 }
 
+size_t ggml_cuda_flash_attn_ext_scratch_size(int device, const ggml_tensor * dst) {
+    // K/V conversions live in the tensor allocation, the pool holds the per-launch temporaries:
+    //   - stream-K (mma kernel): a fixup buffer of at most one partial result per output row
+    //   - split-K (vec/tile kernels): parallel_blocks partial outputs, chosen to fill the SMs, bounded by the KV tiles
+    const ggml_tensor * K = dst->src[1];
+    const int64_t nrows_dst = ggml_nrows(dst);
+    const int64_t DV        = dst->ne[0];
+
+    switch (ggml_cuda_get_best_fattn_kernel(device, dst)) {
+        case BEST_FATTN_KERNEL_NONE:
+            return 0;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            return (size_t) nrows_dst * (2 + DV/2) * sizeof(float) + 1u*1024*1024;
+        case BEST_FATTN_KERNEL_VEC:
+        case BEST_FATTN_KERNEL_TILE: {
+            const int     nsm        = ggml_cuda_info().devices[device].nsm;
+            const int64_t ntiles_KV  = (K->ne[1] + 63) / 64;
+            const int64_t ntiles_dst = std::max<int64_t>(1, nrows_dst / 64);
+            const int64_t parallel_blocks = std::min<int64_t>(ntiles_KV, std::max<int64_t>(1, (4 * nsm + ntiles_dst - 1) / ntiles_dst));
+            return (size_t) parallel_blocks * (ggml_nelements(dst) * sizeof(float) + nrows_dst * sizeof(float2))
+                 + (size_t) dst->ne[1] * dst->ne[3] * sizeof(int32_t);
+        }
+    }
+    return 0;
+}
+
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
