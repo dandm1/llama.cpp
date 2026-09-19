@@ -290,7 +290,9 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
         } else if (c40.supported) {
             m.op_overhead_us = c40.us_per_run / 40.0;
         }
-        LOG_INF("%s:   per-op overhead inside a graph %.1f us\n", __func__, m.op_overhead_us);
+        const bench_result c1 = bench_chain(backend, 1);
+        m.launch_us = c1.supported ? c1.us_per_run : 0;
+        LOG_INF("%s:   per-op overhead inside a graph %.1f us, one-op graph compute %.1f us\n", __func__, m.op_overhead_us, m.launch_us);
     }
 
     // matmul per weight type: two weight sizes at batch 1 give slope (bandwidth) and intercept (overhead)
@@ -465,6 +467,7 @@ static json device_to_json(const fit_advisor_device_measurements & m) {
     j["fingerprint"] = fingerprint_to_json(m.fingerprint);
     j["measured_at"] = m.measured_at;
     j["op_overhead_us"] = m.op_overhead_us;
+    j["launch_us"] = m.launch_us;
     for (const auto & [type, r] : m.matmul) {
         j["matmul"][type] = {
             { "supported",   r.supported },
@@ -504,6 +507,7 @@ static fit_advisor_device_measurements device_from_json(const json & j) {
     m.fingerprint = fingerprint_from_json(j.at("fingerprint"));
     m.measured_at = j.value("measured_at", "");
     m.op_overhead_us = j.value("op_overhead_us", 0.0);
+    m.launch_us = j.value("launch_us", 0.0);
     if (j.contains("matmul")) {
         for (const auto & [type, r] : j.at("matmul").items()) {
             fit_advisor_matmul_rate mr;
@@ -638,7 +642,8 @@ const fit_advisor_device_measurements & fit_advisor_measurements::ensure(ggml_ba
             }
         }
         todo.measure_copy = have.copy.h2d_gb_s <= 0;
-        if (todo.weight_types.empty() && todo.kv_types.empty() && !todo.measure_copy) {
+        const bool need_launch = have.launch_us <= 0;
+        if (todo.weight_types.empty() && todo.kv_types.empty() && !todo.measure_copy && !need_launch) {
             return have;
         }
         LOG_INF("%s: cached entry for %s lacks %zu weight types, %zu KV types%s, measuring those\n", __func__,
@@ -658,7 +663,9 @@ const fit_advisor_device_measurements & fit_advisor_measurements::ensure(ggml_ba
         if (todo.measure_copy) {
             have.copy = m.copy;
         }
-        have.measured_at = m.measured_at;
+        have.op_overhead_us = m.op_overhead_us;
+        have.launch_us      = m.launch_us;
+        have.measured_at    = m.measured_at;
     } else {
         devices[key] = std::move(m);
     }
@@ -682,8 +689,8 @@ void fit_advisor_measurements_print(const fit_advisor_device_measurements & m) {
             key.c_str(), r.n_kv, r.kv_bytes_per_s_fa / 1e9, r.us_pp_fa, r.kv_bytes_per_s_nofa / 1e9, r.us_pp_nofa,
             r.supported_fa ? "" : " [fa unsupported]", r.supported_nofa ? "" : " [no-fa unsupported]");
     }
-    LOG_INF("%s:   per-op overhead %.1f us; copy h2d %6.2f GB/s, d2h %6.2f GB/s, small transfer %6.1f us\n", __func__,
-        m.op_overhead_us, m.copy.h2d_gb_s, m.copy.d2h_gb_s, m.copy.latency_us);
+    LOG_INF("%s:   per-op overhead %.1f us, graph launch %.1f us; copy h2d %6.2f GB/s, d2h %6.2f GB/s, small transfer %6.1f us\n", __func__,
+        m.op_overhead_us, m.launch_us, m.copy.h2d_gb_s, m.copy.d2h_gb_s, m.copy.latency_us);
 }
 
 static std::string pair_key(ggml_backend_dev_t src, ggml_backend_dev_t dst, int n_threads) {

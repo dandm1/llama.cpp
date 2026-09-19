@@ -133,34 +133,86 @@ struct searcher {
              - fit_advisor_tensor_request_us(inv, t, d, cost_devs, wl, slots);
     }
 
-    // exact 0/1 knapsack per device: which of the device's own-layer tensors to keep on it under a byte capacity
+    // movable groups: the expert tensors of a layer move together (a partially moved layer still costs its split),
+    // every other tensor is its own group. only groups with a positive, measured gain are candidates to leave their
+    // device; the rest (norms, biases, unmeasured types) always stay with their layer
+    struct group {
+        std::vector<size_t> idx;
+        size_t bytes = 0;
+    };
+
+    std::vector<group> build_groups(const fit_advisor_workload & wl) const {
+        std::map<int32_t, group> exps_by_layer;
+        std::vector<group> ret;
+        for (size_t i = 0; i < inv.tensors.size(); i++) {
+            const auto & t = inv.tensors[i];
+            if (!tensor_counts(i, wl) || t.layer < 0) {
+                continue;
+            }
+            if (t.kind == FIT_ADVISOR_TENSOR_FFN_EXPS) {
+                exps_by_layer[t.layer].idx.push_back(i);
+                exps_by_layer[t.layer].bytes += t.nbytes;
+            } else {
+                ret.push_back({ { i }, t.nbytes });
+            }
+        }
+        for (auto & [il, g] : exps_by_layer) {
+            ret.push_back(g);
+        }
+        return ret;
+    }
+
+    double group_gain(const group & g, int d, const fit_advisor_workload & wl, uint32_t slots) const {
+        double ret = 0;
+        for (const size_t i : g.idx) {
+            ret += gain(i, d, wl, slots);
+        }
+        return ret;
+    }
+
+    // exact 0/1 knapsack per device over the movable groups of its layers: which to keep on it under a byte capacity
+    // everything that is not a movable group stays where the layer split put it and counts against the capacity
     void knapsack_fill(fit_advisor_allocation & a, const fit_advisor_allocation & base, const std::vector<int64_t> & capacity,
-                       const fit_advisor_workload & wl) const {
+                       const fit_advisor_workload & wl, const std::vector<group> & groups) const {
         a = base;
         for (size_t d = 0; d < nd; d++) {
-            // fixed tensors on this device (not movable: none today, but keep the accounting general)
-            std::vector<size_t> idx;
+            std::vector<size_t> gidx;
             std::vector<int64_t> w;
             std::vector<double> v;
-            for (size_t i = 0; i < inv.tensors.size(); i++) {
-                if (base.tensor_device[i] != (int) d || !tensor_counts(i, wl)) {
+            int64_t fixed = 0;
+            std::vector<char> is_movable(inv.tensors.size(), 0);
+            for (size_t k = 0; k < groups.size(); k++) {
+                const group & g = groups[k];
+                if (base.tensor_device[g.idx[0]] != (int) d) {
                     continue;
                 }
-                const double g = gain(i, (int) d, wl, a.n_slots);
-                a.tensor_device[i] = fit_advisor_allocation::DEV_CPU; // default off, the knapsack puts the chosen ones back
-                if (g <= 0) {
-                    continue;
+                const double gn = group_gain(g, (int) d, wl, a.n_slots);
+                if (gn <= 0) {
+                    continue; // stays home
                 }
-                idx.push_back(i);
-                w.push_back((inv.tensors[i].nbytes + UNIT - 1) / UNIT);
-                v.push_back(g);
+                for (const size_t i : g.idx) {
+                    is_movable[i] = 1;
+                }
+                gidx.push_back(k);
+                w.push_back((int64_t) ((g.bytes + UNIT - 1) / UNIT));
+                v.push_back(gn);
             }
-            const int64_t cap = std::max<int64_t>(0, capacity[d] / UNIT);
-            const size_t n = idx.size();
+            for (size_t i = 0; i < inv.tensors.size(); i++) {
+                if (base.tensor_device[i] == (int) d && !is_movable[i] && tensor_counts(i, wl)) {
+                    fixed += inv.tensors[i].nbytes;
+                }
+            }
+            const int64_t cap = std::max<int64_t>(0, (capacity[d] - fixed) / UNIT);
+            const size_t n = gidx.size();
+            // default: movable groups off the device, the knapsack puts the chosen ones back
+            for (const size_t k : gidx) {
+                for (const size_t i : groups[k].idx) {
+                    a.tensor_device[i] = fit_advisor_allocation::DEV_CPU;
+                }
+            }
             if (n == 0 || cap == 0) {
                 continue;
             }
-            // classic DP over capacity with a keep table for reconstruction
             std::vector<double> best(cap + 1, 0.0);
             std::vector<uint8_t> keep(n * (cap + 1), 0);
             for (size_t k = 0; k < n; k++) {
@@ -179,7 +231,9 @@ struct searcher {
             int64_t c = cap;
             for (size_t k = n; k-- > 0;) {
                 if (keep[k * (cap + 1) + c]) {
-                    a.tensor_device[idx[k]] = (int) d;
+                    for (const size_t i : groups[gidx[k]].idx) {
+                        a.tensor_device[i] = (int) d;
+                    }
                     c -= w[k];
                 }
             }
@@ -201,12 +255,16 @@ struct searcher {
 
         fit_advisor_allocation base = fit_advisor_allocation::from_layer_split(inv, device_bufts, part, opts.n_ctx, slots);
         base.n_ubatch = ub;
+        const std::vector<group> groups = build_groups(wl);
 
-        // floor: every movable tensor on the CPU, probe for the overheads
+        // floor: every movable group with a positive gain on the CPU, probe for the overheads
         fit_advisor_allocation floor = base;
-        for (size_t i = 0; i < inv.tensors.size(); i++) {
-            if (floor.tensor_device[i] >= 0) {
-                floor.tensor_device[i] = fit_advisor_allocation::DEV_CPU;
+        for (const group & g : groups) {
+            const int home = base.tensor_device[g.idx[0]];
+            if (home >= 0 && group_gain(g, home, wl, slots) > 0) {
+                for (const size_t i : g.idx) {
+                    floor.tensor_device[i] = fit_advisor_allocation::DEV_CPU;
+                }
             }
         }
         const fit_advisor_projection * pj = &probe_alloc(floor, name);
@@ -229,7 +287,7 @@ struct searcher {
                 cap[d] = held + (pj->devices[d].projected_free() - pj->devices[d].margin);
             }
             fit_advisor_allocation next;
-            knapsack_fill(next, base, cap, wl);
+            knapsack_fill(next, base, cap, wl, groups);
             next.n_ubatch = ub;
             if (next.tensor_device == a.tensor_device) {
                 break;
@@ -397,19 +455,25 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     searcher::state incumbent = cur;
     fit_advisor_projection incumbent_proj = best_cell.proj;
 
-    // movable tensor indices (on a device or the CPU, with a device home)
-    std::vector<size_t> movable;
+    // movable groups: those with a positive gain on their home
+    std::vector<searcher::group> movable;
     {
         fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, cur.alloc.layers_per_device, opts.n_ctx, cur.alloc.n_slots);
-        for (size_t i = 0; i < inv.tensors.size(); i++) {
-            if (home.tensor_device[i] >= 0 && S.tensor_counts(i, cur.wl)) {
-                movable.push_back(i);
+        for (const auto & g : S.build_groups(cur.wl)) {
+            const int h = home.tensor_device[g.idx[0]];
+            if (h >= 0 && S.group_gain(g, h, cur.wl, cur.alloc.n_slots) > 0) {
+                movable.push_back(g);
             }
         }
     }
     if (movable.empty()) {
         LOG_INF("%s: nothing movable, keeping the seed\n", __func__);
     }
+    auto set_group = [&](fit_advisor_allocation & a, const searcher::group & g, int dev) {
+        for (const size_t i : g.idx) {
+            a.tensor_device[i] = dev;
+        }
+    };
 
     const double T0 = std::max(1.0, 0.02 * std::fabs(cur.cost_score));
     const double T1 = std::max(0.01, 0.0001 * std::fabs(cur.cost_score));
@@ -423,24 +487,23 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         const double mv = uni(rng);
 
         if (mv < 0.55) {
-            // toggle one tensor between its home and the CPU
-            const size_t i = movable[(size_t) (uni(rng) * movable.size()) % movable.size()];
+            // toggle one group between its home and the CPU
+            const searcher::group & g = movable[(size_t) (uni(rng) * movable.size()) % movable.size()];
             fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots);
-            nxt.alloc.tensor_device[i] = nxt.alloc.tensor_device[i] == fit_advisor_allocation::DEV_CPU ? home.tensor_device[i] : fit_advisor_allocation::DEV_CPU;
+            const int h = home.tensor_device[g.idx[0]];
+            set_group(nxt.alloc, g, nxt.alloc.tensor_device[g.idx[0]] == fit_advisor_allocation::DEV_CPU ? h : fit_advisor_allocation::DEV_CPU);
         } else if (mv < 0.85) {
-            // swap one on-device tensor with one CPU tensor of the same home
+            // swap one on-device group with one CPU group of the same home
             std::vector<size_t> on, off;
             fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots);
             const int d = (int) ((size_t) (uni(rng) * nd) % nd);
-            for (const size_t i : movable) {
-                if (home.tensor_device[i] != d) continue;
-                (nxt.alloc.tensor_device[i] == d ? on : off).push_back(i);
+            for (size_t k = 0; k < movable.size(); k++) {
+                if (home.tensor_device[movable[k].idx[0]] != d) continue;
+                (nxt.alloc.tensor_device[movable[k].idx[0]] == d ? on : off).push_back(k);
             }
             if (on.empty() || off.empty()) continue;
-            const size_t a = on[(size_t) (uni(rng) * on.size()) % on.size()];
-            const size_t b = off[(size_t) (uni(rng) * off.size()) % off.size()];
-            nxt.alloc.tensor_device[a] = fit_advisor_allocation::DEV_CPU;
-            nxt.alloc.tensor_device[b] = d;
+            set_group(nxt.alloc, movable[on[(size_t) (uni(rng) * on.size()) % on.size()]], fit_advisor_allocation::DEV_CPU);
+            set_group(nxt.alloc, movable[off[(size_t) (uni(rng) * off.size()) % off.size()]], d);
         } else if (mv < 0.93 && nd > 1) {
             // move one layer across the boundary between two adjacent devices
             const size_t d = (size_t) (uni(rng) * (nd - 1)) % (nd - 1);

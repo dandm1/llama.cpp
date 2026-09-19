@@ -73,6 +73,7 @@ struct fit_advisor_device_measurements {
     std::map<std::string, fit_advisor_matmul_rate> matmul; // keyed by ggml type name, e.g. "q4_K"
     std::map<std::string, fit_advisor_attn_rate>   attn;   // keyed by "hd<head size>/<kv type>", e.g. "hd128/f16"
     double op_overhead_us = 0; // fixed cost per graph op inside a graph, from the slope of a chain of tiny ops
+    double launch_us      = 0; // cost of one graph compute of a single tiny op: what every scheduler split pays on this device
 
     bool has_matmul(ggml_type type) const { return matmul.count(ggml_type_name(type)) > 0; }
     bool has_matmul_curve(ggml_type type) const; // measured with the batch-4 point too

@@ -225,7 +225,8 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             }
             const fit_advisor_pair_rate & r = pairs[a][b];
             const double bytes = (double) batch * inv.n_embd * sizeof(float);
-            return r.latency_us + (r.gb_s > 0 ? bytes / (r.gb_s * 1e9) * 1e6 : 0);
+            const double launch = devices[b].meas ? devices[b].meas->launch_us : 0; // the split starts a new graph compute there
+            return r.latency_us + (r.gb_s > 0 ? bytes / (r.gb_s * 1e9) * 1e6 : 0) + launch;
         };
         int prev = alloc.layer_device(0, n_layer_all);
         for (uint32_t il = 1; il <= n_layer_all; il++) {
