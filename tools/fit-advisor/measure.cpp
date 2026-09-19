@@ -743,8 +743,23 @@ static double bench_sched_chain(ggml_backend_t ba, ggml_backend_t bb, int n_ops,
         ggml_cgraph * gf = ggml_new_graph_custom(ctx_g, 512, false);
         ggml_build_forward_expand(gf, cur);
 
-        ggml_backend_t backends[2] = { ba, bb };
-        ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, 512, false, true);
+        // the scheduler wants the CPU backend last; op offload is off so an op runs where its weight lives at any batch
+        std::vector<ggml_backend_t> backends;
+        ggml_backend_t extra_cpu = nullptr;
+        for (ggml_backend_t b : { ba, bb }) {
+            if (!ggml_backend_is_cpu(b)) {
+                backends.push_back(b);
+            }
+        }
+        if (ggml_backend_is_cpu(bb)) {
+            backends.push_back(bb);
+        } else if (ggml_backend_is_cpu(ba)) {
+            backends.push_back(ba);
+        } else {
+            extra_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+            backends.push_back(extra_cpu);
+        }
+        ggml_backend_sched_t sched = ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(), 512, false, false);
         if (ggml_backend_sched_reserve(sched, gf)) {
             for (int i = 0; i < 3; i++) {
                 ggml_backend_sched_graph_compute(sched, gf);
@@ -763,6 +778,9 @@ static double bench_sched_chain(ggml_backend_t ba, ggml_backend_t bb, int n_ops,
             ret = (double) total / n;
         }
         ggml_backend_sched_free(sched);
+        if (extra_cpu) {
+            ggml_backend_free(extra_cpu);
+        }
     }
     if (buf_a) ggml_backend_buffer_free(buf_a);
     if (buf_b) ggml_backend_buffer_free(buf_b);
