@@ -180,15 +180,19 @@ static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_ad
     printf("\n[MiB] free: device memory free when probed; model/ctx+cmp: projected weights and context+compute buffers;\n");
     printf("left: free - projected use; fit: left >= --fit-target margin; Host row: projected host-side use, free RAM unknown\n");
 
-    bool any_overrides = false;
+    printf("\narguments per candidate (llama-bench takes the same flags, with ';' instead of ',' between -ot entries):\n");
     for (const auto & c : cands) {
-        if (!c.overrides.empty()) {
-            if (!any_overrides) {
-                printf("\ntensor overrides (-ot) per candidate:\n");
-                any_overrides = true;
+        std::string args = "-c " + std::to_string(c.n_ctx) + " -np " + std::to_string(c.n_slots) + " -ngl " + std::to_string(c.n_gpu_layers);
+        if (!c.tensor_split.empty()) {
+            args += " -ts ";
+            for (size_t i = 0; i < c.tensor_split.size(); i++) {
+                args += (i ? "/" : "") + std::to_string((long long) std::llround(c.tensor_split[i]));
             }
-            printf("  %-16s %s\n", c.name.c_str(), c.overrides_str().c_str());
         }
+        if (!c.overrides.empty()) {
+            args += " -ot \"" + c.overrides_str() + "\"";
+        }
+        printf("  %-16s %s\n", c.name.c_str(), args.c_str());
     }
 }
 
