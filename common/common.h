@@ -483,6 +483,8 @@ struct common_params {
     bool    fit_advisor_verify     = false; // llama-fit-advisor: verify each candidate's placement through a no_alloc load
     std::string fit_advisor_workload = "chat"; // llama-fit-advisor: workload preset to optimise for
     int32_t fit_advisor_search_iters = 20000;  // llama-fit-advisor: simulated annealing iterations, 0 = seeds only
+    std::string fit_advisor_emit_ini;          // llama-fit-advisor: write the chosen allocation as a preset section to this INI file
+    std::string fit_advisor_emit_name;         // llama-fit-advisor: section name for the preset, default: the model file name
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);

@@ -5,6 +5,7 @@
 
 #include "allocation.h"
 #include "cost.h"
+#include "emit.h"
 #include "inventory.h"
 #include "measure.h"
 #include "probe.h"
@@ -296,6 +297,34 @@ static void print_layer_costs(const fit_advisor_inventory & inv, const std::vect
     fflush(stdout);
 }
 
+static void emit_if_requested(const common_params & params, const fit_advisor_candidate & cand, const char * what) {
+    if (params.fit_advisor_emit_ini.empty()) {
+        return;
+    }
+    std::string name = params.fit_advisor_emit_name;
+    if (name.empty()) {
+        name = params.model.path;
+        const size_t slash = name.find_last_of("/\\");
+        if (slash != std::string::npos) {
+            name = name.substr(slash + 1);
+        }
+        const size_t dot = name.rfind(".gguf");
+        if (dot != std::string::npos) {
+            name = name.substr(0, dot);
+        }
+    }
+    const fit_advisor_emit_result er = fit_advisor_emit_ini(params.fit_advisor_emit_ini, name, params.model.path, cand, params.n_batch);
+    if (er.ok) {
+        LOG_INF("%s: wrote the %s allocation as section [%s] to %s and verified it reloads unchanged\n", __func__, what, er.section.c_str(), er.path.c_str());
+        common_log_flush(common_log_main());
+        printf("\n%s", er.ini.c_str());
+        printf("use it with: llama-server --models-preset %s   (router mode; or copy the keys into ~/.config/llama.cpp/config.ini)\n", er.path.c_str());
+        fflush(stdout);
+    } else {
+        LOG_ERR("%s: emitting the preset failed: %s\n", __func__, er.error.c_str());
+    }
+}
+
 int llama_fit_advisor(int argc, char ** argv) {
     common_params params;
 
@@ -364,6 +393,7 @@ int llama_fit_advisor(int argc, char ** argv) {
     }
 
     if (params.fit_advisor_no_measure) {
+        emit_if_requested(params, cands[1], "built-in fitter's");
         return 0;
     }
 
@@ -527,6 +557,7 @@ int llama_fit_advisor(int argc, char ** argv) {
     const double t_search = (ggml_time_us() - t_search0) * 1e-6;
     if (!sr.ok) {
         LOG_WRN("%s: search found no feasible allocation\n", __func__);
+        emit_if_requested(params, cands[1], "built-in fitter's"); // cands[1] is the fitter's own choice
         return 0;
     }
     LOG_INF("%s: search done in %.1f s: %d seed cells, %d probes, %d annealing moves accepted\n", __func__,
@@ -590,5 +621,7 @@ int llama_fit_advisor(int argc, char ** argv) {
         printf("  args: %s\n", args.c_str());
     }
     fflush(stdout);
+
+    emit_if_requested(params, sr.cand, "searched");
     return 0;
 }
