@@ -526,6 +526,8 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         }
     };
 
+    int n_improvements = 0;
+    int n_single_tried = 0, n_single_accepted = 0;
     const double T0 = std::max(1.0, 0.02 * std::fabs(cur.cost_score));
     const double T1 = std::max(0.01, 0.0001 * std::fabs(cur.cost_score));
     const int iters = std::max(0, opts.anneal_iters);
@@ -547,6 +549,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             }
             fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots);
             nxt.alloc.tensor_device[i] = nxt.alloc.tensor_device[i] == fit_advisor_allocation::DEV_CPU ? home.tensor_device[i] : fit_advisor_allocation::DEV_CPU;
+            n_single_tried++;
         } else if (mv < 0.55) {
             // toggle one group between its home and the CPU
             const searcher::group & g = movable[(size_t) (uni(rng) * movable.size()) % movable.size()];
@@ -614,6 +617,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             if (cur.penalty == 0 && cur.objective < best_seen.objective) {
                 best_seen = cur;
                 best_seen_dirty = true;
+                n_improvements++;
             }
         }
         // verify the best state with the real loader at most every 200 iterations, or when the walk is nearly done
@@ -624,7 +628,11 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             best_seen_dirty = false;
             proj_by_key[bkey] = pj;
             searcher::state checked = best_seen;
-            if (pj.ok && pj.fits_all() && S.evaluate(checked, pj) && checked.penalty == 0 && checked.objective < incumbent.objective) {
+            const bool ok = pj.ok && pj.fits_all() && S.evaluate(checked, pj) && checked.penalty == 0 && checked.objective < incumbent.objective;
+            LOG_INF("%s: iter %d: verifying best state (model %.3f s vs incumbent %.3f s): %s\n", __func__, it,
+                best_seen.objective * 1e-6, incumbent.objective * 1e-6,
+                !pj.ok ? "probe failed" : !pj.fits_all() ? "does not fit on probe" : !ok ? "not better after refresh" : "accepted as incumbent");
+            if (ok) {
                 incumbent = checked;
                 incumbent_proj = pj;
             } else {
@@ -636,6 +644,10 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             }
         }
     }
+
+    LOG_INF("%s: annealing: %d accepted of %d, %d single-tensor moves proposed, %d model improvements over the seed\n", __func__,
+        accepted, iters, n_single_tried, n_improvements);
+    GGML_UNUSED(n_single_accepted);
 
     // final verification of the incumbent
     {
