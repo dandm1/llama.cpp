@@ -623,6 +623,10 @@ int llama_fit_advisor(int argc, char ** argv) {
     }
     fflush(stdout);
 
+    if (params.fit_advisor_verify) {
+        fit_advisor_verify_allocation(params, inv, sr.alloc, device_bufts, sr.cand);
+    }
+
     emit_if_requested(params, sr.cand, "searched");
     return 0;
 }
