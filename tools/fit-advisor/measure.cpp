@@ -116,9 +116,11 @@ void fill_zero(ggml_tensor * t) {
 // zero_names: leaf tensors that are filled with zeros instead of random data (masks)
 using custom_fill_fn = std::function<bool(ggml_tensor *, std::mt19937 &)>; // true when the tensor was filled
 
+using per_run_fn = std::function<void(ggml_context *)>; // called before every run, outside the timing
+
 bench_result bench_graph(ggml_backend_t backend, const std::function<ggml_tensor *(ggml_context *)> & build,
                          const std::vector<std::string> & zero_names, double target_ms = 150.0, int min_runs = 3,
-                         const custom_fill_fn & custom_fill = nullptr) {
+                         const custom_fill_fn & custom_fill = nullptr, const per_run_fn & per_run = nullptr) {
     bench_result res;
 
     ggml_init_params ip = {
@@ -164,6 +166,9 @@ bench_result bench_graph(ggml_backend_t backend, const std::function<ggml_tensor
 
     // warm up: first runs include lazy initialization inside the backend
     for (int i = 0; i < 2; i++) {
+        if (per_run) {
+            per_run(ctx);
+        }
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
             res.reason = "graph compute failed";
             ggml_backend_buffer_free(buf);
@@ -176,6 +181,10 @@ bench_result bench_graph(ggml_backend_t backend, const std::function<ggml_tensor
     int64_t total_us = 0;
     int n_runs = 0;
     while (n_runs < min_runs || total_us < target_ms * 1000) {
+        if (per_run) {
+            per_run(ctx);
+            ggml_backend_synchronize(backend);
+        }
         const int64_t t0 = ggml_time_us();
         ggml_backend_graph_compute(backend, gf);
         ggml_backend_synchronize(backend);
@@ -207,8 +216,26 @@ bench_result bench_matmul(ggml_backend_t backend, ggml_type type, int64_t k, int
 }
 
 // expert matmul as the MoE layers issue it: weights [k, m, n_expert], activations [k, 1, n_tokens], ids [n_used, n_tokens]
-// with distinct random experts per token, so the routing, gather and sort work is part of the measurement
+// with distinct random experts per token, so the routing, gather and sort work is part of the measurement. the routing
+// is drawn again before every run: the model routes every token of every layer differently, so a fixed choice would
+// serve the touched experts from cache and overstate the rate several times over on a CPU
 bench_result bench_mul_mat_id(ggml_backend_t backend, ggml_type type, int64_t k, int64_t m, int n_expert, int n_used, int n_tokens) {
+    std::mt19937 rng_ids(7);
+    auto draw_ids = [&](ggml_tensor * t) {
+        std::vector<int32_t> ids((size_t) ggml_nelements(t));
+        std::vector<int32_t> perm(n_expert);
+        for (int64_t tok = 0; tok < t->ne[1]; tok++) {
+            for (int e = 0; e < n_expert; e++) {
+                perm[e] = e;
+            }
+            for (int j = 0; j < n_used; j++) { // partial Fisher-Yates: n_used distinct experts
+                const int r = j + (int) (rng_ids() % (uint32_t) (n_expert - j));
+                std::swap(perm[j], perm[r]);
+                ids[(size_t) tok * n_used + j] = perm[j];
+            }
+        }
+        ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(int32_t));
+    };
     return bench_graph(backend, [&](ggml_context * ctx) {
         ggml_tensor * w = ggml_new_tensor_3d(ctx, type, k, m, n_expert);
         ggml_set_name(w, "w");
@@ -217,24 +244,14 @@ bench_result bench_mul_mat_id(ggml_backend_t backend, ggml_type type, int64_t k,
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
         ggml_set_name(ids, "ids");
         return ggml_mul_mat_id(ctx, w, x, ids);
-    }, {}, 150.0, 3, [&](ggml_tensor * t, std::mt19937 & rng) {
+    }, {}, 150.0, 3, [&](ggml_tensor * t, std::mt19937 &) {
         if (t->type != GGML_TYPE_I32) {
             return false;
         }
-        std::vector<int32_t> ids((size_t) ggml_nelements(t));
-        std::vector<int32_t> perm(n_expert);
-        for (int64_t tok = 0; tok < t->ne[1]; tok++) {
-            for (int e = 0; e < n_expert; e++) {
-                perm[e] = e;
-            }
-            for (int j = 0; j < n_used; j++) { // partial Fisher-Yates: n_used distinct experts
-                const int r = j + (int) (rng() % (uint32_t) (n_expert - j));
-                std::swap(perm[j], perm[r]);
-                ids[(size_t) tok * n_used + j] = perm[j];
-            }
-        }
-        ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(int32_t));
+        draw_ids(t);
         return true;
+    }, [&](ggml_context * ctx) {
+        draw_ids(ggml_get_tensor(ctx, "ids"));
     });
 }
 
@@ -758,7 +775,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
     }
     try {
         const json j = json::parse(f);
-        if (j.value("version", 0) != 5) {
+        if (j.value("version", 0) != 6) {
             LOG_WRN("%s: ignoring %s, unknown version\n", __func__, path.c_str());
             return false;
         }
@@ -786,7 +803,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
 
 std::string fit_advisor_measurements::to_json() const {
     json j;
-    j["version"] = 5;
+    j["version"] = 6;
     j["devices"] = json::object();
     for (const auto & [key, m] : devices) {
         j["devices"][key] = device_to_json(m);
