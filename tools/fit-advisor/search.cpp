@@ -610,6 +610,18 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         if (!S.evaluate(nxt, proj_by_key[key])) continue;
 
         const double delta = nxt.objective - cur.objective;
+        if (mv < 0.15 && n_single_tried <= 12) {
+            // trace the first single-tensor moves: which tensor, where, and what the model thinks of it
+            for (size_t i = 0; i < inv.tensors.size(); i++) {
+                if (nxt.alloc.tensor_device[i] != cur.alloc.tensor_device[i]) {
+                    LOG_INF("%s: move %-34s %s -> %s: cost %.4f -> %.4f s, penalty %.4f -> %.4f s, delta %+.4f s\n", __func__,
+                        inv.tensors[i].name.c_str(),
+                        cur.alloc.tensor_device[i] < 0 ? "CPU" : device_bufts[cur.alloc.tensor_device[i]].c_str(),
+                        nxt.alloc.tensor_device[i] < 0 ? "CPU" : device_bufts[nxt.alloc.tensor_device[i]].c_str(),
+                        cur.cost_score * 1e-6, nxt.cost_score * 1e-6, cur.penalty * 1e-6, nxt.penalty * 1e-6, delta * 1e-6);
+                }
+            }
+        }
         if (delta < 0 || (delta > 0 && uni(rng) < std::exp(-delta / T))) {
             cur = nxt;
             accepted++;
