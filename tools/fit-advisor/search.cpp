@@ -389,11 +389,12 @@ struct searcher {
         s.penalty = 0;
         for (size_t d = 0; d < nd; d++) {
             if (over[d] > 0) {
-                s.penalty += over[d] / (double) UNIT * 2000.0; // 2 ms of request time per MiB over budget
+                // over budget: not a state the walk may enter. swaps and whole-group moves still let it rearrange
+                s.penalty += over[d] / (double) UNIT * 2000.0;
             }
         }
         s.objective = s.cost_score + s.penalty;
-        return true;
+        return s.penalty == 0;
     }
 };
 
@@ -543,8 +544,8 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
 
     int n_improvements = 0;
     int n_single_tried = 0, n_single_accepted = 0;
-    const double T0 = std::max(1.0, 0.02 * std::fabs(cur.cost_score));
-    const double T1 = std::max(0.01, 0.0001 * std::fabs(cur.cost_score));
+    const double T0 = std::max(1.0, 0.005 * std::fabs(cur.cost_score));
+    const double T1 = std::max(0.01, 0.00002 * std::fabs(cur.cost_score));
     const int iters = std::max(0, opts.anneal_iters);
     int accepted = 0;
     int last_probe_iter = 0;
@@ -675,6 +676,35 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     LOG_INF("%s: annealing: %d accepted of %d, %d single-tensor moves proposed, %d model improvements over the seed\n", __func__,
         accepted, iters, n_single_tried, n_improvements);
     GGML_UNUSED(n_single_accepted);
+
+    // fill: from the incumbent, add every CPU-resident tensor that the model says pays for itself, best gain per byte
+    // first, while the memory model has room; the probe verifies the result below
+    {
+        searcher::state st = incumbent;
+        fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, st.alloc.layers_per_device, opts.n_ctx, st.alloc.n_slots);
+        struct cand { size_t i; double density; };
+        std::vector<cand> cands;
+        for (const size_t i : singles) {
+            if (st.alloc.tensor_device[i] != fit_advisor_allocation::DEV_CPU || home.tensor_device[i] < 0) continue;
+            const double g = S.gain(i, home.tensor_device[i], st.wl, st.alloc.n_slots);
+            if (g > 0) cands.push_back({ i, g / (double) inv.tensors[i].nbytes });
+        }
+        std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.density > b.density; });
+        int n_filled = 0;
+        const std::string fkey = cell_key(st.alloc.layers_per_device, st.alloc.n_ubatch, st.alloc.n_slots);
+        for (const cand & c : cands) {
+            searcher::state nxt = st;
+            nxt.alloc.tensor_device[c.i] = home.tensor_device[c.i];
+            if (S.evaluate(nxt, proj_by_key[fkey]) && nxt.objective < st.objective) {
+                st = nxt;
+                n_filled++;
+            }
+        }
+        if (n_filled > 0) {
+            LOG_INF("%s: fill pass placed %d more tensors, model %.3f s -> %.3f s\n", __func__, n_filled, incumbent.objective * 1e-6, st.objective * 1e-6);
+            incumbent = st;
+        }
+    }
 
     // final verification of the incumbent
     {
