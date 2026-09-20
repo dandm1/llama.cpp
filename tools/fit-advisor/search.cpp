@@ -1,5 +1,7 @@
 #include "search.h"
 
+#include "ggml.h"
+
 #include "log.h"
 
 #include <algorithm>
@@ -141,12 +143,32 @@ struct searcher {
         size_t bytes = 0;
     };
 
+    // a tensor the search may consider moving: large enough to matter and of a type with a measured rate on every
+    // device, so its cost on either side is known. norms, biases, recurrent-state parameters and conv weights fail
+    // this and always stay with their layer: moving them buys nothing and drags their ops across the bus
+    bool tensor_movable(size_t i) const {
+        const auto & t = inv.tensors[i];
+        if (t.nbytes < (size_t) UNIT) {
+            return false;
+        }
+        for (const auto & d : cost_devs) {
+            if (!d.meas) {
+                return false;
+            }
+            const auto it = d.meas->matmul.find(ggml_type_name(t.type));
+            if (it == d.meas->matmul.end() || !it->second.supported || it->second.bytes_per_s <= 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     std::vector<group> build_groups(const fit_advisor_workload & wl) const {
         std::map<int32_t, group> exps_by_layer;
         std::vector<group> ret;
         for (size_t i = 0; i < inv.tensors.size(); i++) {
             const auto & t = inv.tensors[i];
-            if (!tensor_counts(i, wl) || t.layer < 0) {
+            if (!tensor_counts(i, wl) || t.layer < 0 || !tensor_movable(i)) {
                 continue;
             }
             if (t.kind == FIT_ADVISOR_TENSOR_FFN_EXPS) {
@@ -567,7 +589,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         if (!S.evaluate(nxt, proj_by_key[key])) continue;
 
         const double delta = nxt.objective - cur.objective;
-        if (delta <= 0 || uni(rng) < std::exp(-delta / T)) {
+        if (delta < 0 || (delta > 0 && uni(rng) < std::exp(-delta / T))) {
             cur = nxt;
             accepted++;
             if (cur.penalty == 0 && cur.objective < incumbent.objective) {
