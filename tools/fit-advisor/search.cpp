@@ -498,6 +498,21 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     fit_advisor_projection incumbent_proj = best_cell.proj;
     searcher::state best_seen = cur;
     bool best_seen_dirty = false;
+    {
+        // what the linear memory model holds for the seed's key, against the seed's own projection
+        const std::string key0 = cell_key(cur.alloc.layers_per_device, cur.alloc.n_ubatch, cur.alloc.n_slots);
+        const auto it = S.mem.by_key.find(key0);
+        std::vector<int64_t> over;
+        S.memory_over(cur.alloc, cur.wl, over);
+        for (size_t d = 0; d < nd && it != S.mem.by_key.end() && d < best_cell.proj.devices.size(); d++) {
+            const auto & pd = best_cell.proj.devices[d];
+            LOG_INF("%s: seed memory model %s: overhead %lld MiB (probe ctx+cmp+scratch %lld), free %lld, margin %lld -> over %lld MiB; probe model %lld, left %lld\n", __func__,
+                device_bufts[d].c_str(), (long long) (it->second.overhead[d] >> 20), (long long) ((pd.context + pd.compute + pd.scratch) >> 20),
+                (long long) (it->second.free[d] >> 20), (long long) (it->second.margin[d] >> 20), (long long) (over[d] >> 20),
+                (long long) (pd.model >> 20), (long long) (pd.projected_free() >> 20));
+        }
+        LOG_INF("%s: seed penalty %.4f s\n", __func__, cur.penalty * 1e-6);
+    }
 
     // movable groups: those with a positive gain on their home; plus every used layer tensor as a single candidate
     std::vector<searcher::group> movable;
