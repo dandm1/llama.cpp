@@ -669,6 +669,17 @@ int llama_fit_advisor(int argc, char ** argv) {
     sopts.n_ctx        = params.n_ctx;
     sopts.max_slots    = wl.concurrency;
     sopts.anneal_iters = params.fit_advisor_search_iters;
+    sopts.ubatch_options.clear();
+    for (const auto & v : string_split<std::string>(params.fit_advisor_search_ubatch, ',')) {
+        const int ub = std::atoi(v.c_str());
+        if (ub <= 0) {
+            LOG_ERR("%s: --search-ubatch: '%s' is not a positive integer\n", __func__, v.c_str());
+            return 1;
+        }
+        sopts.ubatch_options.push_back((uint32_t) ub);
+    }
+    std::sort(sopts.ubatch_options.begin(), sopts.ubatch_options.end());
+    sopts.ubatch_options.erase(std::unique(sopts.ubatch_options.begin(), sopts.ubatch_options.end()), sopts.ubatch_options.end());
 
     fit_advisor_search_result sr = search_and_report(params, inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts);
     if (!sr.ok) {

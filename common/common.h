@@ -485,6 +485,7 @@ struct common_params {
     int32_t fit_advisor_search_iters = 20000;  // llama-fit-advisor: simulated annealing iterations, 0 = seeds only
     std::string fit_advisor_emit_ini;          // llama-fit-advisor: write the chosen allocation as a preset section to this INI file
     std::string fit_advisor_emit_name;         // llama-fit-advisor: section name for the preset, default: the model file name
+    std::string fit_advisor_search_ubatch = "512,1024,2048"; // llama-fit-advisor: ubatch sizes the search may choose from
     bool    fit_advisor_validate = false;      // llama-fit-advisor: load the chosen allocation for real and measure what the projection missed
     int32_t fit_advisor_validate_tokens = 0;   // llama-fit-advisor: prompt tokens for the validation run, 0 = two ubatches
 

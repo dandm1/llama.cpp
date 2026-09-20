@@ -2938,6 +2938,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
     add_opt(common_arg(
+        {"--search-ubatch"}, "N,...",
+        string_format("ubatch sizes the search may choose from, a single value pins it (default: %s)", params.fit_advisor_search_ubatch.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.fit_advisor_search_ubatch = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
+    add_opt(common_arg(
         {"--validate"},
         "load the chosen allocation for real, run a prompt and a few generation steps, and measure the device memory the "
         "projection missed; the margin is then set from that measurement and the search repeated if it changed",
