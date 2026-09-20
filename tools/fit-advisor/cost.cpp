@@ -39,9 +39,31 @@ fit_advisor_workload fit_advisor_workload::preset(const std::string & name) {
 
 // the matmul curve has three points: batch 1 and 4 on the large weight, batch n_pp on the small one
 // interpolate per-token seconds per byte log-linearly in the batch size, extrapolating the last segment
+// per-token seconds at a batch from measured (batch -> seconds for the whole batch) points: log-linear between
+// bracketing points, the first point below its batch, flat per token beyond the last (compute bound)
+static double interp_per_token(const std::map<int, double> & points, uint32_t batch) {
+    if (points.empty()) {
+        return 0;
+    }
+    auto per_token = [](const std::pair<const int, double> & p) { return p.second / p.first; };
+    auto hi = points.lower_bound((int) batch);
+    if (hi == points.end()) {
+        return per_token(*std::prev(points.end()));
+    }
+    if (hi == points.begin() || hi->first == (int) batch) {
+        return per_token(*hi);
+    }
+    auto lo = std::prev(hi);
+    const double f = (std::log((double) batch) - std::log((double) lo->first)) / (std::log((double) hi->first) - std::log((double) lo->first));
+    return std::exp(std::log(per_token(*lo)) + f * (std::log(per_token(*hi)) - std::log(per_token(*lo))));
+}
+
 double fit_advisor_s_per_byte(const fit_advisor_matmul_rate & r, uint32_t batch) {
     if (!r.supported || r.s_per_byte_b1 <= 0) {
         return 0;
+    }
+    if (r.points.size() >= 2) {
+        return interp_per_token(r.points, std::max<uint32_t>(1, batch));
     }
     // per-token cost at each point
     const double c1 = r.s_per_byte_b1;
@@ -125,6 +147,16 @@ double tensor_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t
         return copy_us;
     }
 
+    if (use.is_matmul && t.kind == FIT_ADVISOR_TENSOR_FFN_EXPS) {
+        // measured through mul_mat_id with this model's routing: seconds per stack byte for the whole ubatch,
+        // interpolated per token in the batch, so the routed fraction and the gather/sort work are inside the number
+        const auto it = dev->meas->moe.find(ggml_type_name(t.type));
+        if (it != dev->meas->moe.end() && it->second.supported && it->second.n_expert == (int) inv.n_expert
+            && it->second.n_expert_used == (int) inv.n_expert_used && !it->second.points.empty()) {
+            const uint32_t b = std::max<uint32_t>(1, batch);
+            return copy_us + t.nbytes * interp_per_token(it->second.points, b) * b * 1e6;
+        }
+    }
     if (use.is_matmul) {
         const auto it = dev->meas->matmul.find(ggml_type_name(t.type));
         if (it == dev->meas->matmul.end() || !it->second.supported || it->second.bytes_per_s <= 0) {

@@ -41,6 +41,21 @@ struct fit_advisor_matmul_rate {
     double s_per_byte_bpp  = 0; // small weight, batch n_batch_pp
     size_t bytes_small = 0; // weight sizes used, the large one is chosen to exceed on-chip caches
     size_t bytes_large = 0;
+
+    // the full curve: batch -> seconds per weight byte for the whole batch (large weight up to batch 64, small above)
+    std::map<int, double> points;
+};
+
+// expert matmul (mul_mat_id) with the model's own routing geometry: a stack of n_expert experts, each token reading
+// n_expert_used of them. the routing, gather and sort costs are inside the measurement, so the cost model needs no
+// expert arithmetic for a type that has this
+struct fit_advisor_moe_rate {
+    bool   supported     = false;
+    int    n_expert      = 0;
+    int    n_expert_used = 0;
+    int64_t k = 0, m = 0;          // one expert's matrix, [k, m]
+    size_t bytes_total = 0;        // the whole stack
+    std::map<int, double> points;  // batch (tokens) -> seconds per stack byte for the whole ubatch
 };
 
 struct fit_advisor_attn_rate {
@@ -79,6 +94,7 @@ struct fit_advisor_device_measurements {
     std::string measured_at;
 
     std::map<std::string, fit_advisor_matmul_rate> matmul; // keyed by ggml type name, e.g. "q4_K"
+    std::map<std::string, fit_advisor_moe_rate>    moe;    // keyed by ggml type name; one routing geometry per entry
     std::map<std::string, fit_advisor_attn_rate>   attn;   // keyed by "hd<head size>/<kv type>", e.g. "hd128/f16"
     double op_overhead_us = 0; // fixed cost per graph op inside a graph, from the slope of a chain of tiny ops
     double launch_us      = 0; // cost of one graph compute of a single tiny op: what every scheduler split pays on this device
@@ -88,7 +104,8 @@ struct fit_advisor_device_measurements {
     int64_t runtime_overhead_bytes = -1;
 
     bool has_matmul(ggml_type type) const { return matmul.count(ggml_type_name(type)) > 0; }
-    bool has_matmul_curve(ggml_type type) const; // measured with the batch-4 point too
+    bool has_matmul_curve(ggml_type type, const std::vector<int> & batches) const; // measured at every batch in the list
+    bool has_moe(ggml_type type, int n_expert, int n_expert_used, const std::vector<int> & batches) const;
     bool has_attn(int head_size, int head_size_v, ggml_type type_kv) const;
     fit_advisor_copy_rate copy;
 };
@@ -102,6 +119,12 @@ struct fit_advisor_measure_options {
     int  n_head_kv  = 8;
     int  n_kv          = 16384;
     int  n_batch_pp    = 512; // matmul prompt-processing batch
+    std::vector<int> batches = { 1, 4, 16, 64 }; // matmul curve points below the prompt batch, which is always added
+    std::vector<ggml_type> moe_types; // expert weight types to measure through mul_mat_id, empty for dense models
+    int  n_expert      = 0;
+    int  n_expert_used = 0;
+    int64_t moe_k = 0;  // one expert's matrix, from the model
+    int64_t moe_m = 0;
     int  n_batch_attn  = 128; // attention prompt-processing batch, smaller because the KV is large
     int  n_threads     = 0;   // CPU device only, 0 = default
     bool measure_copy  = true;

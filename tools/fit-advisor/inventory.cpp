@@ -140,6 +140,8 @@ static void add_shard(fit_advisor_inventory & inv, const std::string & path, boo
         inv.n_expert      = (uint32_t) get_kv_uint(ctx, inv.arch + ".expert_count",         0);
         inv.n_expert_used = (uint32_t) get_kv_uint(ctx, inv.arch + ".expert_used_count",    0);
         inv.n_embd        = (uint32_t) get_kv_uint(ctx, inv.arch + ".embedding_length",     0);
+        inv.n_ff_exp      = (uint32_t) get_kv_uint(ctx, inv.arch + ".expert_feed_forward_length",
+                                                   inv.n_expert > 0 ? (uint32_t) get_kv_uint(ctx, inv.arch + ".feed_forward_length", 0) : 0);
         inv.n_head        = (uint32_t) get_kv_uint_or_arr_max(ctx, inv.arch + ".attention.head_count",    0);
         inv.n_head_kv     = (uint32_t) get_kv_uint_or_arr_max(ctx, inv.arch + ".attention.head_count_kv", inv.n_head);
         inv.head_size     = (uint32_t) get_kv_uint(ctx, inv.arch + ".attention.key_length",

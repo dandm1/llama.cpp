@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cinttypes>
 #include <chrono>
 #include <cmath>
 #include <ctime>
@@ -113,8 +114,11 @@ void fill_zero(ggml_tensor * t) {
 
 // build: creates the op(s) in ctx and returns the output tensor
 // zero_names: leaf tensors that are filled with zeros instead of random data (masks)
+using custom_fill_fn = std::function<bool(ggml_tensor *, std::mt19937 &)>; // true when the tensor was filled
+
 bench_result bench_graph(ggml_backend_t backend, const std::function<ggml_tensor *(ggml_context *)> & build,
-                         const std::vector<std::string> & zero_names, double target_ms = 150.0, int min_runs = 3) {
+                         const std::vector<std::string> & zero_names, double target_ms = 150.0, int min_runs = 3,
+                         const custom_fill_fn & custom_fill = nullptr) {
     bench_result res;
 
     ggml_init_params ip = {
@@ -146,6 +150,9 @@ bench_result bench_graph(ggml_backend_t backend, const std::function<ggml_tensor
     std::mt19937 rng(42);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         if (t->op != GGML_OP_NONE || t->view_src != nullptr) {
+            continue;
+        }
+        if (custom_fill && custom_fill(t, rng)) {
             continue;
         }
         if (std::find(zero_names.begin(), zero_names.end(), t->name) != zero_names.end()) {
@@ -197,6 +204,38 @@ bench_result bench_matmul(ggml_backend_t backend, ggml_type type, int64_t k, int
         ggml_set_name(x, "x");
         return ggml_mul_mat(ctx, w, x);
     }, {});
+}
+
+// expert matmul as the MoE layers issue it: weights [k, m, n_expert], activations [k, 1, n_tokens], ids [n_used, n_tokens]
+// with distinct random experts per token, so the routing, gather and sort work is part of the measurement
+bench_result bench_mul_mat_id(ggml_backend_t backend, ggml_type type, int64_t k, int64_t m, int n_expert, int n_used, int n_tokens) {
+    return bench_graph(backend, [&](ggml_context * ctx) {
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, type, k, m, n_expert);
+        ggml_set_name(w, "w");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_set_name(ids, "ids");
+        return ggml_mul_mat_id(ctx, w, x, ids);
+    }, {}, 150.0, 3, [&](ggml_tensor * t, std::mt19937 & rng) {
+        if (t->type != GGML_TYPE_I32) {
+            return false;
+        }
+        std::vector<int32_t> ids((size_t) ggml_nelements(t));
+        std::vector<int32_t> perm(n_expert);
+        for (int64_t tok = 0; tok < t->ne[1]; tok++) {
+            for (int e = 0; e < n_expert; e++) {
+                perm[e] = e;
+            }
+            for (int j = 0; j < n_used; j++) { // partial Fisher-Yates: n_used distinct experts
+                const int r = j + (int) (rng() % (uint32_t) (n_expert - j));
+                std::swap(perm[j], perm[r]);
+                ids[(size_t) tok * n_used + j] = perm[j];
+            }
+        }
+        ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(int32_t));
+        return true;
+    });
 }
 
 // attention over a KV cache of n_kv entries, with flash attention or through the explicit path
@@ -325,6 +364,16 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
         const bench_result b2 = bench_matmul(backend, type, k, m2, 1);
         const bench_result b4 = bench_matmul(backend, type, k, m2, 4);
         const bench_result bp = bench_matmul(backend, type, k, m1, opts.n_batch_pp);
+        // the rest of the curve: the large weight below the prompt batch, the small one at it
+        for (const int b : opts.batches) {
+            if (b == 1 || b == 4 || b >= opts.n_batch_pp) {
+                continue;
+            }
+            const bench_result bb = bench_matmul(backend, type, k, m2, b);
+            if (bb.supported) {
+                r.points[b] = bb.us_per_run * 1e-6 / (double) r.bytes_large;
+            }
+        }
         if (!b1.supported || !b2.supported) {
             LOG_WRN("%s: matmul %s not measurable: %s\n", __func__, ggml_type_name(type), (b1.supported ? b2 : b1).reason.c_str());
             m.matmul[ggml_type_name(type)] = r;
@@ -346,13 +395,69 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
             r.s_per_byte_bpp = bp.us_per_run * 1e-6 / bytes1;
         }
         r.s_per_byte_b1 = b2.us_per_run * 1e-6 / bytes2;
+        r.points[1] = r.s_per_byte_b1;
         if (b4.supported) {
             r.s_per_byte_b4 = b4.us_per_run * 1e-6 / bytes2;
+            r.points[4] = r.s_per_byte_b4;
+        }
+        if (bp.supported) {
+            r.points[opts.n_batch_pp] = r.s_per_byte_bpp;
         }
         m.matmul[ggml_type_name(type)] = r;
         LOG_INF("%s:   matmul %-6s tg %7.1f GB/s, b4 %7.1f GB/s/token, overhead %6.1f us, pp %7.0f GFLOPS (%d/%d/%d/%d runs, %.1f s)\n", __func__,
             ggml_type_name(type), r.bytes_per_s / 1e9, r.s_per_byte_b4 > 0 ? 1.0 / r.s_per_byte_b4 / 4 / 1e9 : 0.0, r.overhead_us, r.gflops_pp,
             b1.n_runs, b2.n_runs, b4.n_runs, bp.n_runs, (ggml_time_us() - t_type0) * 1e-6);
+    }
+
+    // expert matmul per expert weight type, with the model's routing geometry and expert shape
+    if (opts.n_expert > 0 && opts.n_expert_used > 0 && opts.moe_k > 0 && opts.moe_m > 0) {
+        for (const ggml_type type : opts.moe_types) {
+            fit_advisor_moe_rate r;
+            r.n_expert      = opts.n_expert;
+            r.n_expert_used = opts.n_expert_used;
+            r.k = opts.moe_k;
+            r.m = opts.moe_m;
+            r.bytes_total = ggml_row_size(type, r.k) * (size_t) r.m * (size_t) r.n_expert;
+            if (dev_free > 0 && r.bytes_total > dev_free / 2) {
+                LOG_WRN("%s: moe %s not measurable: the expert stack needs %zu MiB\n", __func__, ggml_type_name(type), r.bytes_total / (1024 * 1024));
+                m.moe[ggml_type_name(type)] = r;
+                continue;
+            }
+            std::vector<int> batches = opts.batches;
+            if (std::find(batches.begin(), batches.end(), opts.n_batch_pp) == batches.end()) {
+                batches.push_back(opts.n_batch_pp);
+            }
+            LOG_INF("%s:   moe %-6s measuring (%d experts of [%" PRId64 ", %" PRId64 "], %d used, %zu MiB, %zu batch points) ...\n", __func__,
+                ggml_type_name(type), r.n_expert, r.k, r.m, r.n_expert_used, r.bytes_total / (1024 * 1024), batches.size());
+            const int64_t t_moe0 = ggml_time_us();
+            std::string reason;
+            for (const int b : batches) {
+                if (b > opts.n_batch_pp) {
+                    continue;
+                }
+                const bench_result br = bench_mul_mat_id(backend, type, r.k, r.m, r.n_expert, r.n_expert_used, b);
+                if (br.supported) {
+                    r.points[b] = br.us_per_run * 1e-6 / (double) r.bytes_total;
+                } else {
+                    reason = br.reason;
+                }
+            }
+            r.supported = r.points.count(1) > 0;
+            if (!r.supported) {
+                LOG_WRN("%s: moe %s not measurable: %s\n", __func__, ggml_type_name(type), reason.c_str());
+            } else {
+                const double touched = (double) r.bytes_total * r.n_expert_used / r.n_expert;
+                std::string pts;
+                for (const auto & [b, spb] : r.points) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "%s b%d %.0f us", pts.empty() ? "" : ",", b, spb * r.bytes_total * 1e6);
+                    pts += buf;
+                }
+                LOG_INF("%s:   moe %-6s tg %7.1f GB/s over the %d used experts;%s (%.1f s)\n", __func__, ggml_type_name(type),
+                    touched / (r.points[1] * r.bytes_total) / 1e9, r.n_expert_used, pts.c_str(), (ggml_time_us() - t_moe0) * 1e-6);
+            }
+            m.moe[ggml_type_name(type)] = r;
+        }
     }
 
     // attention per KV type
@@ -501,6 +606,22 @@ static json device_to_json(const fit_advisor_device_measurements & m) {
             { "s_per_byte_b4",  r.s_per_byte_b4 },
             { "s_per_byte_bpp", r.s_per_byte_bpp },
         };
+        for (const auto & [b, spb] : r.points) {
+            j["matmul"][type]["points"][std::to_string(b)] = spb;
+        }
+    }
+    for (const auto & [type, r] : m.moe) {
+        j["moe"][type] = {
+            { "supported",     r.supported },
+            { "n_expert",      r.n_expert },
+            { "n_expert_used", r.n_expert_used },
+            { "k",             r.k },
+            { "m",             r.m },
+            { "bytes_total",   r.bytes_total },
+        };
+        for (const auto & [b, spb] : r.points) {
+            j["moe"][type]["points"][std::to_string(b)] = spb;
+        }
     }
     for (const auto & [key, r] : m.attn) {
         j["attn"][key] = {
@@ -542,7 +663,29 @@ static fit_advisor_device_measurements device_from_json(const json & j) {
             mr.s_per_byte_b1  = r.value("s_per_byte_b1", 0.0);
             mr.s_per_byte_b4  = r.value("s_per_byte_b4", 0.0);
             mr.s_per_byte_bpp = r.value("s_per_byte_bpp", 0.0);
+            if (r.contains("points")) {
+                for (const auto & [b, spb] : r.at("points").items()) {
+                    mr.points[std::stoi(b)] = spb.get<double>();
+                }
+            }
             m.matmul[type] = mr;
+        }
+    }
+    if (j.contains("moe")) {
+        for (const auto & [type, r] : j.at("moe").items()) {
+            fit_advisor_moe_rate mr;
+            mr.supported     = r.value("supported", false);
+            mr.n_expert      = r.value("n_expert", 0);
+            mr.n_expert_used = r.value("n_expert_used", 0);
+            mr.k             = r.value("k", (int64_t) 0);
+            mr.m             = r.value("m", (int64_t) 0);
+            mr.bytes_total   = r.value("bytes_total", (size_t) 0);
+            if (r.contains("points")) {
+                for (const auto & [b, spb] : r.at("points").items()) {
+                    mr.points[std::stoi(b)] = spb.get<double>();
+                }
+            }
+            m.moe[type] = mr;
         }
     }
     if (j.contains("attn")) {
@@ -568,9 +711,36 @@ static fit_advisor_device_measurements device_from_json(const json & j) {
     return m;
 }
 
-bool fit_advisor_device_measurements::has_matmul_curve(ggml_type type) const {
+bool fit_advisor_device_measurements::has_matmul_curve(ggml_type type, const std::vector<int> & batches) const {
     const auto it = matmul.find(ggml_type_name(type));
-    return it != matmul.end() && (!it->second.supported || it->second.s_per_byte_b4 > 0);
+    if (it == matmul.end()) {
+        return false;
+    }
+    if (!it->second.supported) {
+        return true; // measured and found unsupported, nothing more to learn
+    }
+    for (const int b : batches) {
+        if (it->second.points.count(b) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool fit_advisor_device_measurements::has_moe(ggml_type type, int n_expert, int n_expert_used, const std::vector<int> & batches) const {
+    const auto it = moe.find(ggml_type_name(type));
+    if (it == moe.end() || it->second.n_expert != n_expert || it->second.n_expert_used != n_expert_used) {
+        return false;
+    }
+    if (!it->second.supported) {
+        return true;
+    }
+    for (const int b : batches) {
+        if (it->second.points.count(b) == 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool fit_advisor_device_measurements::has_attn(int head_size, int head_size_v, ggml_type type_kv) const {
@@ -588,7 +758,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
     }
     try {
         const json j = json::parse(f);
-        if (j.value("version", 0) != 4) {
+        if (j.value("version", 0) != 5) {
             LOG_WRN("%s: ignoring %s, unknown version\n", __func__, path.c_str());
             return false;
         }
@@ -616,7 +786,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
 
 std::string fit_advisor_measurements::to_json() const {
     json j;
-    j["version"] = 4;
+    j["version"] = 5;
     j["devices"] = json::object();
     for (const auto & [key, m] : devices) {
         j["devices"][key] = device_to_json(m);
@@ -661,10 +831,20 @@ const fit_advisor_device_measurements & fit_advisor_measurements::ensure(ggml_ba
     if (it != devices.end() && !force) {
         // measure only what the cached entry lacks
         const fit_advisor_device_measurements & have = it->second;
+        std::vector<int> batches = opts.batches;
+        if (std::find(batches.begin(), batches.end(), opts.n_batch_pp) == batches.end()) {
+            batches.push_back(opts.n_batch_pp);
+        }
         todo.weight_types.clear();
         for (const ggml_type type : opts.weight_types) {
-            if (!have.has_matmul_curve(type)) {
+            if (!have.has_matmul_curve(type, batches)) {
                 todo.weight_types.push_back(type);
+            }
+        }
+        todo.moe_types.clear();
+        for (const ggml_type type : opts.moe_types) {
+            if (!have.has_moe(type, opts.n_expert, opts.n_expert_used, batches)) {
+                todo.moe_types.push_back(type);
             }
         }
         todo.kv_types.clear();
@@ -678,11 +858,11 @@ const fit_advisor_device_measurements & fit_advisor_measurements::ensure(ggml_ba
         if (have.runtime_overhead_bytes < 0) {
             // the runtime overhead is the memory the whole kernel set leaves behind, so measure everything again
             todo = opts;
-        } else if (todo.weight_types.empty() && todo.kv_types.empty() && !todo.measure_copy && !need_launch) {
+        } else if (todo.weight_types.empty() && todo.moe_types.empty() && todo.kv_types.empty() && !todo.measure_copy && !need_launch) {
             return have;
         }
-        LOG_INF("%s: cached entry for %s lacks %zu weight types, %zu KV types%s, measuring those\n", __func__,
-            ggml_backend_dev_name(dev), todo.weight_types.size(), todo.kv_types.size(), todo.measure_copy ? " and copy rates" : "");
+        LOG_INF("%s: cached entry for %s lacks %zu weight types, %zu expert types, %zu KV types%s, measuring those\n", __func__,
+            ggml_backend_dev_name(dev), todo.weight_types.size(), todo.moe_types.size(), todo.kv_types.size(), todo.measure_copy ? " and copy rates" : "");
     }
 
     fit_advisor_device_measurements m = fit_advisor_measure_device(dev, todo);
@@ -691,6 +871,9 @@ const fit_advisor_device_measurements & fit_advisor_measurements::ensure(ggml_ba
         fit_advisor_device_measurements & have = it->second;
         for (auto & [type, r] : m.matmul) {
             have.matmul[type] = r;
+        }
+        for (auto & [type, r] : m.moe) {
+            have.moe[type] = r;
         }
         for (auto & [k, r] : m.attn) {
             have.attn[k] = r;
@@ -718,8 +901,28 @@ void fit_advisor_measurements_print(const fit_advisor_device_measurements & m) {
             LOG_INF("%s:   matmul %-6s not supported\n", __func__, type.c_str());
             continue;
         }
-        LOG_INF("%s:   matmul %-6s tg %7.1f GB/s, b4 %7.1f GB/s/token, overhead %6.1f us, pp %7.0f GFLOPS at batch %d\n", __func__,
-            type.c_str(), r.bytes_per_s / 1e9, r.s_per_byte_b4 > 0 ? 1.0 / r.s_per_byte_b4 / 4 / 1e9 : 0.0, r.overhead_us, r.gflops_pp, r.n_batch_pp);
+        std::string curve; // per-token weight throughput at every measured batch
+        for (const auto & [b, spb] : r.points) {
+            char buf[48];
+            snprintf(buf, sizeof(buf), "%sb%d %.0f", curve.empty() ? "" : " ", b, spb > 0 ? 1.0 / spb / b / 1e9 : 0.0);
+            curve += buf;
+        }
+        LOG_INF("%s:   matmul %-6s tg %7.1f GB/s, overhead %6.1f us, pp %7.0f GFLOPS at batch %d; GB/s per token: %s\n", __func__,
+            type.c_str(), r.bytes_per_s / 1e9, r.overhead_us, r.gflops_pp, r.n_batch_pp, curve.c_str());
+    }
+    for (const auto & [type, r] : m.moe) {
+        if (!r.supported) {
+            LOG_INF("%s:   moe    %-6s not measured\n", __func__, type.c_str());
+            continue;
+        }
+        std::string curve; // microseconds per ubatch for the stack
+        for (const auto & [b, spb] : r.points) {
+            char buf[48];
+            snprintf(buf, sizeof(buf), "%sb%d %.0f", curve.empty() ? "" : " ", b, spb * r.bytes_total * 1e6);
+            curve += buf;
+        }
+        LOG_INF("%s:   moe    %-6s %d experts [%" PRId64 "x%" PRId64 "], %d used, %zu MiB; us per ubatch: %s\n", __func__,
+            type.c_str(), r.n_expert, r.k, r.m, r.n_expert_used, r.bytes_total / (1024 * 1024), curve.c_str());
     }
     for (const auto & [key, r] : m.attn) {
         LOG_INF("%s:   attn %-10s n_kv %d: fa tg %7.1f GB/s pp %8.0f us | no-fa tg %7.1f GB/s pp %8.0f us%s%s\n", __func__,

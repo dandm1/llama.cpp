@@ -508,6 +508,18 @@ int llama_fit_advisor(int argc, char ** argv) {
         mopts.n_head_kv   = (int) inv.n_head_kv;
     }
     mopts.n_batch_pp = params.n_ubatch;
+    if (inv.is_moe() && inv.n_expert_used > 0 && inv.n_ff_exp > 0) {
+        // expert matmuls are measured through mul_mat_id with the model's own routing and expert shape (gate/up)
+        mopts.n_expert      = (int) inv.n_expert;
+        mopts.n_expert_used = (int) inv.n_expert_used;
+        mopts.moe_k = inv.n_embd;
+        mopts.moe_m = inv.n_ff_exp;
+        for (const auto & t : inv.tensors) {
+            if (t.kind == FIT_ADVISOR_TENSOR_FFN_EXPS && std::find(mopts.moe_types.begin(), mopts.moe_types.end(), t.type) == mopts.moe_types.end()) {
+                mopts.moe_types.push_back(t.type);
+            }
+        }
+    }
     mopts.n_threads  = params.cpuparams.n_threads;
     mopts.verbose    = params.verbosity >= LOG_LEVEL_DEBUG;
 

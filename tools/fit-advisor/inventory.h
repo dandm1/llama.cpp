@@ -48,6 +48,7 @@ struct fit_advisor_inventory {
     uint32_t n_layer_nextn = 0; // MTP layers stored after the regular ones (blk.n_layer, ...)
     uint32_t n_expert      = 0;
     uint32_t n_expert_used = 0; // experts read per token, 0 for dense models
+    uint32_t n_ff_exp      = 0; // feed-forward width of one expert, 0 for dense models
     uint32_t n_ctx_train   = 0;
     uint32_t n_split       = 1; // number of GGUF shards
 
