@@ -5567,6 +5567,14 @@ static size_t ggml_cuda_scratch_cublas(int cc, const ggml_tensor * src0, const g
     if (dst->op_params[0] == GGML_PREC_F32) {
         compute_type = GGML_TYPE_F32;
     }
+    // same rule as ggml_cuda_mul_mat_cublas_impl: some architectures write f32 output directly, the rest compute the
+    // output in the compute type in the pool and convert it
+    bool prefer_f32_output = false;
+    if (compute_type == GGML_TYPE_F16) {
+        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+    } else if (compute_type == GGML_TYPE_BF16) {
+        prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+    }
     const size_t ts = ggml_type_size(compute_type);
     size_t ret = 0;
     if (src0->type != compute_type) {
@@ -5575,7 +5583,7 @@ static size_t ggml_cuda_scratch_cublas(int cc, const ggml_tensor * src0, const g
     if (src1->type != compute_type) {
         ret += (size_t) ggml_nelements(src1) * ts;
     }
-    if (compute_type != GGML_TYPE_F32) {
+    if (compute_type != GGML_TYPE_F32 && !prefer_f32_output) {
         ret += (size_t) ggml_nelements(dst) * ts;  // output computed in the compute type, then converted
     }
     return ret;

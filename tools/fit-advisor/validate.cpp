@@ -115,12 +115,14 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
     llama_batch batch = llama_batch_init((int32_t) n_batch, 0, (int32_t) n_slots);
     bool decode_ok = true;
 
-    LOG_INF("%s: prompt of %u tokens in batches of %u ...\n", __func__, n_prompt_tokens, n_batch);
+    // every prompt token asks for logits: the reserve sizes the compute buffer and the scratch estimate for an
+    // output matmul over the whole ubatch, so the validation has to exercise that path too
+    LOG_INF("%s: prompt of %u tokens in batches of %u, logits for every token ...\n", __func__, n_prompt_tokens, n_batch);
     for (uint32_t pos = 0; pos < n_prompt_tokens && decode_ok; pos += n_batch) {
         const uint32_t n = std::min(n_batch, n_prompt_tokens - pos);
         common_batch_clear(batch);
         for (uint32_t i = 0; i < n; i++) {
-            common_batch_add(batch, token_at(pos + i), (llama_pos) (pos + i), { 0 }, i + 1 == n);
+            common_batch_add(batch, token_at(pos + i), (llama_pos) (pos + i), { 0 }, true);
         }
         const int ret = llama_decode(ctx, batch);
         if (ret != 0) {

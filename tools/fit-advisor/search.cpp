@@ -5,6 +5,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <map>
 #include <numeric>
@@ -544,6 +545,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
 
     int n_improvements = 0;
     int n_single_tried = 0, n_single_accepted = 0;
+    const char * trace_tensor = getenv("FIT_ADVISOR_TRACE"); // substring of a tensor name whose moves are logged
     const double T0 = std::max(1.0, 0.005 * std::fabs(cur.cost_score));
     const double T1 = std::max(0.01, 0.00002 * std::fabs(cur.cost_score));
     const int iters = std::max(0, opts.anneal_iters);
@@ -626,6 +628,21 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         if (!S.evaluate(nxt, proj_by_key[key])) continue;
 
         const double delta = nxt.objective - cur.objective;
+        if (mv < 0.15 && trace_tensor) {
+            for (size_t i = 0; i < inv.tensors.size(); i++) {
+                if (nxt.alloc.tensor_device[i] != cur.alloc.tensor_device[i] && inv.tensors[i].name.find(trace_tensor) != std::string::npos) {
+                    const fit_advisor_cost c0 = fit_advisor_cost_estimate(inv, cur.alloc, proj_by_key[key], gp, cost_devs, pairs, cur.wl);
+                    const fit_advisor_cost c1 = fit_advisor_cost_estimate(inv, nxt.alloc, proj_by_key[key], gp, cost_devs, pairs, nxt.wl);
+                    LOG_INF("%s: iter %d T %.4f s: move %s %s -> %s: delta %+.4f s (weights %+.1f attn %+.1f overhead %+.1f boundary %+.1f us/gen step; pp %.0f -> %.0f tok/s)\n", __func__,
+                        it, T * 1e-6, inv.tensors[i].name.c_str(),
+                        cur.alloc.tensor_device[i] < 0 ? "CPU" : device_bufts[cur.alloc.tensor_device[i]].c_str(),
+                        nxt.alloc.tensor_device[i] < 0 ? "CPU" : device_bufts[nxt.alloc.tensor_device[i]].c_str(),
+                        delta * 1e-6, c1.step_weights_us - c0.step_weights_us, c1.step_attn_us - c0.step_attn_us,
+                        c1.step_overhead_us - c0.step_overhead_us, c1.step_boundary_us - c0.step_boundary_us,
+                        c0.prompt_tokens_per_s, c1.prompt_tokens_per_s);
+                }
+            }
+        }
         if (mv < 0.15 && n_single_tried <= 12) {
             // trace the first single-tensor moves: which tensor, where, and what the model thinks of it
             for (size_t i = 0; i < inv.tensors.size(); i++) {
@@ -684,10 +701,12 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, st.alloc.layers_per_device, opts.n_ctx, st.alloc.n_slots);
         struct cand { size_t i; double density; };
         std::vector<cand> cands;
+        // every CPU-resident single is tried, whatever its weight-only gain: the full model with the excursion cost
+        // decides, so a tensor the walk parked on the CPU at high temperature comes back if that was a bad trade
         for (const size_t i : singles) {
             if (st.alloc.tensor_device[i] != fit_advisor_allocation::DEV_CPU || home.tensor_device[i] < 0) continue;
             const double g = S.gain(i, home.tensor_device[i], st.wl, st.alloc.n_slots);
-            if (g > 0) cands.push_back({ i, g / (double) inv.tensors[i].nbytes });
+            cands.push_back({ i, g / (double) inv.tensors[i].nbytes });
         }
         std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.density > b.density; });
         int n_filled = 0;
@@ -695,7 +714,14 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         for (const cand & c : cands) {
             searcher::state nxt = st;
             nxt.alloc.tensor_device[c.i] = home.tensor_device[c.i];
-            if (S.evaluate(nxt, proj_by_key[fkey]) && nxt.objective < st.objective) {
+            const bool feasible = S.evaluate(nxt, proj_by_key[fkey]);
+            if (trace_tensor && inv.tensors[c.i].name.find(trace_tensor) != std::string::npos) {
+                LOG_INF("%s: fill %-34s CPU -> %s: %s, cost %.4f -> %.4f s, weight-only gain %+.4f s\n", __func__,
+                    inv.tensors[c.i].name.c_str(), device_bufts[home.tensor_device[c.i]].c_str(),
+                    feasible ? "fits" : "over budget", st.cost_score * 1e-6, nxt.cost_score * 1e-6,
+                    c.density * (double) inv.tensors[c.i].nbytes * 1e-6);
+            }
+            if (feasible && nxt.objective < st.objective) {
                 st = nxt;
                 n_filled++;
             }
