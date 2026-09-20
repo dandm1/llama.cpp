@@ -496,6 +496,8 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     }
     searcher::state incumbent = cur;
     fit_advisor_projection incumbent_proj = best_cell.proj;
+    searcher::state best_seen = cur;
+    bool best_seen_dirty = false;
 
     // movable groups: those with a positive gain on their home; plus every used layer tensor as a single candidate
     std::vector<searcher::group> movable;
@@ -608,21 +610,28 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         if (delta < 0 || (delta > 0 && uni(rng) < std::exp(-delta / T))) {
             cur = nxt;
             accepted++;
-            if (cur.penalty == 0 && cur.objective < incumbent.objective) {
-                // verify improved incumbents with the real loader, at most every 200 iterations
-                if (it - last_probe_iter >= 200 || it == iters - 1) {
-                    const fit_advisor_projection & pj = S.probe_alloc(cur.alloc, cell_name(cur.alloc.layers_per_device, cur.alloc.n_ubatch, cur.alloc.n_slots));
-                    last_probe_iter = it;
-                    proj_by_key[key] = pj;
-                    if (!pj.ok || !pj.fits_all()) {
-                        S.evaluate(cur, pj); // the refreshed overheads penalise it now
-                        continue;
-                    }
-                    S.evaluate(cur, pj);
-                    if (cur.objective < incumbent.objective) {
-                        incumbent = cur;
-                        incumbent_proj = pj;
-                    }
+            // track the best model-feasible state continuously; it is verified by the loader below, and again at the end
+            if (cur.penalty == 0 && cur.objective < best_seen.objective) {
+                best_seen = cur;
+                best_seen_dirty = true;
+            }
+        }
+        // verify the best state with the real loader at most every 200 iterations, or when the walk is nearly done
+        if (best_seen_dirty && (it - last_probe_iter >= 200 || it == iters - 1)) {
+            const std::string bkey = cell_key(best_seen.alloc.layers_per_device, best_seen.alloc.n_ubatch, best_seen.alloc.n_slots);
+            const fit_advisor_projection & pj = S.probe_alloc(best_seen.alloc, cell_name(best_seen.alloc.layers_per_device, best_seen.alloc.n_ubatch, best_seen.alloc.n_slots));
+            last_probe_iter = it;
+            best_seen_dirty = false;
+            proj_by_key[bkey] = pj;
+            searcher::state checked = best_seen;
+            if (pj.ok && pj.fits_all() && S.evaluate(checked, pj) && checked.penalty == 0 && checked.objective < incumbent.objective) {
+                incumbent = checked;
+                incumbent_proj = pj;
+            } else {
+                // the refreshed overheads say it does not fit: forget it and let the walk continue from the incumbent
+                best_seen = incumbent;
+                if (cur.penalty == 0) {
+                    S.evaluate(cur, proj_by_key.count(key) ? proj_by_key[key] : pj);
                 }
             }
         }
