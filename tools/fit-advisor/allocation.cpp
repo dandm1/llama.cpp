@@ -127,11 +127,31 @@ std::vector<size_t> fit_advisor_allocation::weight_bytes_per_device(const fit_ad
     return ret;
 }
 
-std::vector<std::string> fit_advisor_device_bufts(const fit_advisor_projection & proj) {
+std::vector<std::string> fit_advisor_device_names(const fit_advisor_projection & proj) {
     std::vector<std::string> ret;
     for (const auto & d : proj.devices) {
-        // the projection names devices as "<name> (<description>)", the buffer type is named after the device
+        // the projection names devices as "<name> (<description>)"
         ret.push_back(d.name.substr(0, d.name.find(" (")));
+    }
+    return ret;
+}
+
+std::vector<std::string> fit_advisor_device_bufts(const fit_advisor_projection & proj) {
+    // the buffer type is what -ot names; it coincides with the device name on CUDA, Vulkan and SYCL but not on
+    // every backend (Metal's device and buffer type are named differently), so look it up in the registry
+    std::vector<std::string> ret;
+    for (const std::string & name : fit_advisor_device_names(proj)) {
+        std::string buft = name;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (name == ggml_backend_dev_name(dev)) {
+                if (ggml_backend_buffer_type_t b = ggml_backend_dev_buffer_type(dev)) {
+                    buft = ggml_backend_buft_name(b);
+                }
+                break;
+            }
+        }
+        ret.push_back(buft);
     }
     return ret;
 }

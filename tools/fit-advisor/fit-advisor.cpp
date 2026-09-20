@@ -351,6 +351,7 @@ int llama_fit_advisor(int argc, char ** argv) {
     // the user's own arguments come first; their probe also reveals the model's devices for the allocations
     std::vector<fit_advisor_candidate> cands = { user_candidate(params) };
     const std::vector<std::string> device_bufts = fit_advisor_device_bufts(probe.run(cands[0]));
+    const std::vector<std::string> device_names = fit_advisor_device_names(probe.run(cands[0]));
     const std::vector<named_allocation> allocs = build_allocations(params, inv, device_bufts, cands[0]);
     for (const auto & na : allocs) {
         cands.push_back(na.alloc.to_candidate(inv, device_bufts, na.name));
@@ -480,13 +481,13 @@ int llama_fit_advisor(int argc, char ** argv) {
 
     std::vector<fit_advisor_cost_device> cost_devs;
     std::vector<ggml_backend_dev_t>      cost_dev_handles;
-    for (const auto & buft : device_bufts) {
+    for (size_t d = 0; d < device_bufts.size(); d++) {
         fit_advisor_cost_device cd;
-        cd.name   = buft;
+        cd.name   = device_bufts[d];
         cd.n_embd = inv.n_embd;
         ggml_backend_dev_t handle = nullptr;
         for (size_t i = 0; i < devs.size(); i++) {
-            if (buft == ggml_backend_dev_name(devs[i])) {
+            if (device_names[d] == ggml_backend_dev_name(devs[i])) {
                 cd.meas = meas[i];
                 cd.offload_min_batch = fit_advisor_offload_min_batch(devs[i]);
                 handle = devs[i];

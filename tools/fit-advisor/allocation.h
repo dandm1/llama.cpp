@@ -53,5 +53,7 @@ struct fit_advisor_allocation {
 int fit_advisor_verify_allocation(const common_params & params, const fit_advisor_inventory & inv, const fit_advisor_allocation & alloc,
                                   const std::vector<std::string> & device_bufts, const fit_advisor_candidate & cand);
 
-// device buffer type names in the model's device order, from a projection
+// device names and device buffer type names in the model's device order, from a projection
+// names identify devices (measurements, registry lookups); bufts are what -ot patterns name
+std::vector<std::string> fit_advisor_device_names(const fit_advisor_projection & proj);
 std::vector<std::string> fit_advisor_device_bufts(const fit_advisor_projection & proj);
