@@ -350,6 +350,8 @@ static fit_advisor_search_result search_and_report(const common_params & params,
     printf("  request %.2f s (best seed %.2f s), gen %.2f tok/s, pp %.0f tok/s, ubatch %u, slots %u\n",
         sr.cost.t_request_us * 1e-6, sr.seed_request_us * 1e-6, sr.cost.gen_tokens_per_s, sr.cost.prompt_tokens_per_s,
         sr.wl.n_ubatch, sr.alloc.n_slots);
+    printf("  generation step %.0f us: weights %.0f, attention %.0f, per-node overhead %.0f, boundaries %.0f\n",
+        sr.cost.t_gen_step_us, sr.cost.step_weights_us, sr.cost.step_attn_us, sr.cost.step_overhead_us, sr.cost.step_boundary_us);
     for (size_t d = 0; d < sr.proj.devices.size(); d++) {
         const auto & pd = sr.proj.devices[d];
         printf("  %-34.34s model %6.0f MiB, ctx+cmp %5.0f, scratch %4.0f, left %6.0f MiB%s\n", pd.name.c_str(),
