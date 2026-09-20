@@ -132,6 +132,11 @@ const fit_advisor_projection & fit_advisor_probe::run(const fit_advisor_candidat
             d.scratch = dmds[id].scratch;
             d.scratch_unknown = dmds[id].scratch_unknown;
             d.margin  = id < base.fit_params_target.size() ? (int64_t) base.fit_params_target[id] : 0;
+            // with a scratch estimate the projection has been measured to cover everything but the CUDA context,
+            // so the default margin can be half the fitter's; an explicit --fit-target is always respected
+            if (!base.fit_params_target_set && !d.scratch_unknown) {
+                d.margin = std::min<int64_t>(d.margin, 512ll * 1024 * 1024);
+            }
             proj.devices.push_back(d);
         }
         proj.host.total   = dmds.back().total;

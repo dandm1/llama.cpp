@@ -184,7 +184,8 @@ static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_ad
 
     printf("\n[MiB] free: device memory free when probed; model/ctx+cmp: projected weights and context+compute buffers;\n");
     printf("scratch: backend pool memory the graph's ops need outside those buffers, estimated per op (? = some op had no estimate);\n");
-    printf("left: free - projected use; fit: left >= --fit-target margin; Host row: projected host-side use, free RAM unknown\n");
+    printf("left: free - projected use; fit: left >= margin (--fit-target, default 512 MiB where scratch is estimated, else 1024);\n");
+    printf("Host row: projected host-side use, free RAM unknown\n");
 
     printf("\narguments per candidate (llama-bench takes the same flags, with ';' instead of ',' between -ot entries):\n");
     for (const auto & c : cands) {
