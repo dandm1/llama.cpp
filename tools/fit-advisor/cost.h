@@ -65,11 +65,12 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
 // seconds per weight byte at a batch size, interpolated on the measured curve
 double fit_advisor_s_per_byte(const fit_advisor_matmul_rate & r, uint32_t batch);
 
-// microseconds one op over this tensor costs when it lives on dev_idx (DEV_CPU = -1) at a batch size,
-// including the per-ubatch copy when a CPU-resident weight is offloaded to a device at that batch
-double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, int dev_idx,
-                                  const std::vector<fit_advisor_cost_device> & devices, uint32_t batch);
+// microseconds one op over this tensor costs when it lives on dev_idx (DEV_CPU = -1) at a batch size:
+//   - matmul weights: bytes on the measured per-byte curve, plus the per-ubatch copy when offloaded
+//   - anything else: the device's per-op cost plus the op's activation bytes over the device's memory rate
+double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
+                                  int dev_idx, const std::vector<fit_advisor_cost_device> & devices, uint32_t batch);
 
 // microseconds per request attributable to this tensor on this device under the workload
-double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, int dev_idx,
+double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fit_advisor_graph_profile & gp, size_t tensor_idx, int dev_idx,
                                      const std::vector<fit_advisor_cost_device> & devices, const fit_advisor_workload & wl, uint32_t n_slots);

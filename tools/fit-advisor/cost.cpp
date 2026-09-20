@@ -87,12 +87,25 @@ expert_view expert_batch(const fit_advisor_inventory & inv, const fit_advisor_te
     return v;
 }
 
-// time for one op over a tensor: per-token cost times tokens plus the fixed overhead
-// weights on the CPU above the device's offload threshold are copied to the device and computed there
-double tensor_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, int dev_idx, int layer_dev,
-                 const std::vector<fit_advisor_cost_device> & devices, uint32_t batch, std::string & error) {
+// memory rate of a device: the best measured weight-streaming rate stands in for its bandwidth
+double device_bandwidth(const fit_advisor_cost_device & d) {
+    double best = 0;
+    if (d.meas) {
+        for (const auto & [type, r] : d.meas->matmul) {
+            best = std::max(best, r.bytes_per_s);
+        }
+    }
+    return best;
+}
+
+// time for one op over a tensor: per-token cost times tokens; matmuls on the measured curve, other ops by the
+// activation bytes they touch. weights on the CPU above a device's offload threshold are copied there and run there.
+double tensor_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
+                 int dev_idx, const std::vector<fit_advisor_cost_device> & devices, uint32_t batch, std::string & error) {
+    if (use.op == 0) {
+        return 0; // not read by the graph (e.g. an MTP tensor with MTP off)
+    }
     const fit_advisor_cost_device * dev = &devices[dev_idx < 0 ? devices.size() - 1 : (size_t) dev_idx];
-    GGML_UNUSED(layer_dev);
 
     double copy_us = 0;
     if (dev->is_cpu) {
@@ -108,34 +121,47 @@ double tensor_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t
             }
         }
     }
-
-    const auto it = dev->meas ? dev->meas->matmul.find(ggml_type_name(t.type)) : dev->meas->matmul.end();
-    if (!dev->meas || it == dev->meas->matmul.end() || !it->second.supported) {
-        if (t.nbytes >= 1024 * 1024) {
-            error = std::string("no measured rate for ") + ggml_type_name(t.type) + " on " + dev->name;
-        }
-        return copy_us; // norms and biases: negligible
+    if (!dev->meas) {
+        return copy_us;
     }
-    const expert_view ev = expert_batch(inv, t, batch);
-    const uint32_t b_eff = (uint32_t) std::lround(ev.batch);
-    return copy_us + t.nbytes * ev.frac_touched * fit_advisor_s_per_byte(it->second, b_eff) * 1e6 * ev.batch;
+
+    if (use.is_matmul) {
+        const auto it = dev->meas->matmul.find(ggml_type_name(t.type));
+        if (it == dev->meas->matmul.end() || !it->second.supported || it->second.bytes_per_s <= 0) {
+            error = std::string("no measured rate for ") + ggml_type_name(t.type) + " on " + dev->name;
+            // fall back to the device's best rate so the cost is at least not zero
+            const double bw = device_bandwidth(*dev);
+            const expert_view ev = expert_batch(inv, t, batch);
+            return copy_us + (bw > 0 ? t.nbytes * ev.frac_touched / bw * 1e6 : 0) + dev->meas->op_overhead_us;
+        }
+        const expert_view ev = expert_batch(inv, t, batch);
+        const uint32_t b_eff = (uint32_t) std::lround(ev.batch);
+        return copy_us + t.nbytes * ev.frac_touched * fit_advisor_s_per_byte(it->second, b_eff) * 1e6 * ev.batch;
+    }
+
+    // a norm, scale, conv or recurrent-state op: streams its activations once per ubatch, plus the per-op cost
+    const double bw = device_bandwidth(*dev);
+    return copy_us + dev->meas->op_overhead_us + (bw > 0 ? (double) use.act_bytes / bw * 1e6 : 0);
 }
 
 } // namespace
 
-double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, int dev_idx,
-                                  const std::vector<fit_advisor_cost_device> & devices, uint32_t batch) {
+double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
+                                  int dev_idx, const std::vector<fit_advisor_cost_device> & devices, uint32_t batch) {
     std::string err;
-    return tensor_us(inv, t, dev_idx, dev_idx, devices, batch, err);
+    return tensor_us(inv, t, use, dev_idx, devices, batch, err);
 }
 
-double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, int dev_idx,
+double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fit_advisor_graph_profile & gp, size_t tensor_idx, int dev_idx,
                                      const std::vector<fit_advisor_cost_device> & devices, const fit_advisor_workload & wl, uint32_t n_slots) {
     const uint32_t batch_gen = std::max<uint32_t>(1, std::min(wl.concurrency, n_slots));
     const uint32_t n_ub      = std::max<uint32_t>(1, wl.n_ubatch);
     const double n_pp_steps  = std::ceil((double) wl.prompt_tokens / n_ub);
-    return wl.gen_tokens * fit_advisor_tensor_cost_us(inv, t, dev_idx, devices, batch_gen)
-         + n_pp_steps    * fit_advisor_tensor_cost_us(inv, t, dev_idx, devices, n_ub);
+    const fit_advisor_tensor & t = inv.tensors[tensor_idx];
+    const fit_advisor_tensor_use & u_tg = tensor_idx < gp.use_tg.size() ? gp.use_tg[tensor_idx] : fit_advisor_tensor_use{};
+    const fit_advisor_tensor_use & u_pp = tensor_idx < gp.use_pp.size() ? gp.use_pp[tensor_idx] : fit_advisor_tensor_use{};
+    return wl.gen_tokens * fit_advisor_tensor_cost_us(inv, t, u_tg, dev_idx, devices, batch_gen)
+         + n_pp_steps    * fit_advisor_tensor_cost_us(inv, t, u_pp, dev_idx, devices, n_ub);
 }
 
 fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, const fit_advisor_allocation & alloc,
@@ -158,18 +184,17 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
     // one decode step: every weight once for the batch, attention over each active slot's KV, boundaries
     auto step_us = [&](uint32_t batch, double & weights, double & attn, double & overhead, double & boundary) {
         weights = attn = overhead = boundary = 0;
+        const std::vector<fit_advisor_tensor_use> & uses = batch > 4 ? gp.use_pp : gp.use_tg;
         for (size_t i = 0; i < inv.tensors.size(); i++) {
             const auto & t = inv.tensors[i];
             if (t.layer >= (int32_t) inv.n_layer && !wl.use_mtp) {
                 continue; // MTP layer, not loaded and not executed
             }
-            const int layer_dev = t.layer >= 0 ? alloc.layer_device((uint32_t) t.layer, n_layer_all)
-                                               : (t.kind == FIT_ADVISOR_TENSOR_TOKEN_EMBD ? fit_advisor_allocation::DEV_CPU
-                                                                                            : alloc.layer_device(n_layer_all, n_layer_all));
             if (t.kind == FIT_ADVISOR_TENSOR_TOKEN_EMBD) {
                 continue; // a row lookup, not a matmul
             }
-            weights += tensor_us(inv, t, alloc.tensor_device[i], layer_dev, devices, batch, c.error);
+            const fit_advisor_tensor_use use = i < uses.size() ? uses[i] : fit_advisor_tensor_use{};
+            weights += tensor_us(inv, t, use, alloc.tensor_device[i], devices, batch, c.error);
         }
 
         // attention: the KV bytes each device holds for this candidate, scaled by fill and active slots
@@ -249,30 +274,49 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             }
             prev = d;
         }
-        std::map<std::pair<int, int>, int> away; // (layer, device) pairs with tensors away from home
-        for (size_t i = 0; i < inv.tensors.size(); i++) {
-            const auto & t = inv.tensors[i];
-            if (t.layer < 0) {
-                continue;
-            }
-            const int home = alloc.layer_device((uint32_t) t.layer, n_layer_all);
-            if (alloc.tensor_device[i] != home) {
-                away[{ t.layer, alloc.tensor_device[i] }]++;
-            }
-        }
-        // a tensor on the CPU whose batch reaches the offload threshold is computed on a device instead, no split
+        // excursions: tensors away from their layer's device, in graph order; consecutive away ops on the same device
+        // share one excursion, anything else in between starts a new one. each excursion moves its first op's inputs
+        // out and its last op's output back
         int offload_min = 0;
         for (const auto & d : devices) {
             if (!d.is_cpu && d.offload_min_batch > 0) {
                 offload_min = offload_min == 0 ? d.offload_min_batch : std::min(offload_min, d.offload_min_batch);
             }
         }
-        for (const auto & [key, n] : away) {
-            if (key.second == fit_advisor_allocation::DEV_CPU && offload_min > 0 && batch >= (uint32_t) offload_min) {
+        struct away_op { int node_idx; int dev; int home; size_t act_bytes; };
+        std::vector<away_op> aways;
+        for (size_t i = 0; i < inv.tensors.size() && i < uses.size(); i++) {
+            const auto & t = inv.tensors[i];
+            if (t.layer < 0 || uses[i].op == 0) {
                 continue;
             }
-            const int home = alloc.layer_device((uint32_t) key.first, n_layer_all);
-            boundary += hop_us(home, key.second) + hop_us(key.second, home);
+            if (t.layer >= (int32_t) inv.n_layer && !wl.use_mtp) {
+                continue;
+            }
+            const int home = alloc.layer_device((uint32_t) t.layer, n_layer_all);
+            const int dev  = alloc.tensor_device[i];
+            if (dev == home) {
+                continue;
+            }
+            if (dev == fit_advisor_allocation::DEV_CPU && offload_min > 0 && batch >= (uint32_t) offload_min) {
+                continue; // offloaded, no split
+            }
+            aways.push_back({ uses[i].node_idx, dev, home, uses[i].act_bytes });
+        }
+        std::sort(aways.begin(), aways.end(), [](const away_op & a, const away_op & b) { return a.node_idx < b.node_idx; });
+        for (size_t k = 0; k < aways.size();) {
+            size_t j = k;
+            while (j + 1 < aways.size() && aways[j + 1].dev == aways[k].dev && aways[j + 1].node_idx <= aways[j].node_idx + 2) {
+                j++;
+            }
+            // hop_us prices the round trip with the standard activation; add the op's own activation bytes over the link
+            boundary += hop_us(aways[k].home, aways[k].dev) + hop_us(aways[k].dev, aways[k].home);
+            const size_t a = aways[k].home < 0 ? devices.size() - 1 : (size_t) aways[k].home;
+            const size_t b = aways[k].dev  < 0 ? devices.size() - 1 : (size_t) aways[k].dev;
+            if (a < pairs.size() && b < pairs[a].size() && pairs[a][b].gb_s > 0) {
+                boundary += (double) (aways[k].act_bytes + aways[j].act_bytes) / (pairs[a][b].gb_s * 1e9) * 1e6;
+            }
+            k = j + 1;
         }
     };
 

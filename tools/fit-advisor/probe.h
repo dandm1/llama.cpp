@@ -74,10 +74,20 @@ struct fit_advisor_projection {
 };
 
 // op counts of the model's compute graph, from a reserved graph on a no_alloc context
+// how the graph uses one model weight: the op that consumes it, its position, and the activation bytes it touches
+struct fit_advisor_tensor_use {
+    int      op        = 0;  // ggml_op, GGML_OP_NONE when the weight is not read by the graph
+    int      node_idx  = -1; // position in the graph, for grouping CPU excursions
+    size_t   act_bytes = 0;  // bytes of the op's non-weight inputs and its output
+    bool     is_matmul = false;
+};
+
 struct fit_advisor_graph_profile {
     bool ok = false;
     std::string error;
     uint32_t n_batch_pp = 0;
+    std::vector<fit_advisor_tensor_use> use_tg; // indexed like the inventory's tensors
+    std::vector<fit_advisor_tensor_use> use_pp;
     std::vector<uint32_t> ops_per_layer_tg; // graph nodes attributed to each layer at batch 1
     std::vector<uint32_t> ops_per_layer_pp; // same for a prompt ubatch
     uint32_t ops_global_tg = 0;             // nodes outside any layer (embeddings, output, ...)
@@ -92,8 +102,8 @@ struct fit_advisor_probe {
     // project a candidate, memoized on the candidate key
     const fit_advisor_projection & run(const fit_advisor_candidate & cand);
 
-    // op counts per layer for the base parameters (independent of placement)
-    fit_advisor_graph_profile graph_profile(uint32_t n_layer_all);
+    // op counts per layer and per-weight op usage for the base parameters (independent of placement)
+    fit_advisor_graph_profile graph_profile(uint32_t n_layer_all, const std::vector<std::string> & tensor_names);
 
     // what the built-in fitter would choose for the same base parameters, as a candidate
     // returns the fitter status; the candidate is filled in on success and failure alike

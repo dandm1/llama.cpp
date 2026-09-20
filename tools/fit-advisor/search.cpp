@@ -128,11 +128,10 @@ struct searcher {
         return true;
     }
 
-    // request-time gain of placing tensor i on device d instead of the CPU
+    // request-time gain of placing tensor i on device d instead of the CPU, from the op that reads it
     double gain(size_t i, int d, const fit_advisor_workload & wl, uint32_t slots) const {
-        const auto & t = inv.tensors[i];
-        return fit_advisor_tensor_request_us(inv, t, fit_advisor_allocation::DEV_CPU, cost_devs, wl, slots)
-             - fit_advisor_tensor_request_us(inv, t, d, cost_devs, wl, slots);
+        return fit_advisor_tensor_request_us(inv, gp, i, fit_advisor_allocation::DEV_CPU, cost_devs, wl, slots)
+             - fit_advisor_tensor_request_us(inv, gp, i, d, cost_devs, wl, slots);
     }
 
     // movable groups: the expert tensors of a layer move together (a partially moved layer still costs its split),
@@ -143,24 +142,14 @@ struct searcher {
         size_t bytes = 0;
     };
 
-    // a tensor the search may consider moving: large enough to matter and of a type with a measured rate on every
-    // device, so its cost on either side is known. norms, biases, recurrent-state parameters and conv weights fail
-    // this and always stay with their layer: moving them buys nothing and drags their ops across the bus
-    bool tensor_movable(size_t i) const {
-        const auto & t = inv.tensors[i];
-        if (t.nbytes < (size_t) UNIT) {
-            return false;
-        }
-        for (const auto & d : cost_devs) {
-            if (!d.meas) {
-                return false;
-            }
-            const auto it = d.meas->matmul.find(ggml_type_name(t.type));
-            if (it == d.meas->matmul.end() || !it->second.supported || it->second.bytes_per_s <= 0) {
-                return false;
-            }
-        }
-        return true;
+    // a tensor the graph reads at all; everything is a candidate for the annealer, the cost model decides
+    bool tensor_used(size_t i) const {
+        return i < gp.use_tg.size() && gp.use_tg[i].op != 0;
+    }
+
+    // large enough to seed the knapsack with: the seed works on the tensors that decide memory, the annealer refines
+    bool tensor_large(size_t i) const {
+        return inv.tensors[i].nbytes >= (size_t) UNIT;
     }
 
     std::vector<group> build_groups(const fit_advisor_workload & wl) const {
@@ -168,7 +157,7 @@ struct searcher {
         std::vector<group> ret;
         for (size_t i = 0; i < inv.tensors.size(); i++) {
             const auto & t = inv.tensors[i];
-            if (!tensor_counts(i, wl) || t.layer < 0 || !tensor_movable(i)) {
+            if (!tensor_counts(i, wl) || t.layer < 0 || !tensor_used(i) || !tensor_large(i)) {
                 continue;
             }
             if (t.kind == FIT_ADVISOR_TENSOR_FFN_EXPS) {
@@ -491,14 +480,20 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     searcher::state incumbent = cur;
     fit_advisor_projection incumbent_proj = best_cell.proj;
 
-    // movable groups: those with a positive gain on their home
+    // movable groups: those with a positive gain on their home; plus every used layer tensor as a single candidate
     std::vector<searcher::group> movable;
+    std::vector<size_t> singles;
     {
         fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, cur.alloc.layers_per_device, opts.n_ctx, cur.alloc.n_slots);
         for (const auto & g : S.build_groups(cur.wl)) {
             const int h = home.tensor_device[g.idx[0]];
             if (h >= 0 && S.group_gain(g, h, cur.wl, cur.alloc.n_slots) > 0) {
                 movable.push_back(g);
+            }
+        }
+        for (size_t i = 0; i < inv.tensors.size(); i++) {
+            if (inv.tensors[i].layer >= 0 && home.tensor_device[i] >= 0 && S.tensor_counts(i, cur.wl) && S.tensor_used(i)) {
+                singles.push_back(i);
             }
         }
     }
@@ -517,16 +512,19 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     int accepted = 0;
     int last_probe_iter = 0;
 
-    for (int it = 0; it < iters && !movable.empty(); it++) {
+    for (int it = 0; it < iters && (!movable.empty() || !singles.empty()); it++) {
         const double T = T0 * std::pow(T1 / T0, (double) it / std::max(1, iters));
         searcher::state nxt = cur;
         const double mv = uni(rng);
 
-        if (mv < 0.10) {
-            // toggle a single tensor of a multi-tensor group: a partial layer, worth it only if the split is cheap
-            const searcher::group & g = movable[(size_t) (uni(rng) * movable.size()) % movable.size()];
-            if (g.idx.size() < 2) continue;
-            const size_t i = g.idx[(size_t) (uni(rng) * g.idx.size()) % g.idx.size()];
+        if (mv < 0.15) {
+            // toggle a single tensor of any kind: partial expert layers, a stray norm, whatever the model prices as better
+            if (singles.empty()) continue;
+            // draw large tensors more often, they decide memory; small ones still get their turn
+            size_t i = singles[(size_t) (uni(rng) * singles.size()) % singles.size()];
+            if (inv.tensors[i].nbytes < (size_t) UNIT && uni(rng) < 0.8) {
+                i = singles[(size_t) (uni(rng) * singles.size()) % singles.size()];
+            }
             fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots);
             nxt.alloc.tensor_device[i] = nxt.alloc.tensor_device[i] == fit_advisor_allocation::DEV_CPU ? home.tensor_device[i] : fit_advisor_allocation::DEV_CPU;
         } else if (mv < 0.55) {

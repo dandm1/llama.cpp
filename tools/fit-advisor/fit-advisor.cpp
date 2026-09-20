@@ -400,7 +400,7 @@ int llama_fit_advisor(int argc, char ** argv) {
 
     // measure the devices for the types this model actually uses
     fit_advisor_measure_options mopts;
-    mopts.weight_types = inv.matmul_types(1024 * 1024); // every type used by a weight tensor of at least 1 MiB
+    mopts.weight_types = inv.matmul_types(0); // every type present, so no op is ever priced from nothing
     for (const auto & name : string_split<std::string>(params.fit_advisor_measure_types, ',')) {
         bool found = false;
         for (int t = 0; t < GGML_TYPE_COUNT && !found; t++) {
@@ -467,11 +467,18 @@ int llama_fit_advisor(int argc, char ** argv) {
     // transfers between every pair of devices, and the model's op counts per layer
     cache.ensure_pairs(devs, mopts.n_threads, params.fit_advisor_remeasure);
 
-    const fit_advisor_graph_profile gp = probe.graph_profile(inv.n_layer + inv.n_layer_nextn);
+    std::vector<std::string> tensor_names;
+    for (const auto & t : inv.tensors) {
+        tensor_names.push_back(t.name);
+    }
+    const fit_advisor_graph_profile gp = probe.graph_profile(inv.n_layer + inv.n_layer_nextn, tensor_names);
     if (gp.ok) {
         uint32_t sum_tg = 0, sum_pp = 0;
         for (uint32_t x : gp.ops_per_layer_tg) sum_tg += x;
         for (uint32_t x : gp.ops_per_layer_pp) sum_pp += x;
+        size_t n_used = 0, n_matmul = 0;
+        for (const auto & u : gp.use_tg) { n_used += u.op != 0; n_matmul += u.is_matmul; }
+        LOG_INF("%s: graph reads %zu of %zu weights, %zu through matmuls\n", __func__, n_used, gp.use_tg.size(), n_matmul);
         LOG_INF("%s: graph ops: %u nodes at batch 1 (%.1f per layer, %u global), %u nodes at batch %u (%.1f per layer, %u global)\n", __func__,
             gp.n_nodes_tg, gp.ops_per_layer_tg.empty() ? 0.0 : (double) sum_tg / gp.ops_per_layer_tg.size(), gp.ops_global_tg,
             gp.n_nodes_pp, gp.n_batch_pp, gp.ops_per_layer_pp.empty() ? 0.0 : (double) sum_pp / gp.ops_per_layer_pp.size(), gp.ops_global_pp);

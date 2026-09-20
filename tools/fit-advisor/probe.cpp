@@ -175,9 +175,48 @@ static void count_ops(ggml_cgraph * gf, uint32_t n_layer_all, std::vector<uint32
     }
 }
 
-fit_advisor_graph_profile fit_advisor_probe::graph_profile(uint32_t n_layer_all) {
+// for every node, the model weights among its sources and the activation bytes the op touches
+static void record_uses(ggml_cgraph * gf, const std::map<std::string, size_t> & index_by_name, std::vector<fit_advisor_tensor_use> & uses) {
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        // classify the sources: weights (in the inventory) vs activations
+        size_t act_bytes = ggml_nbytes(node);
+        std::vector<size_t> weights;
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            ggml_tensor * src = node->src[j];
+            if (!src) {
+                continue;
+            }
+            const auto it = index_by_name.find(ggml_get_name(src->view_src ? src->view_src : src));
+            if (it != index_by_name.end()) {
+                weights.push_back(it->second);
+            } else {
+                act_bytes += ggml_nbytes(src);
+            }
+        }
+        for (const size_t w : weights) {
+            fit_advisor_tensor_use & u = uses[w];
+            const bool matmul = node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID;
+            // a weight read by several ops keeps the heaviest use
+            if (u.op == GGML_OP_NONE || (matmul && !u.is_matmul) || (matmul == u.is_matmul && act_bytes > u.act_bytes)) {
+                u.op        = node->op;
+                u.node_idx  = i;
+                u.act_bytes = act_bytes;
+                u.is_matmul = matmul;
+            }
+        }
+    }
+}
+
+fit_advisor_graph_profile fit_advisor_probe::graph_profile(uint32_t n_layer_all, const std::vector<std::string> & tensor_names) {
     fit_advisor_graph_profile gp;
     gp.n_batch_pp = (uint32_t) base.n_ubatch;
+    std::map<std::string, size_t> index_by_name;
+    for (size_t i = 0; i < tensor_names.size(); i++) {
+        index_by_name[tensor_names[i]] = i;
+    }
+    gp.use_tg.assign(tensor_names.size(), {});
+    gp.use_pp.assign(tensor_names.size(), {});
 
     common_params p = base;
     llama_model_params   mparams = common_model_params_to_llama(p);
@@ -198,9 +237,11 @@ fit_advisor_graph_profile fit_advisor_probe::graph_profile(uint32_t n_layer_all)
     }
     if (ggml_cgraph * gf = llama_graph_reserve(ctx, 1, 1, 1)) {
         count_ops(gf, n_layer_all, gp.ops_per_layer_tg, gp.ops_global_tg, gp.n_nodes_tg);
+        record_uses(gf, index_by_name, gp.use_tg);
     }
     if (ggml_cgraph * gf = llama_graph_reserve(ctx, gp.n_batch_pp, 1, gp.n_batch_pp)) {
         count_ops(gf, n_layer_all, gp.ops_per_layer_pp, gp.ops_global_pp, gp.n_nodes_pp);
+        record_uses(gf, index_by_name, gp.use_pp);
     }
     llama_free(ctx);
     llama_model_free(model);
