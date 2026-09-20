@@ -507,12 +507,12 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         S.memory_over(cur.alloc, cur.wl, over);
         for (size_t d = 0; d < nd && it != S.mem.by_key.end() && d < best_cell.proj.devices.size(); d++) {
             const auto & pd = best_cell.proj.devices[d];
-            LOG_INF("%s: seed memory model %s: overhead %lld MiB (probe ctx+cmp+scratch %lld), free %lld, margin %lld -> over %lld MiB; probe model %lld, left %lld\n", __func__,
+            LOG_DBG("%s: seed memory model %s: overhead %lld MiB (probe ctx+cmp+scratch %lld), free %lld, margin %lld -> over %lld MiB; probe model %lld, left %lld\n", __func__,
                 device_bufts[d].c_str(), (long long) (it->second.overhead[d] >> 20), (long long) ((pd.context + pd.compute + pd.scratch) >> 20),
                 (long long) (it->second.free[d] >> 20), (long long) (it->second.margin[d] >> 20), (long long) (over[d] >> 20),
                 (long long) (pd.model >> 20), (long long) (pd.projected_free() >> 20));
         }
-        LOG_INF("%s: seed penalty %.4f s\n", __func__, cur.penalty * 1e-6);
+        LOG_DBG("%s: seed penalty %.4f s\n", __func__, cur.penalty * 1e-6);
     }
 
     // movable groups: those with a positive gain on their home; plus every used layer tensor as a single candidate
@@ -630,7 +630,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             // trace the first single-tensor moves: which tensor, where, and what the model thinks of it
             for (size_t i = 0; i < inv.tensors.size(); i++) {
                 if (nxt.alloc.tensor_device[i] != cur.alloc.tensor_device[i]) {
-                    LOG_INF("%s: move %-34s %s -> %s: cost %.4f -> %.4f s, penalty %.4f -> %.4f s, delta %+.4f s\n", __func__,
+                    LOG_DBG("%s: move %-34s %s -> %s: cost %.4f -> %.4f s, penalty %.4f -> %.4f s, delta %+.4f s\n", __func__,
                         inv.tensors[i].name.c_str(),
                         cur.alloc.tensor_device[i] < 0 ? "CPU" : device_bufts[cur.alloc.tensor_device[i]].c_str(),
                         nxt.alloc.tensor_device[i] < 0 ? "CPU" : device_bufts[nxt.alloc.tensor_device[i]].c_str(),
@@ -657,7 +657,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             proj_by_key[bkey] = pj;
             searcher::state checked = best_seen;
             const bool ok = pj.ok && pj.fits_all() && S.evaluate(checked, pj) && checked.penalty == 0 && checked.objective < incumbent.objective;
-            LOG_INF("%s: iter %d: verifying best state (model %.3f s vs incumbent %.3f s): %s\n", __func__, it,
+            LOG_DBG("%s: iter %d: verifying best state (model %.3f s vs incumbent %.3f s): %s\n", __func__, it,
                 best_seen.objective * 1e-6, incumbent.objective * 1e-6,
                 !pj.ok ? "probe failed" : !pj.fits_all() ? "does not fit on probe" : !ok ? "not better after refresh" : "accepted as incumbent");
             if (ok) {
