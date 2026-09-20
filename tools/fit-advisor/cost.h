@@ -71,6 +71,11 @@ double fit_advisor_s_per_byte(const fit_advisor_matmul_rate & r, uint32_t batch)
 double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
                                   int dev_idx, const std::vector<fit_advisor_cost_device> & devices, uint32_t batch);
 
+// whether the cost of this tensor on this device rests on measurements (false: a fallback rate was used, or the
+// device has no measurements); the search never lets an unknown cost decide a placement
+bool fit_advisor_tensor_cost_known(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
+                                   int dev_idx, const std::vector<fit_advisor_cost_device> & devices);
+
 // microseconds per request attributable to this tensor on this device under the workload
 double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fit_advisor_graph_profile & gp, size_t tensor_idx, int dev_idx,
                                      const std::vector<fit_advisor_cost_device> & devices, const fit_advisor_workload & wl, uint32_t n_slots);

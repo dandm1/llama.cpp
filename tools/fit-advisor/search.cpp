@@ -147,6 +147,19 @@ struct searcher {
         return i < gp.use_tg.size() && gp.use_tg[i].op != 0;
     }
 
+    // fallback rule: a tensor whose cost is not measured on both its home and the CPU is never moved by the search,
+    // it stays with its layer like its neighbours
+    bool tensor_decidable(size_t i, int home) const {
+        if (i >= gp.use_tg.size()) {
+            return false;
+        }
+        const auto & t = inv.tensors[i];
+        return fit_advisor_tensor_cost_known(inv, t, gp.use_tg[i], home, cost_devs)
+            && fit_advisor_tensor_cost_known(inv, t, gp.use_tg[i], fit_advisor_allocation::DEV_CPU, cost_devs)
+            && fit_advisor_tensor_cost_known(inv, t, gp.use_pp[i], home, cost_devs)
+            && fit_advisor_tensor_cost_known(inv, t, gp.use_pp[i], fit_advisor_allocation::DEV_CPU, cost_devs);
+    }
+
     // large enough to seed the knapsack with: the seed works on the tensors that decide memory, the annealer refines
     bool tensor_large(size_t i) const {
         return inv.tensors[i].nbytes >= (size_t) UNIT;
@@ -158,6 +171,10 @@ struct searcher {
         for (size_t i = 0; i < inv.tensors.size(); i++) {
             const auto & t = inv.tensors[i];
             if (!tensor_counts(i, wl) || t.layer < 0 || !tensor_used(i) || !tensor_large(i)) {
+                continue;
+            }
+            const int home = fit_advisor_allocation::from_layer_split(inv, device_bufts, std::vector<uint32_t>(nd, 1), 0, 1).tensor_device[i];
+            if (home >= 0 && !tensor_decidable(i, home)) {
                 continue;
             }
             if (t.kind == FIT_ADVISOR_TENSOR_FFN_EXPS) {
@@ -492,7 +509,8 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             }
         }
         for (size_t i = 0; i < inv.tensors.size(); i++) {
-            if (inv.tensors[i].layer >= 0 && home.tensor_device[i] >= 0 && S.tensor_counts(i, cur.wl) && S.tensor_used(i)) {
+            if (inv.tensors[i].layer >= 0 && home.tensor_device[i] >= 0 && S.tensor_counts(i, cur.wl) && S.tensor_used(i)
+                && S.tensor_decidable(i, home.tensor_device[i])) {
                 singles.push_back(i);
             }
         }

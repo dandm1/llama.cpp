@@ -152,6 +152,23 @@ double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_a
     return tensor_us(inv, t, use, dev_idx, devices, batch, err);
 }
 
+bool fit_advisor_tensor_cost_known(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
+                                   int dev_idx, const std::vector<fit_advisor_cost_device> & devices) {
+    GGML_UNUSED(inv);
+    if (use.op == 0) {
+        return true; // unused: a known zero
+    }
+    const fit_advisor_cost_device & dev = devices[dev_idx < 0 ? devices.size() - 1 : (size_t) dev_idx];
+    if (!dev.meas) {
+        return false;
+    }
+    if (use.is_matmul) {
+        const auto it = dev.meas->matmul.find(ggml_type_name(t.type));
+        return it != dev.meas->matmul.end() && it->second.supported && it->second.bytes_per_s > 0;
+    }
+    return dev.meas->op_overhead_us > 0 && device_bandwidth(dev) > 0;
+}
+
 double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fit_advisor_graph_profile & gp, size_t tensor_idx, int dev_idx,
                                      const std::vector<fit_advisor_cost_device> & devices, const fit_advisor_workload & wl, uint32_t n_slots) {
     const uint32_t batch_gen = std::max<uint32_t>(1, std::min(wl.concurrency, n_slots));

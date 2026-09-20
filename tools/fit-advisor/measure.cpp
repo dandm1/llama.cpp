@@ -229,17 +229,16 @@ bench_result bench_attn(ggml_backend_t backend, bool flash, ggml_type type_kv, i
     }, { "mask" });
 }
 
-// a chain of n tiny matmuls, each consuming the previous result: the slope in n is the per-op cost inside a graph
+// a chain of n trivial elementwise ops on a tiny tensor, each consuming the previous result: the slope in n is the
+// fixed cost of a graph node on this device (launch or barrier), with next to no kernel work in it
 bench_result bench_chain(ggml_backend_t backend, int n_ops) {
     return bench_graph(backend, [&](ggml_context * ctx) {
         constexpr int64_t k = 256;
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
         ggml_set_name(x, "x");
         ggml_tensor * cur = x;
         for (int i = 0; i < n_ops; i++) {
-            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, k);
-            ggml_format_name(w, "w%d", i);
-            cur = ggml_mul_mat(ctx, w, cur);
+            cur = ggml_scale(ctx, cur, 1.0001f);
         }
         return cur;
     }, {}, 100.0, 5);
@@ -569,7 +568,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
     }
     try {
         const json j = json::parse(f);
-        if (j.value("version", 0) != 2) {
+        if (j.value("version", 0) != 3) {
             LOG_WRN("%s: ignoring %s, unknown version\n", __func__, path.c_str());
             return false;
         }
@@ -597,7 +596,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
 
 std::string fit_advisor_measurements::to_json() const {
     json j;
-    j["version"] = 2;
+    j["version"] = 3;
     j["devices"] = json::object();
     for (const auto & [key, m] : devices) {
         j["devices"][key] = device_to_json(m);
