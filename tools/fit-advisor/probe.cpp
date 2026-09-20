@@ -80,34 +80,12 @@ const fit_advisor_projection & fit_advisor_probe::run(const fit_advisor_candidat
 
     // build the parameters exactly as the server would from an equivalent command line
     common_params p = base;
-    p.n_gpu_layers = cand.n_gpu_layers;
-    p.n_ctx        = cand.n_ctx;
-    p.n_parallel   = (int32_t) cand.n_slots;
-    if (cand.n_ubatch > 0) {
-        p.n_ubatch = (int32_t) cand.n_ubatch;
-        p.n_batch  = std::max(p.n_batch, p.n_ubatch);
-    }
-
-    std::memset(p.tensor_split, 0, sizeof(p.tensor_split));
-    for (size_t i = 0; i < cand.tensor_split.size() && i < llama_max_devices(); i++) {
-        p.tensor_split[i] = cand.tensor_split[i];
-    }
-
-    // pattern strings must outlive the probe, keep them beside the override array
-    std::vector<std::string> patterns;
-    patterns.reserve(cand.overrides.size());
-    p.tensor_buft_overrides.clear();
+    std::vector<std::string> patterns; // pattern strings must outlive the probe, the override array points into them
     try {
-        const auto bufts = get_buft_by_name();
-        for (const auto & o : cand.overrides) {
-            auto b = bufts.find(o.buft);
-            if (b == bufts.end()) {
-                throw std::runtime_error("unknown buffer type '" + o.buft + "' in override '" + o.pattern + "'");
-            }
-            patterns.push_back(o.pattern);
-            p.tensor_buft_overrides.push_back({ patterns.back().c_str(), b->second });
+        std::string error;
+        if (!fit_advisor_apply_candidate(p, cand, patterns, error)) {
+            throw std::runtime_error(error);
         }
-        p.tensor_buft_overrides.push_back({ nullptr, nullptr });
 
         llama_model_params   mparams = common_model_params_to_llama(p);
         llama_context_params cparams = common_context_params_to_llama(p);
@@ -126,6 +104,13 @@ const fit_advisor_projection & fit_advisor_probe::run(const fit_advisor_candidat
             d.name    = std::string(ggml_backend_dev_name(devs[id])) + " (" + ggml_backend_dev_description(devs[id]) + ")";
             d.total   = dmds[id].total;
             d.free    = dmds[id].free;
+            if (free_snapshot.size() <= id) {
+                free_snapshot.resize(id + 1, -1);
+            }
+            if (free_snapshot[id] < 0) {
+                free_snapshot[id] = d.free;
+            }
+            d.free = free_snapshot[id];
             d.model   = dmds[id].model;
             d.context = dmds[id].context;
             d.compute = dmds[id].compute;
@@ -136,6 +121,9 @@ const fit_advisor_projection & fit_advisor_probe::run(const fit_advisor_candidat
             // so the default margin can be half the fitter's; an explicit --fit-target is always respected
             if (!base.fit_params_target_set && !d.scratch_unknown) {
                 d.margin = std::min<int64_t>(d.margin, 512ll * 1024 * 1024);
+                if (id < margins.size() && margins[id] >= 0) {
+                    d.margin = margins[id];
+                }
             }
             proj.devices.push_back(d);
         }
@@ -155,6 +143,52 @@ const fit_advisor_projection & fit_advisor_probe::run(const fit_advisor_candidat
     n_probes++;
 
     return memo.emplace(key, std::move(proj)).first->second;
+}
+
+void fit_advisor_probe::set_margin(size_t device, int64_t margin) {
+    if (base.fit_params_target_set) {
+        return; // the user's choice stands
+    }
+    if (margins.size() <= device) {
+        margins.resize(device + 1, -1);
+    }
+    margins[device] = margin;
+    for (auto & [key, proj] : memo) {
+        if (device < proj.devices.size() && !proj.devices[device].scratch_unknown) {
+            proj.devices[device].margin = margin;
+        }
+    }
+}
+
+bool fit_advisor_apply_candidate(common_params & p, const fit_advisor_candidate & cand, std::vector<std::string> & patterns, std::string & error) {
+    p.n_gpu_layers = cand.n_gpu_layers;
+    p.n_ctx        = cand.n_ctx;
+    p.n_parallel   = (int32_t) cand.n_slots;
+    if (cand.n_ubatch > 0) {
+        p.n_ubatch = (int32_t) cand.n_ubatch;
+        p.n_batch  = std::max(p.n_batch, p.n_ubatch);
+    }
+
+    std::memset(p.tensor_split, 0, sizeof(p.tensor_split));
+    for (size_t i = 0; i < cand.tensor_split.size() && i < llama_max_devices(); i++) {
+        p.tensor_split[i] = cand.tensor_split[i];
+    }
+
+    patterns.clear();
+    patterns.reserve(cand.overrides.size());
+    p.tensor_buft_overrides.clear();
+    const auto bufts = get_buft_by_name();
+    for (const auto & o : cand.overrides) {
+        auto b = bufts.find(o.buft);
+        if (b == bufts.end()) {
+            error = "unknown buffer type '" + o.buft + "' in override '" + o.pattern + "'";
+            return false;
+        }
+        patterns.push_back(o.pattern);
+        p.tensor_buft_overrides.push_back({ patterns.back().c_str(), b->second });
+    }
+    p.tensor_buft_overrides.push_back({ nullptr, nullptr });
+    return true;
 }
 
 // attribute graph nodes to layers: named nodes carry a "-<il>" suffix, unnamed ones follow the last named layer

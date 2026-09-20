@@ -2938,6 +2938,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
     add_opt(common_arg(
+        {"--validate"},
+        "load the chosen allocation for real, run a prompt and a few generation steps, and measure the device memory the "
+        "projection missed; the margin is then set from that measurement and the search repeated if it changed",
+        [](common_params & params) {
+            params.fit_advisor_validate = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
+    add_opt(common_arg(
+        {"--validate-tokens"}, "N",
+        "prompt tokens to run in the validation load (default: two ubatches, at least 1024)",
+        [](common_params & params, int value) {
+            params.fit_advisor_validate_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
+    add_opt(common_arg(
         {"--emit-name"}, "NAME",
         "section name for --emit-ini (default: the model file name without extension)",
         [](common_params & params, const std::string & value) {

@@ -270,6 +270,11 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
     m.fingerprint = fit_advisor_fingerprint(dev, n_threads);
     m.measured_at = now_string();
 
+    // free memory before the backend exists: what the runtime keeps once the kernels have run is measured against this
+    size_t free_before = 0;
+    size_t total_dev   = 0;
+    ggml_backend_dev_memory(dev, &free_before, &total_dev);
+
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     if (backend == nullptr) {
         LOG_ERR("%s: failed to initialize backend for device %s\n", __func__, m.fingerprint.name.c_str());
@@ -431,7 +436,20 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
             m.copy.h2d_gb_s, m.copy.d2h_gb_s, m.copy.latency_us);
     }
 
+    ggml_backend_synchronize(backend);
     ggml_backend_free(backend);
+
+    // with the backend gone every buffer, pool and handle is released; what is still missing from the device's free
+    // memory is runtime state the loader never sees (kernel modules loaded on first use, driver bookkeeping)
+    if (is_cpu) {
+        m.runtime_overhead_bytes = 0;
+    } else {
+        size_t free_after = 0;
+        ggml_backend_dev_memory(dev, &free_after, &total_dev);
+        m.runtime_overhead_bytes = free_before > free_after ? (int64_t) (free_before - free_after) : 0;
+        LOG_INF("%s:   runtime overhead after the kernels ran %.0f MiB (free %.0f -> %.0f MiB)\n", __func__,
+            m.runtime_overhead_bytes / (1024.0 * 1024), free_before / (1024.0 * 1024), free_after / (1024.0 * 1024));
+    }
     return m;
 }
 
@@ -469,6 +487,7 @@ static json device_to_json(const fit_advisor_device_measurements & m) {
     j["measured_at"] = m.measured_at;
     j["op_overhead_us"] = m.op_overhead_us;
     j["launch_us"] = m.launch_us;
+    j["runtime_overhead_bytes"] = m.runtime_overhead_bytes;
     for (const auto & [type, r] : m.matmul) {
         j["matmul"][type] = {
             { "supported",   r.supported },
@@ -509,6 +528,7 @@ static fit_advisor_device_measurements device_from_json(const json & j) {
     m.measured_at = j.value("measured_at", "");
     m.op_overhead_us = j.value("op_overhead_us", 0.0);
     m.launch_us = j.value("launch_us", 0.0);
+    m.runtime_overhead_bytes = j.value("runtime_overhead_bytes", (int64_t) -1);
     if (j.contains("matmul")) {
         for (const auto & [type, r] : j.at("matmul").items()) {
             fit_advisor_matmul_rate mr;
@@ -568,7 +588,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
     }
     try {
         const json j = json::parse(f);
-        if (j.value("version", 0) != 3) {
+        if (j.value("version", 0) != 4) {
             LOG_WRN("%s: ignoring %s, unknown version\n", __func__, path.c_str());
             return false;
         }
@@ -596,7 +616,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
 
 std::string fit_advisor_measurements::to_json() const {
     json j;
-    j["version"] = 3;
+    j["version"] = 4;
     j["devices"] = json::object();
     for (const auto & [key, m] : devices) {
         j["devices"][key] = device_to_json(m);
@@ -655,7 +675,10 @@ const fit_advisor_device_measurements & fit_advisor_measurements::ensure(ggml_ba
         }
         todo.measure_copy = have.copy.h2d_gb_s <= 0;
         const bool need_launch = have.launch_us <= 0;
-        if (todo.weight_types.empty() && todo.kv_types.empty() && !todo.measure_copy && !need_launch) {
+        if (have.runtime_overhead_bytes < 0) {
+            // the runtime overhead is the memory the whole kernel set leaves behind, so measure everything again
+            todo = opts;
+        } else if (todo.weight_types.empty() && todo.kv_types.empty() && !todo.measure_copy && !need_launch) {
             return have;
         }
         LOG_INF("%s: cached entry for %s lacks %zu weight types, %zu KV types%s, measuring those\n", __func__,
@@ -678,6 +701,8 @@ const fit_advisor_device_measurements & fit_advisor_measurements::ensure(ggml_ba
         have.op_overhead_us = m.op_overhead_us;
         have.launch_us      = m.launch_us;
         have.measured_at    = m.measured_at;
+        // a partial run loads only part of the kernel set, keep the largest footprint seen
+        have.runtime_overhead_bytes = std::max(have.runtime_overhead_bytes, m.runtime_overhead_bytes);
     } else {
         devices[key] = std::move(m);
     }
@@ -703,6 +728,10 @@ void fit_advisor_measurements_print(const fit_advisor_device_measurements & m) {
     }
     LOG_INF("%s:   per-op overhead %.1f us, graph launch %.1f us; copy h2d %6.2f GB/s, d2h %6.2f GB/s, small transfer %6.1f us\n", __func__,
         m.op_overhead_us, m.launch_us, m.copy.h2d_gb_s, m.copy.d2h_gb_s, m.copy.latency_us);
+    if (m.runtime_overhead_bytes >= 0) {
+        LOG_INF("%s:   runtime overhead %.0f MiB (kernel modules and driver state outside every buffer)\n", __func__,
+            m.runtime_overhead_bytes / (1024.0 * 1024));
+    }
 }
 
 // time one scheduler round: a chain of n_ops tiny matmuls whose weights live on backend a, except every 4th which lives

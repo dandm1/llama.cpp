@@ -83,6 +83,10 @@ struct fit_advisor_device_measurements {
     double op_overhead_us = 0; // fixed cost per graph op inside a graph, from the slope of a chain of tiny ops
     double launch_us      = 0; // cost of one graph compute of a single tiny op: what every scheduler split pays on this device
 
+    // device memory the runtime keeps after the benchmark kernels have run and every buffer is freed: lazily loaded
+    // kernel modules and other driver state that no buffer accounts for; -1 = not measured, 0 for the CPU
+    int64_t runtime_overhead_bytes = -1;
+
     bool has_matmul(ggml_type type) const { return matmul.count(ggml_type_name(type)) > 0; }
     bool has_matmul_curve(ggml_type type) const; // measured with the batch-4 point too
     bool has_attn(int head_size, int head_size_v, ggml_type type_kv) const;

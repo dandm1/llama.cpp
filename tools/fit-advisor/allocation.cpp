@@ -171,37 +171,12 @@ int fit_advisor_verify_allocation(const common_params & params, const fit_adviso
                                   const std::vector<std::string> & device_bufts, const fit_advisor_candidate & cand) {
     // same parameter construction as the probe
     common_params p = params;
-    p.n_gpu_layers = cand.n_gpu_layers;
-    p.n_ctx        = cand.n_ctx;
-    p.n_parallel   = (int32_t) cand.n_slots;
-    if (cand.n_ubatch > 0) {
-        p.n_ubatch = (int32_t) cand.n_ubatch;
-        p.n_batch  = std::max(p.n_batch, p.n_ubatch);
-    }
-    std::fill(p.tensor_split, p.tensor_split + llama_max_devices(), 0.0f);
-    for (size_t i = 0; i < cand.tensor_split.size() && i < llama_max_devices(); i++) {
-        p.tensor_split[i] = cand.tensor_split[i];
-    }
-    std::map<std::string, ggml_backend_buffer_type_t> bufts;
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-        ggml_backend_buffer_type_t b = ggml_backend_dev_buffer_type(ggml_backend_dev_get(i));
-        if (b) {
-            bufts[ggml_backend_buft_name(b)] = b;
-        }
-    }
     std::vector<std::string> patterns;
-    patterns.reserve(cand.overrides.size());
-    p.tensor_buft_overrides.clear();
-    for (const auto & o : cand.overrides) {
-        auto it = bufts.find(o.buft);
-        if (it == bufts.end()) {
-            LOG_ERR("%s: unknown buffer type %s\n", __func__, o.buft.c_str());
-            return -1;
-        }
-        patterns.push_back(o.pattern);
-        p.tensor_buft_overrides.push_back({ patterns.back().c_str(), it->second });
+    std::string error;
+    if (!fit_advisor_apply_candidate(p, cand, patterns, error)) {
+        LOG_ERR("%s: %s\n", __func__, error.c_str());
+        return -1;
     }
-    p.tensor_buft_overrides.push_back({ nullptr, nullptr });
 
     llama_model_params mparams = common_model_params_to_llama(p);
     mparams.no_alloc  = true;

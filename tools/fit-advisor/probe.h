@@ -96,11 +96,24 @@ struct fit_advisor_graph_profile {
     uint32_t n_nodes_pp = 0;
 };
 
+// headroom kept on top of a measured runtime overhead, for what the measurement cannot see: other processes,
+// driver updates, kernels the measurement did not exercise
+constexpr int64_t FIT_ADVISOR_MARGIN_PAD = 128ll * 1024 * 1024;
+
+// apply a candidate to a copy of the base parameters exactly as the server would parse the equivalent command line;
+// patterns must outlive p because the override array points into them. false with error set on an unknown buffer type
+bool fit_advisor_apply_candidate(common_params & p, const fit_advisor_candidate & cand, std::vector<std::string> & patterns, std::string & error);
+
 struct fit_advisor_probe {
     explicit fit_advisor_probe(const common_params & params);
 
     // project a candidate, memoized on the candidate key
     const fit_advisor_projection & run(const fit_advisor_candidate & cand);
+
+    // replace the default margin of one device (index in the model's device order); reaches projections already made.
+    // used once the runtime overhead has been measured or validated, an explicit --fit-target is never overridden
+    void set_margin(size_t device, int64_t margin);
+    int64_t margin(size_t device) const { return device < margins.size() ? margins[device] : -1; }
 
     // op counts per layer and per-weight op usage for the base parameters (independent of placement)
     fit_advisor_graph_profile graph_profile(uint32_t n_layer_all, const std::vector<std::string> & tensor_names);
@@ -115,4 +128,9 @@ private:
     common_params  base;
     ggml_log_level log_level;
     std::map<std::string, fit_advisor_projection> memo;
+
+    // free memory per device as first seen: measurements in this process load kernels that lower later readings,
+    // while the server starts fresh, so every projection uses the first reading
+    std::vector<int64_t> free_snapshot;
+    std::vector<int64_t> margins; // per device, -1 = default rule
 };

@@ -485,6 +485,8 @@ struct common_params {
     int32_t fit_advisor_search_iters = 20000;  // llama-fit-advisor: simulated annealing iterations, 0 = seeds only
     std::string fit_advisor_emit_ini;          // llama-fit-advisor: write the chosen allocation as a preset section to this INI file
     std::string fit_advisor_emit_name;         // llama-fit-advisor: section name for the preset, default: the model file name
+    bool    fit_advisor_validate = false;      // llama-fit-advisor: load the chosen allocation for real and measure what the projection missed
+    int32_t fit_advisor_validate_tokens = 0;   // llama-fit-advisor: prompt tokens for the validation run, 0 = two ubatches
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);

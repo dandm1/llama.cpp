@@ -10,6 +10,7 @@
 #include "measure.h"
 #include "probe.h"
 #include "search.h"
+#include "validate.h"
 
 #include "arg.h"
 #include "common.h"
@@ -21,6 +22,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -184,7 +186,8 @@ static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_ad
 
     printf("\n[MiB] free: device memory free when probed; model/ctx+cmp: projected weights and context+compute buffers;\n");
     printf("scratch: backend pool memory the graph's ops need outside those buffers, estimated per op (? = some op had no estimate);\n");
-    printf("left: free - projected use; fit: left >= margin (--fit-target, default 512 MiB where scratch is estimated, else 1024);\n");
+    printf("left: free - projected use; fit: left >= margin (--fit-target; default 512 MiB where scratch is estimated, else 1024,\n");
+    printf("  and the measured runtime overhead + %.0f MiB once the devices have been measured or validated);\n", FIT_ADVISOR_MARGIN_PAD / MiB);
     printf("Host row: projected host-side use, free RAM unknown\n");
 
     printf("\narguments per candidate (llama-bench takes the same flags, with ';' instead of ',' between -ot entries):\n");
@@ -326,6 +329,83 @@ static void emit_if_requested(const common_params & params, const fit_advisor_ca
     }
 }
 
+// run the search and print the result: request cost, per-device memory, what sits where, and the loader arguments
+static fit_advisor_search_result search_and_report(const common_params & params, const fit_advisor_inventory & inv, fit_advisor_probe & probe,
+                                                   const std::vector<std::string> & device_bufts, const fit_advisor_graph_profile & gp,
+                                                   const std::vector<fit_advisor_cost_device> & cost_devs, const fit_advisor_pair_table & pair_table,
+                                                   const fit_advisor_workload & wl, const fit_advisor_search_options & sopts) {
+    LOG_INF("%s: searching allocations (%d annealing iterations) ...\n", __func__, sopts.anneal_iters);
+    const int64_t t_search0 = ggml_time_us();
+    const fit_advisor_search_result sr = fit_advisor_search(inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts);
+    const double t_search = (ggml_time_us() - t_search0) * 1e-6;
+    if (!sr.ok) {
+        LOG_WRN("%s: search found no feasible allocation\n", __func__);
+        return sr;
+    }
+    LOG_INF("%s: search done in %.1f s: %d seed cells, %d probes, %d annealing moves accepted\n", __func__,
+        t_search, sr.n_cells, sr.n_probes, sr.n_anneal_accepted);
+    common_log_flush(common_log_main());
+
+    printf("\nbest allocation: %s\n", sr.name.c_str());
+    printf("  request %.2f s (best seed %.2f s), gen %.2f tok/s, pp %.0f tok/s, ubatch %u, slots %u\n",
+        sr.cost.t_request_us * 1e-6, sr.seed_request_us * 1e-6, sr.cost.gen_tokens_per_s, sr.cost.prompt_tokens_per_s,
+        sr.wl.n_ubatch, sr.alloc.n_slots);
+    for (size_t d = 0; d < sr.proj.devices.size(); d++) {
+        const auto & pd = sr.proj.devices[d];
+        printf("  %-34.34s model %6.0f MiB, ctx+cmp %5.0f, scratch %4.0f, left %6.0f MiB%s\n", pd.name.c_str(),
+            pd.model / (1024.0 * 1024), (pd.context + pd.compute) / (1024.0 * 1024), pd.scratch / (1024.0 * 1024),
+            pd.projected_free() / (1024.0 * 1024), pd.fits() ? "" : "  (over budget!)");
+    }
+    // what sits on each device, by tensor kind and layer ranges
+    const uint32_t n_layer_all = inv.n_layer + inv.n_layer_nextn;
+    for (size_t d = 0; d < device_bufts.size(); d++) {
+        std::map<fit_advisor_tensor_kind, std::vector<uint32_t>> layers_by_kind;
+        size_t bytes_on = 0;
+        for (size_t i = 0; i < inv.tensors.size(); i++) {
+            if (sr.alloc.tensor_device[i] != (int) d) continue;
+            bytes_on += inv.tensors[i].nbytes;
+            if (inv.tensors[i].layer >= 0) layers_by_kind[inv.tensors[i].kind].push_back((uint32_t) inv.tensors[i].layer);
+        }
+        printf("  %s holds %.0f MiB of weights, layers %s\n", device_bufts[d].c_str(), bytes_on / (1024.0 * 1024),
+            [&]() { // layer range of this device's block
+                std::string r;
+                uint32_t first = UINT32_MAX, last = 0;
+                for (uint32_t il = 0; il <= n_layer_all; il++) {
+                    if (sr.alloc.layer_device(il, n_layer_all) == (int) d) { first = std::min(first, il); last = il; }
+                }
+                return first == UINT32_MAX ? std::string("none") : std::to_string(first) + "-" + std::to_string(last);
+            }().c_str());
+        for (auto & [kind, layers] : layers_by_kind) {
+            std::sort(layers.begin(), layers.end());
+            layers.erase(std::unique(layers.begin(), layers.end()), layers.end());
+            // compress into ranges
+            std::string ranges;
+            for (size_t k = 0; k < layers.size();) {
+                size_t j = k;
+                while (j + 1 < layers.size() && layers[j + 1] == layers[j] + 1) j++;
+                ranges += (ranges.empty() ? "" : ",") + std::to_string(layers[k]) + (j > k ? "-" + std::to_string(layers[j]) : "");
+                k = j + 1;
+            }
+            printf("    %-12s layers %s\n", fit_advisor_tensor_kind_name(kind), ranges.c_str());
+        }
+    }
+    {
+        const fit_advisor_candidate & c = sr.cand;
+        std::string args = "-c " + std::to_string(c.n_ctx) + " -np " + std::to_string(c.n_slots) + " -ngl " + std::to_string(c.n_gpu_layers);
+        if (c.n_ubatch > 0) {
+            args += " -ub " + std::to_string(c.n_ubatch) + " -b " + std::to_string(std::max<uint32_t>(c.n_ubatch, (uint32_t) params.n_batch));
+        }
+        if (!c.tensor_split.empty()) {
+            args += " -ts ";
+            for (size_t i = 0; i < c.tensor_split.size(); i++) args += (i ? "/" : "") + std::to_string((long long) std::llround(c.tensor_split[i]));
+        }
+        if (!c.overrides.empty()) args += " -ot \"" + c.overrides_str() + "\"";
+        printf("  args: %s\n", args.c_str());
+    }
+    fflush(stdout);
+    return sr;
+}
+
 int llama_fit_advisor(int argc, char ** argv) {
     common_params params;
 
@@ -452,6 +532,21 @@ int llama_fit_advisor(int argc, char ** argv) {
     for (const auto * m : meas) {
         fit_advisor_measurements_print(*m);
     }
+
+    // the margin now only has to cover what the measurement cannot see, unless the user fixed it with --fit-target
+    for (size_t d = 0; d < device_names.size(); d++) {
+        for (size_t i = 0; i < devs.size(); i++) {
+            if (device_names[d] == ggml_backend_dev_name(devs[i]) && meas[i]->runtime_overhead_bytes >= 0 && !params.fit_params_target_set) {
+                const int64_t margin = meas[i]->runtime_overhead_bytes + FIT_ADVISOR_MARGIN_PAD;
+                if (proj0.devices.size() > d && !proj0.devices[d].scratch_unknown) {
+                    probe.set_margin(d, margin);
+                    LOG_INF("%s: %s margin set to %.0f MiB: measured runtime overhead %.0f + %.0f MiB pad\n", __func__,
+                        device_names[d].c_str(), margin / (1024.0 * 1024), meas[i]->runtime_overhead_bytes / (1024.0 * 1024),
+                        FIT_ADVISOR_MARGIN_PAD / (1024.0 * 1024));
+                }
+            }
+        }
+    }
     common_log_flush(common_log_main());
 
     print_layer_costs(inv, devs, meas);
@@ -555,81 +650,57 @@ int llama_fit_advisor(int argc, char ** argv) {
     }
     fflush(stdout);
 
-    // ---- the search
+    // ---- the search, then an optional real load to measure what the projection missed and search again with that margin
     fit_advisor_search_options sopts;
     sopts.n_ctx        = params.n_ctx;
     sopts.max_slots    = wl.concurrency;
     sopts.anneal_iters = params.fit_advisor_search_iters;
-    LOG_INF("%s: searching allocations (%d annealing iterations) ...\n", __func__, sopts.anneal_iters);
-    const int64_t t_search0 = ggml_time_us();
-    const fit_advisor_search_result sr = fit_advisor_search(inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts);
-    const double t_search = (ggml_time_us() - t_search0) * 1e-6;
+
+    fit_advisor_search_result sr = search_and_report(params, inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts);
     if (!sr.ok) {
-        LOG_WRN("%s: search found no feasible allocation\n", __func__);
         emit_if_requested(params, cands[1], "built-in fitter's"); // cands[1] is the fitter's own choice
         return 0;
     }
-    LOG_INF("%s: search done in %.1f s: %d seed cells, %d probes, %d annealing moves accepted\n", __func__,
-        t_search, sr.n_cells, sr.n_probes, sr.n_anneal_accepted);
-    common_log_flush(common_log_main());
 
-    printf("\nbest allocation: %s\n", sr.name.c_str());
-    printf("  request %.2f s (best seed %.2f s), gen %.2f tok/s, pp %.0f tok/s, ubatch %u, slots %u\n",
-        sr.cost.t_request_us * 1e-6, sr.seed_request_us * 1e-6, sr.cost.gen_tokens_per_s, sr.cost.prompt_tokens_per_s,
-        sr.wl.n_ubatch, sr.alloc.n_slots);
-    for (size_t d = 0; d < sr.proj.devices.size(); d++) {
-        const auto & pd = sr.proj.devices[d];
-        printf("  %-34.34s model %6.0f MiB, ctx+cmp %5.0f, scratch %4.0f, left %6.0f MiB%s\n", pd.name.c_str(),
-            pd.model / (1024.0 * 1024), (pd.context + pd.compute) / (1024.0 * 1024), pd.scratch / (1024.0 * 1024),
-            pd.projected_free() / (1024.0 * 1024), pd.fits() ? "" : "  (over budget!)");
-    }
-    // what sits on each device, by tensor kind and layer ranges
-    const uint32_t n_layer_all = inv.n_layer + inv.n_layer_nextn;
-    for (size_t d = 0; d < device_bufts.size(); d++) {
-        std::map<fit_advisor_tensor_kind, std::vector<uint32_t>> layers_by_kind;
-        size_t bytes_on = 0;
-        for (size_t i = 0; i < inv.tensors.size(); i++) {
-            if (sr.alloc.tensor_device[i] != (int) d) continue;
-            bytes_on += inv.tensors[i].nbytes;
-            if (inv.tensors[i].layer >= 0) layers_by_kind[inv.tensors[i].kind].push_back((uint32_t) inv.tensors[i].layer);
-        }
-        printf("  %s holds %.0f MiB of weights, layers %s\n", device_bufts[d].c_str(), bytes_on / (1024.0 * 1024),
-            [&]() { // layer range of this device's block
-                std::string r;
-                uint32_t first = UINT32_MAX, last = 0;
-                for (uint32_t il = 0; il <= n_layer_all; il++) {
-                    if (sr.alloc.layer_device(il, n_layer_all) == (int) d) { first = std::min(first, il); last = il; }
+    if (params.fit_advisor_validate) {
+        const uint32_t n_tokens = (uint32_t) std::max(0, params.fit_advisor_validate_tokens);
+        fit_advisor_validate_result vr = fit_advisor_validate(params, sr.cand, sr.proj, n_tokens);
+        fit_advisor_validate_print(vr);
+        if (vr.ok && !params.fit_params_target_set) {
+            bool changed = false;
+            for (size_t d = 0; d < vr.devices.size() && d < sr.proj.devices.size(); d++) {
+                const int64_t suggested = vr.suggested_margin(d);
+                const int64_t current   = sr.proj.devices[d].margin;
+                if (!sr.proj.devices[d].scratch_unknown && std::llabs(suggested - current) > 64ll * 1024 * 1024) {
+                    LOG_INF("%s: %s margin %.0f -> %.0f MiB from the validation run\n", __func__, sr.proj.devices[d].name.c_str(),
+                        current / (1024.0 * 1024), suggested / (1024.0 * 1024));
+                    probe.set_margin(d, suggested);
+                    changed = true;
                 }
-                return first == UINT32_MAX ? std::string("none") : std::to_string(first) + "-" + std::to_string(last);
-            }().c_str());
-        for (auto & [kind, layers] : layers_by_kind) {
-            std::sort(layers.begin(), layers.end());
-            layers.erase(std::unique(layers.begin(), layers.end()), layers.end());
-            // compress into ranges
-            std::string ranges;
-            for (size_t k = 0; k < layers.size();) {
-                size_t j = k;
-                while (j + 1 < layers.size() && layers[j + 1] == layers[j] + 1) j++;
-                ranges += (ranges.empty() ? "" : ",") + std::to_string(layers[k]) + (j > k ? "-" + std::to_string(layers[j]) : "");
-                k = j + 1;
             }
-            printf("    %-12s layers %s\n", fit_advisor_tensor_kind_name(kind), ranges.c_str());
+            if (changed) {
+                LOG_INF("%s: searching again with the validated margins ...\n", __func__);
+                fit_advisor_search_result sr2 = search_and_report(params, inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts);
+                if (sr2.ok) {
+                    fit_advisor_validate_result vr2 = fit_advisor_validate(params, sr2.cand, sr2.proj, n_tokens);
+                    fit_advisor_validate_print(vr2);
+                    bool within = vr2.ok;
+                    for (size_t d = 0; d < vr2.devices.size() && within; d++) {
+                        within = vr2.devices[d].unmodelled() <= vr2.devices[d].margin;
+                    }
+                    if (within) {
+                        sr = sr2;
+                    } else {
+                        LOG_WRN("%s: the allocation found with the validated margins did not validate, keeping the first one\n", __func__);
+                    }
+                } else {
+                    LOG_WRN("%s: no feasible allocation with the validated margins, keeping the first one\n", __func__);
+                }
+            } else {
+                LOG_INF("%s: validated margins match the ones used, the allocation stands\n", __func__);
+            }
         }
     }
-    {
-        const fit_advisor_candidate & c = sr.cand;
-        std::string args = "-c " + std::to_string(c.n_ctx) + " -np " + std::to_string(c.n_slots) + " -ngl " + std::to_string(c.n_gpu_layers);
-        if (c.n_ubatch > 0) {
-            args += " -ub " + std::to_string(c.n_ubatch) + " -b " + std::to_string(std::max<uint32_t>(c.n_ubatch, (uint32_t) params.n_batch));
-        }
-        if (!c.tensor_split.empty()) {
-            args += " -ts ";
-            for (size_t i = 0; i < c.tensor_split.size(); i++) args += (i ? "/" : "") + std::to_string((long long) std::llround(c.tensor_split[i]));
-        }
-        if (!c.overrides.empty()) args += " -ot \"" + c.overrides_str() + "\"";
-        printf("  args: %s\n", args.c_str());
-    }
-    fflush(stdout);
 
     if (params.fit_advisor_verify) {
         fit_advisor_verify_allocation(params, inv, sr.alloc, device_bufts, sr.cand);
