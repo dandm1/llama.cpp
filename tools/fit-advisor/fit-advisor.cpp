@@ -422,6 +422,7 @@ static fit_advisor_search_result search_and_report(const common_params & params,
         size_t bytes_on = 0;
         for (size_t i = 0; i < inv.tensors.size(); i++) {
             if (sr.alloc.tensor_device[i] != (int) d) continue;
+            if (inv.tensors[i].layer >= (int32_t) inv.n_layer && !sr.alloc.draft_mtp) continue; // MTP layer not loaded
             bytes_on += inv.tensors[i].nbytes;
             if (inv.tensors[i].layer >= 0) layers_by_kind[inv.tensors[i].kind].push_back((uint32_t) inv.tensors[i].layer);
         }
