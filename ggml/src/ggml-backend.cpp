@@ -1842,6 +1842,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t t_split0 = ggml_time_us();
+        int n_eligible = 0, n_pref = 0;
+        if (debug_prefetch > 1) {
+            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                n_eligible += ggml_backend_sched_weight_slot_eligible(sched, split, split->inputs[input_id]);
+                n_pref     += is_prefetched(split_id, input_id);
+            }
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2033,6 +2041,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        }
+
+        if (debug_prefetch > 1 && split_id < 60) {
+            GGML_LOG_WARN("sched: split %3d on %-6s nodes %3d inputs %2d host-weights %d prefetched %d first %-20s host %.1f ms\n",
+                split_id, ggml_backend_name(split_backend), split->graph.n_nodes, split->n_inputs, n_eligible, n_pref,
+                split->graph.n_nodes > 0 ? ggml_op_desc(split->graph.nodes[0]) : "-", (ggml_time_us() - t_split0) / 1000.0);
         }
 
         // with this split's compute enqueued, start the weight copies of upcoming splits on other backends: the first
