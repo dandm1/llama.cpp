@@ -4330,7 +4330,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             auto types = common_speculative_types_from_names(types_str);
             params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_FIT_ADVISOR}).set_env("LLAMA_ARG_SPEC_TYPE"));
     add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),
@@ -4465,7 +4465,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & /*params*/, int /*value*/) {
             arg_removed("use --spec-draft-n-max or --spec-ngram-mod-n-max");
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_FIT_ADVISOR}).set_env("LLAMA_ARG_DRAFT_MAX"));
     add_opt(common_arg(
         {"--draft-min", "--draft-n-min"}, "N",
         "the argument has been removed. use --spec-draft-n-min or --spec-ngram-mod-n-min",
