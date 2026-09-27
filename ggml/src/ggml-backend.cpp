@@ -850,6 +850,13 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // weight slots: host-resident weight inputs of the splits on a backend are copied into a dedicated buffer per
+    // backend instead of the graph allocator's time-shared memory, so that a copy for an upcoming split can be
+    // started while earlier splits still run (see the prefetch in ggml_backend_sched_compute_splits). the slot holds
+    // the inputs of one split at a time; every write to it is ordered on the backend's own stream
+    ggml_backend_buffer_t weight_slot_buf[GGML_SCHED_MAX_BACKENDS];
+    size_t                weight_slot_size[GGML_SCHED_MAX_BACKENDS];
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -1622,7 +1629,80 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+// a split input that lives in the backend's weight slot: a host-resident weight copied to a non-CPU backend
+static bool ggml_backend_sched_weight_slot_eligible(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split, const struct ggml_tensor * input) {
+    if (sched->n_copies != 1 || split->backend_id == sched->n_backends - 1) {
+        return false;
+    }
+    return !(input->flags & GGML_TENSOR_FLAG_INPUT) && input->buffer != NULL &&
+        ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_backend_buffer_is_host(input->buffer);
+}
+
+// bytes the slot of this split's backend needs for the split's eligible inputs, assigning offsets when asked
+static size_t ggml_backend_sched_weight_slot_layout(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, bool assign, size_t * offsets) {
+    const int backend_id = split->backend_id;
+    const size_t align = ggml_backend_buft_get_alignment(sched->bufts[backend_id]);
+    size_t total = 0;
+    for (int j = 0; j < split->n_inputs; j++) {
+        struct ggml_tensor * input = split->inputs[j];
+        if (!ggml_backend_sched_weight_slot_eligible(sched, split, input)) {
+            continue;
+        }
+        struct ggml_tensor * input_cpy = tensor_copy(input, backend_id, sched->cur_copy);
+        const size_t size = ggml_backend_buft_get_alloc_size(sched->bufts[backend_id], input_cpy);
+        if (offsets) {
+            offsets[j] = total;
+        }
+        if (assign && input_cpy->data == NULL) {
+            ggml_backend_tensor_alloc(sched->weight_slot_buf[backend_id], input_cpy, (char *) ggml_backend_buffer_get_base(sched->weight_slot_buf[backend_id]) + total);
+        }
+        total += (size + align - 1) / align * align;
+    }
+    return total;
+}
+
+// size the slots for the current splits, allocate them, and place the eligible input copies in them so that the
+// graph allocator leaves those tensors alone
+static bool ggml_backend_sched_alloc_weight_slots(ggml_backend_sched_t sched) {
+    size_t need[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        need[split->backend_id] = std::max(need[split->backend_id], ggml_backend_sched_weight_slot_layout(sched, split, false, NULL));
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (need[b] == 0) {
+            continue;
+        }
+        if (sched->weight_slot_buf[b] == NULL || sched->weight_slot_size[b] < need[b]) {
+            if (sched->weight_slot_buf[b]) {
+                ggml_backend_synchronize(sched->backends[b]);
+                ggml_backend_buffer_free(sched->weight_slot_buf[b]);
+                sched->weight_slot_buf[b] = NULL;
+            }
+            sched->weight_slot_buf[b] = ggml_backend_buft_alloc_buffer(sched->bufts[b], need[b]);
+            if (sched->weight_slot_buf[b] == NULL) {
+                GGML_LOG_ERROR("%s: failed to allocate a %zu byte weight slot on %s\n", __func__, need[b], ggml_backend_name(sched->backends[b]));
+                sched->weight_slot_size[b] = 0;
+                return false;
+            }
+            ggml_backend_buffer_set_usage(sched->weight_slot_buf[b], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            sched->weight_slot_size[b] = need[b];
+        }
+    }
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        if (need[split->backend_id] > 0) {
+            ggml_backend_sched_weight_slot_layout(sched, split, true, NULL);
+        }
+    }
+    return true;
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    if (!ggml_backend_sched_alloc_weight_slots(sched)) {
+        return false;
+    }
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -1719,12 +1799,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         bool any = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             struct ggml_tensor * input = split->inputs[input_id];
-            if ((input->flags & GGML_TENSOR_FLAG_INPUT) || input->buffer == NULL ||
-                ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
-                !ggml_backend_buffer_is_host(input->buffer)) {
+            if (!ggml_backend_sched_weight_slot_eligible(sched, split, input)) {
                 continue;
             }
             struct ggml_tensor * input_cpy = tensor_copy(input, backend_id, sched->cur_copy);
+            if (input_cpy->buffer != sched->weight_slot_buf[backend_id]) {
+                continue; // not in the slot (should not happen), leave it to the normal path
+            }
             double coverage = 1.0;
             if (moe_coverage(split, input_cpy, coverage) && coverage < 0.9) {
                 continue; // the used-experts copy would move much less, let the normal path do it
@@ -2035,6 +2116,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         return;
     }
     for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->weight_slot_buf[b]) {
+            ggml_backend_buffer_free(sched->weight_slot_buf[b]);
+        }
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
         }
@@ -2122,6 +2208,9 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
+    if (!ggml_backend_sched_alloc_weight_slots(sched)) {
+        return false;
+    }
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
@@ -2224,7 +2313,7 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     int backend_index = ggml_backend_sched_backend_id(sched, backend);
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
-    return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+    return ggml_gallocr_get_buffer_size(sched->galloc, backend_index) + sched->weight_slot_size[backend_index];
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
