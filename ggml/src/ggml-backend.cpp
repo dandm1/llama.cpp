@@ -2057,7 +2057,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     if (debug_prefetch && (bytes_prefetch + bytes_ids) > 0) {
-        GGML_LOG_INFO("sched: %d splits, host thread %.1f ms: prefetch %d inputs %.0f MB in %.1f ms, ids-path %d inputs %.0f MB in %.1f ms, other copies %.1f ms, compute enqueue %.1f ms\n",
+        GGML_LOG_WARN("sched: %d splits, host thread %.1f ms: prefetch %d inputs %.0f MB in %.1f ms, ids-path %d inputs %.0f MB in %.1f ms, other copies %.1f ms, compute enqueue %.1f ms\n",
             sched->n_splits, (ggml_time_us() - t_begin) / 1000.0, n_prefetch, bytes_prefetch / 1e6, t_prefetch / 1000.0,
             n_ids, bytes_ids / 1e6, t_ids / 1000.0, t_copy / 1000.0, t_compute / 1000.0);
     }
