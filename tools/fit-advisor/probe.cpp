@@ -32,6 +32,12 @@ std::string fit_advisor_candidate::key() const {
     if (spec_mtp) {
         ss << " mtp";
     }
+    if (flash_attn >= 0) {
+        ss << " fa=" << (flash_attn ? "on" : "off");
+    }
+    if (no_kv_offload) {
+        ss << " nkvo";
+    }
     const std::string off = op_offload_str();
     if (!off.empty()) {
         ss << " offload=" << off;
@@ -270,6 +276,10 @@ bool fit_advisor_apply_candidate(common_params & p, const fit_advisor_candidate 
     for (size_t d = 0; d < cand.op_offload_min_batch_dev.size() && d < p.op_offload_min_batch_dev.size(); d++) {
         p.op_offload_min_batch_dev[d] = cand.op_offload_min_batch_dev[d] > 0 ? cand.op_offload_min_batch_dev[d] : g_default_op_offload;
     }
+
+    p.flash_attn_type = cand.flash_attn < 0 ? LLAMA_FLASH_ATTN_TYPE_AUTO
+                      : cand.flash_attn == 0 ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    p.no_kv_offload   = cand.no_kv_offload;
 
     // drafting is the candidate's decision: with it the MTP layers are loaded and priced, without it neither
     p.speculative.types.erase(std::remove(p.speculative.types.begin(), p.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP),

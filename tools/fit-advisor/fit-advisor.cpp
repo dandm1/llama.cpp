@@ -90,6 +90,8 @@ static std::vector<named_allocation> build_allocations(const common_params & par
         fit_advisor_allocation a = fit_advisor_allocation::from_layer_split(inv, device_bufts, split(ngl), n_ctx, n_slots);
         a.draft_mtp = spec_mtp;
         a.op_offload_min_batch_dev = user_offload_dev(params);
+        a.flash_attn    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO ? -1 : params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ? 1 : 0;
+        a.no_kv_offload = params.no_kv_offload;
         ret.push_back({ name, a });
     };
 
@@ -107,6 +109,8 @@ static std::vector<named_allocation> build_allocations(const common_params & par
         fit_advisor_allocation a = fit_advisor_allocation::from_layer_split(inv, device_bufts, split(ngl_max), params.n_ctx, n_slots);
         a.draft_mtp = spec_mtp;
         a.op_offload_min_batch_dev = user_offload_dev(params);
+        a.flash_attn    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO ? -1 : params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ? 1 : 0;
+        a.no_kv_offload = params.no_kv_offload;
         for (size_t i = 0; i < inv.tensors.size(); i++) {
             const auto & t = inv.tensors[i];
             if (t.kind == kind && t.layer >= (int32_t) il_begin && t.layer < (int32_t) il_end) {
@@ -147,6 +151,8 @@ static fit_advisor_candidate user_candidate(const common_params & params) {
     c.spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     c.op_offload_min_batch_dev = user_offload_dev(params);
+    c.flash_attn    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO ? -1 : params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ? 1 : 0;
+    c.no_kv_offload = params.no_kv_offload;
     // -old as given, translated to buffer type names like the rest of the candidate
     for (const auto & o : params.layer_dev_overrides) {
         if (o.il == -1) {
@@ -385,6 +391,10 @@ static fit_advisor_search_result search_and_report(const common_params & params,
         sr.wl.n_ubatch, sr.alloc.n_slots);
     printf("  generation step %.0f us: weights %.0f, attention %.0f, per-node overhead %.0f, boundaries %.0f\n",
         sr.cost.t_gen_step_us, sr.cost.step_weights_us, sr.cost.step_attn_us, sr.cost.step_overhead_us, sr.cost.step_boundary_us);
+    if (sr.alloc.flash_attn >= 0 || sr.alloc.no_kv_offload) {
+        printf("  attention: flash attention %s%s\n", sr.alloc.flash_attn < 0 ? "auto" : sr.alloc.flash_attn ? "on" : "off",
+            sr.alloc.no_kv_offload ? ", KV cache in host memory (-nkvo)" : "");
+    }
     for (size_t d = 0; d < sr.alloc.op_offload_min_batch_dev.size() && d < device_bufts.size(); d++) {
         const int32_t v = sr.alloc.op_offload_min_batch_dev[d];
         if (v > 0) {
@@ -746,6 +756,10 @@ int llama_fit_advisor(int argc, char ** argv) {
     sopts.n_ctx        = params.n_ctx;
     sopts.max_slots    = wl.concurrency;
     sopts.anneal_iters = params.fit_advisor_search_iters;
+    sopts.base_flash_attn    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO ? -1 : params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ? 1 : 0;
+    sopts.base_no_kv_offload = params.no_kv_offload;
+    sopts.search_flash_attn  = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO; // an explicit -fa is obeyed
+    sopts.search_kv_offload  = !params.no_kv_offload;                                 // an explicit -nkvo is obeyed
     sopts.ubatch_options.clear();
     for (const auto & v : string_split<std::string>(params.fit_advisor_search_ubatch, ',')) {
         const int ub = std::atoi(v.c_str());

@@ -26,6 +26,10 @@ struct fit_advisor_search_options {
     uint32_t max_slots  = 1;     // from the workload's concurrency
     int      anneal_iters = 20000;
     uint32_t seed       = 42;
+    bool search_flash_attn    = true; // false when the user pinned -fa
+    bool search_kv_offload    = true; // false when the user pinned -nkvo
+    int8_t base_flash_attn    = -1;   // the user's -fa
+    bool   base_no_kv_offload = false;
 };
 
 struct fit_advisor_search_result {

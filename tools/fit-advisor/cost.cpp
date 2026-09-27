@@ -308,29 +308,36 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
         const double attn_share = sel == SEL_ALL ? 1.0
             : sel == SEL_MTP ? (double) inv.n_layer_nextn / std::max<uint32_t>(1, n_layer_all)
             : (wl.use_mtp ? (double) inv.n_layer / std::max<uint32_t>(1, n_layer_all) : 1.0);
+        // the attention path: flash attention when the allocation asks for it or leaves it to llama.cpp (which enables
+        // it wherever the backend supports it), the explicit path when it is off or unsupported on the device
+        auto attn_rate = [&](const fit_advisor_device_measurements * m) {
+            double fa = 0, nofa = 0;
+            for (const auto & [key, r] : m->attn) {
+                fa   = std::max(fa,   r.supported_fa   ? r.kv_bytes_per_s_fa   : 0.0);
+                nofa = std::max(nofa, r.supported_nofa ? r.kv_bytes_per_s_nofa : 0.0);
+            }
+            if (alloc.flash_attn == 0) {
+                return nofa > 0 ? nofa : fa;
+            }
+            return fa > 0 ? fa : nofa;
+        };
         for (size_t d = 0; d < proj.devices.size() && d < devices.size(); d++) {
             const auto & pd = proj.devices[d];
             const auto * m  = devices[d].meas;
             if (!m || pd.context == 0) {
                 continue;
             }
-            double best = 0;
-            for (const auto & [key, r] : m->attn) {
-                best = std::max({ best, r.kv_bytes_per_s_fa, r.kv_bytes_per_s_nofa });
-            }
-            if (best > 0) {
-                attn += attn_share * pd.context * fill_frac * ((double) batch_gen / alloc.n_slots) / best * 1e6;
+            const double rate = attn_rate(m);
+            if (rate > 0) {
+                attn += attn_share * pd.context * fill_frac * ((double) batch_gen / alloc.n_slots) / rate * 1e6;
             }
         }
         {
             const auto * m = devices.back().meas;
             if (m && proj.host.context > 0) {
-                double best = 0;
-                for (const auto & [key, r] : m->attn) {
-                    best = std::max({ best, r.kv_bytes_per_s_fa, r.kv_bytes_per_s_nofa });
-                }
-                if (best > 0) {
-                    attn += attn_share * proj.host.context * fill_frac * ((double) batch_gen / alloc.n_slots) / best * 1e6;
+                const double rate = attn_rate(m);
+                if (rate > 0) {
+                    attn += attn_share * proj.host.context * fill_frac * ((double) batch_gen / alloc.n_slots) / rate * 1e6;
                 }
             }
         }

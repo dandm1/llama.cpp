@@ -50,15 +50,15 @@ std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common
     if (params.cache_type_v != defaults.cache_type_v) {
         ret.push_back({ "LLAMA_ARG_CACHE_TYPE_V", ggml_type_name(params.cache_type_v), std::string("-ctv ") + ggml_type_name(params.cache_type_v) });
     }
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_AUTO) {
-        const char * v = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ? "on" : "off";
+    if (cand.flash_attn >= 0) {
+        const char * v = cand.flash_attn ? "on" : "off";
         ret.push_back({ "LLAMA_ARG_FLASH_ATTN", v, std::string("-fa ") + v });
     }
     if (params.cpuparams.n_threads != defaults.cpuparams.n_threads && params.cpuparams.n_threads > 0) {
         const std::string v = std::to_string(params.cpuparams.n_threads);
         ret.push_back({ "LLAMA_ARG_THREADS", v, "-t " + v });
     }
-    if (params.no_kv_offload) {
+    if (cand.no_kv_offload) {
         ret.push_back({ "LLAMA_ARG_KV_OFFLOAD", "false", "-nkvo" });
     }
     if (params.kv_unified) {
@@ -68,6 +68,16 @@ std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common
         const char * v = params.load_mode == LLAMA_LOAD_MODE_NONE ? "none" : params.load_mode == LLAMA_LOAD_MODE_MMAP ? "mmap"
                        : params.load_mode == LLAMA_LOAD_MODE_MLOCK ? "mlock" : params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? "mmap+mlock" : "auto";
         ret.push_back({ "LLAMA_ARG_LOAD_MODE", v, std::string("--load-mode ") + v });
+    } else {
+        // weights kept on the CPU run from the loader's own memory rather than page-mapped file pages; the loader
+        // itself warns that mmap hurts in that case
+        bool cpu_weights = false;
+        for (const auto & o : cand.overrides) {
+            cpu_weights = cpu_weights || o.buft == "CPU";
+        }
+        if (cpu_weights || cand.n_gpu_layers == 0) {
+            ret.push_back({ "LLAMA_ARG_LOAD_MODE", "none", "--load-mode none" });
+        }
     }
     if (!params.devices.empty()) {
         std::string v;

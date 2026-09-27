@@ -58,6 +58,12 @@ std::string alloc_key(const fit_advisor_allocation & a) {
     if (a.draft_mtp) {
         ret += "|mtp";
     }
+    if (a.flash_attn >= 0) {
+        ret += a.flash_attn ? "|fa" : "|nofa";
+    }
+    if (a.no_kv_offload) {
+        ret += "|nkvo";
+    }
     for (size_t d = 0; d < a.op_offload_min_batch_dev.size(); d++) {
         if (a.op_offload_min_batch_dev[d] > 0) {
             ret += "|off" + std::to_string(d) + "=" + std::to_string(a.op_offload_min_batch_dev[d]);
@@ -81,6 +87,12 @@ std::string alloc_name(const fit_advisor_allocation & a) {
     }
     if (a.draft_mtp) {
         ret += "-mtp";
+    }
+    if (a.flash_attn >= 0) {
+        ret += a.flash_attn ? "-fa" : "-nofa";
+    }
+    if (a.no_kv_offload) {
+        ret += "-nkvo";
     }
     for (size_t d = 0; d < a.op_offload_min_batch_dev.size(); d++) {
         const int32_t v = a.op_offload_min_batch_dev[d];
@@ -328,7 +340,9 @@ struct searcher {
         const std::string name = cell_name(part, ub, slots);
 
         fit_advisor_allocation base = fit_advisor_allocation::from_layer_split(inv, device_bufts, part, opts.n_ctx, slots);
-        base.draft_mtp = wl_base.use_mtp;
+        base.draft_mtp     = wl_base.use_mtp;
+        base.flash_attn    = opts.base_flash_attn;
+        base.no_kv_offload = opts.base_no_kv_offload;
         base.op_offload_min_batch_dev = wl_base.op_offload_min_batch_dev;
         if (base.op_offload_min_batch_dev.empty() && wl_base.op_offload_min_batch > 0) {
             base.op_offload_min_batch_dev.assign(nd, wl_base.op_offload_min_batch);
@@ -594,7 +608,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     };
 
     int n_improvements = 0;
-    int n_single_tried = 0, n_single_accepted = 0, n_rehome_tried = 0, n_mtp_tried = 0, n_offload_tried = 0;
+    int n_single_tried = 0, n_single_accepted = 0, n_rehome_tried = 0, n_mtp_tried = 0, n_offload_tried = 0, n_attn_tried = 0;
     const char * trace_tensor = getenv("FIT_ADVISOR_TRACE"); // substring of a tensor name whose moves are logged
     const double T0 = std::max(1.0, 0.005 * std::fabs(cur.cost_score));
     const double T1 = std::max(0.01, 0.00002 * std::fabs(cur.cost_score));
@@ -684,6 +698,14 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             nxt.alloc.draft_mtp = !nxt.alloc.draft_mtp;
             nxt.wl = S.workload(nxt.alloc);
             n_mtp_tried++;
+        } else if (mv < 0.9675 && opts.search_flash_attn) {
+            // flash attention on or off: the attention path and the compute buffer size change
+            nxt.alloc.flash_attn = nxt.alloc.flash_attn == 1 ? 0 : 1;
+            n_attn_tried++;
+        } else if (mv < 0.97 && opts.search_kv_offload) {
+            // the whole KV cache on the host with attention on the CPU, freeing the cards for weights
+            nxt.alloc.no_kv_offload = !nxt.alloc.no_kv_offload;
+            n_attn_tried++;
         } else if (mv < 0.97) {
             // step the ubatch
             const auto & ubs = opts.ubatch_options;
@@ -773,8 +795,8 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         }
     }
 
-    LOG_INF("%s: annealing: %d accepted of %d, %d single-tensor moves, %d layer re-homes, %d drafting toggles and %d offload threshold steps proposed, %d model improvements over the seed\n", __func__,
-        accepted, iters, n_single_tried, n_rehome_tried, n_mtp_tried, n_offload_tried, n_improvements);
+    LOG_INF("%s: annealing: %d accepted of %d, %d single-tensor moves, %d layer re-homes, %d drafting toggles, %d offload threshold steps and %d attention toggles proposed, %d model improvements over the seed\n", __func__,
+        accepted, iters, n_single_tried, n_rehome_tried, n_mtp_tried, n_offload_tried, n_attn_tried, n_improvements);
     GGML_UNUSED(n_single_accepted);
 
     // fill: from the incumbent, add every CPU-resident tensor that the model says pays for itself, best gain per byte

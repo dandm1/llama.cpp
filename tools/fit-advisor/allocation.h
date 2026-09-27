@@ -25,6 +25,8 @@ struct fit_advisor_allocation {
     uint32_t n_slots  = 1;
     uint32_t n_ubatch = 0; // 0 = the base parameters' ubatch
     bool     draft_mtp = false; // MTP drafting on: the MTP layers are part of the allocation and the draft context exists
+    int8_t   flash_attn = -1;   // -1 auto (llama.cpp decides), 0 off, 1 on; changes the attention path and the compute buffer
+    bool     no_kv_offload = false; // the whole KV cache in host memory, attention on the CPU
     // op offload threshold per device (index), 0 = the device's default, LLAMA_OP_OFFLOAD_NEVER = it never takes CPU
     // weights; empty = defaults everywhere. a device that declines leaves its layers' offloads to the first willing one
     std::vector<int32_t> op_offload_min_batch_dev;
