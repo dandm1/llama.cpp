@@ -2043,10 +2043,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
-        if (debug_prefetch > 1 && split_id < 60) {
-            GGML_LOG_WARN("sched: split %3d on %-6s nodes %3d inputs %2d host-weights %d prefetched %d first %-20s host %.1f ms\n",
+        if (debug_prefetch > 1) {
+            const struct ggml_tensor * n0 = split->graph.n_nodes > 0 ? split->graph.nodes[0] : NULL;
+            GGML_LOG_WARN("sched: split %3d on %-6s nodes %3d inputs %2d host-weights %d prefetched %d first %-12s %-28s src0 %-28s host %.1f ms\n",
                 split_id, ggml_backend_name(split_backend), split->graph.n_nodes, split->n_inputs, n_eligible, n_pref,
-                split->graph.n_nodes > 0 ? ggml_op_desc(split->graph.nodes[0]) : "-", (ggml_time_us() - t_split0) / 1000.0);
+                n0 ? ggml_op_desc(n0) : "-", n0 ? ggml_get_name(n0) : "-", n0 && n0->src[0] ? ggml_get_name(n0->src[0]) : "-",
+                (ggml_time_us() - t_split0) / 1000.0);
         }
 
         // with this split's compute enqueued, start the weight copies of upcoming splits on other backends: the first
