@@ -81,41 +81,15 @@ std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common
             ret.push_back({ "LLAMA_ARG_LOAD_MODE", "none", "--load-mode none" });
         }
     }
-    {
-        // the device list: what the user gave (or every non-CPU device), minus the devices the candidate leaves empty
-        std::vector<ggml_backend_dev_t> devs = params.devices;
-        if (devs.empty()) {
-            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    devs.push_back(dev);
-                }
-            }
-        }
+    if (!params.devices.empty()) {
         std::string v;
-        size_t n_dropped = 0;
-        for (ggml_backend_dev_t dev : devs) {
-            ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
-            const bool unused = buft && std::find(cand.unused_bufts.begin(), cand.unused_bufts.end(), ggml_backend_buft_name(buft)) != cand.unused_bufts.end();
-            if (unused) {
-                n_dropped++;
-                continue;
+        for (ggml_backend_dev_t dev : params.devices) {
+            if (dev == nullptr) {
+                continue; // the list is NULL-terminated for the C API
             }
             v += (v.empty() ? "" : ",") + std::string(ggml_backend_dev_name(dev));
         }
-        if ((!params.devices.empty() || n_dropped > 0) && !v.empty()) {
-            ret.push_back({ "LLAMA_ARG_DEVICE", v, "-dev " + v });
-        }
-    }
-    {
-        // the candidate's thresholds, else the user's; all-default needs no flag
-        std::string v = cand.op_offload_str();
-        if (v.empty() && (params.op_offload_min_batch > 0 || !params.op_offload_min_batch_dev.empty())) {
-            v = common_op_offload_min_batch_to_str(params.op_offload_min_batch, params.op_offload_min_batch_dev);
-        }
-        if (!v.empty() && v != "default") {
-            ret.push_back({ "LLAMA_ARG_OP_OFFLOAD_MIN_BATCH", v, "--op-offload-min-batch " + v });
-        }
+        ret.push_back({ "LLAMA_ARG_DEVICE", v, "-dev " + v });
     }
     std::vector<common_speculative_type> types;
     for (const auto t : params.speculative.types) {
