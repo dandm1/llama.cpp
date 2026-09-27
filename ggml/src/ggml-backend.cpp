@@ -1774,6 +1774,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // nothing once a batch is large enough to touch (nearly) every expert. controlled by GGML_SCHED_PREFETCH (0 off)
     const bool prefetch_enabled = sched->weight_prefetch;
     std::vector<std::vector<uint8_t>> prefetched(sched->n_splits);
+
+    // GGML_SCHED_DEBUG_PREFETCH=1: account for where the host thread spends its time in this function
+    static const int debug_prefetch = getenv("GGML_SCHED_DEBUG_PREFETCH") ? atoi(getenv("GGML_SCHED_DEBUG_PREFETCH")) : 0;
+    const int64_t t_begin = ggml_time_us();
+    int64_t t_prefetch = 0, t_ids = 0, t_copy = 0, t_compute = 0;
+    int     n_prefetch = 0, n_ids = 0;
+    size_t  bytes_prefetch = 0, bytes_ids = 0;
     auto is_prefetched = [&](int split_id, int input_id) {
         return (size_t) input_id < prefetched[split_id].size() && prefetched[split_id][input_id];
     };
@@ -1817,7 +1824,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             } else {
                 ggml_backend_synchronize(backend);
             }
+            const int64_t t0 = ggml_time_us();
             ggml_backend_tensor_set_async(backend, input_cpy, input->data, 0, ggml_nbytes(input));
+            t_prefetch += ggml_time_us() - t0;
+            n_prefetch++;
+            bytes_prefetch += ggml_nbytes(input);
             if (prefetched[target_id].size() <= (size_t) input_id) {
                 prefetched[target_id].resize(split->n_inputs, 0);
             }
@@ -1879,6 +1890,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
+                    const int64_t t_ids0 = ggml_time_us();
+                    n_ids++;
                     ggml_backend_synchronize(input_backend);
 
                     // get the ids
@@ -1922,6 +1935,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                        bytes_ids += expert_size_copy;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
@@ -1956,9 +1970,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+                    t_ids += ggml_time_us() - t_ids0;
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+                    const int64_t t_copy0 = ggml_time_us();
+                    struct scope_timer { int64_t & acc; int64_t t0; ~scope_timer() { acc += ggml_time_us() - t0; } } copy_timer{ t_copy, t_copy0 };
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1973,7 +1990,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            const int64_t t_c0 = ggml_time_us();
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            t_compute += ggml_time_us() - t_c0;
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -2035,6 +2054,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (debug_prefetch && (bytes_prefetch + bytes_ids) > 0) {
+        GGML_LOG_INFO("sched: %d splits, host thread %.1f ms: prefetch %d inputs %.0f MB in %.1f ms, ids-path %d inputs %.0f MB in %.1f ms, other copies %.1f ms, compute enqueue %.1f ms\n",
+            sched->n_splits, (ggml_time_us() - t_begin) / 1000.0, n_prefetch, bytes_prefetch / 1e6, t_prefetch / 1000.0,
+            n_ids, bytes_ids / 1e6, t_ids / 1000.0, t_copy / 1000.0, t_compute / 1000.0);
     }
 
     return GGML_STATUS_SUCCESS;
