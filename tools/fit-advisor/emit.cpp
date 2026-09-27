@@ -98,7 +98,7 @@ std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common
     }
     std::vector<common_speculative_type> types;
     for (const auto t : params.speculative.types) {
-        if (t != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+        if (t != COMMON_SPECULATIVE_TYPE_DRAFT_MTP && t != COMMON_SPECULATIVE_TYPE_NONE) {
             types.push_back(t);
         }
     }
