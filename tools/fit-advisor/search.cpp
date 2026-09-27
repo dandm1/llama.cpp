@@ -49,12 +49,29 @@ std::string cell_key(const std::vector<uint32_t> & part, uint32_t ub, uint32_t s
     return k + "ub" + std::to_string(ub) + "/np" + std::to_string(slots);
 }
 
+// the key of a state: its cell plus any explicit layer homes, which change the KV and compute of the devices
+std::string alloc_key(const fit_advisor_allocation & a) {
+    std::string ret = alloc_key(a);
+    for (const auto & [il, dev] : a.layer_home) {
+        ret += "|" + std::to_string(il) + "=" + std::to_string(dev);
+    }
+    return ret;
+}
+
 std::string cell_name(const std::vector<uint32_t> & part, uint32_t ub, uint32_t slots) {
     std::string n = "search";
     for (size_t d = 0; d < part.size(); d++) {
         n += (d ? "/" : "-") + std::to_string(part[d]);
     }
     return n + "-ub" + std::to_string(ub) + "-np" + std::to_string(slots);
+}
+
+std::string alloc_name(const fit_advisor_allocation & a) {
+    std::string ret = cell_name(a.layers_per_device, a.n_ubatch, a.n_slots);
+    for (const auto & [il, dev] : a.layer_home) {
+        ret += "-L" + std::to_string(il) + (dev < 0 ? "cpu" : std::to_string(dev));
+    }
+    return ret;
 }
 
 struct searcher {
@@ -104,7 +121,7 @@ struct searcher {
                 e.free.push_back(pj.devices[d].free);
                 e.margin.push_back(pj.devices[d].margin);
             }
-            mem.by_key[cell_key(a.layers_per_device, a.n_ubatch, a.n_slots)] = e;
+            mem.by_key[alloc_key(a)] = e;
         }
         return pj;
     }
@@ -112,7 +129,7 @@ struct searcher {
     // linear memory model: weights on each device plus the probed overhead for the key; returns the over-budget bytes
     // per device (negative = room), or false if the key was never probed
     bool memory_over(const fit_advisor_allocation & a, const fit_advisor_workload & wl, std::vector<int64_t> & over) const {
-        const auto it = mem.by_key.find(cell_key(a.layers_per_device, a.n_ubatch, a.n_slots));
+        const auto it = mem.by_key.find(alloc_key(a));
         if (it == mem.by_key.end() || !it->second.ok) {
             return false;
         }
@@ -490,7 +507,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     cur.alloc = best_cell.alloc;
     cur.wl    = S.workload(best_ub);
     std::map<std::string, fit_advisor_projection> proj_by_key; // last probe per key, for the cost model's KV figures
-    proj_by_key[cell_key(cur.alloc.layers_per_device, cur.alloc.n_ubatch, cur.alloc.n_slots)] = best_cell.proj;
+    proj_by_key[alloc_key(cur.alloc)] = best_cell.proj;
     if (!S.evaluate(cur, best_cell.proj)) {
         LOG_WRN("%s: cannot evaluate the seed\n", __func__);
         best.n_probes = S.n_probes;
@@ -502,7 +519,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     bool best_seen_dirty = false;
     {
         // what the linear memory model holds for the seed's key, against the seed's own projection
-        const std::string key0 = cell_key(cur.alloc.layers_per_device, cur.alloc.n_ubatch, cur.alloc.n_slots);
+        const std::string key0 = alloc_key(cur.alloc);
         const auto it = S.mem.by_key.find(key0);
         std::vector<int64_t> over;
         S.memory_over(cur.alloc, cur.wl, over);
@@ -520,7 +537,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     std::vector<searcher::group> movable;
     std::vector<size_t> singles;
     {
-        fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, cur.alloc.layers_per_device, opts.n_ctx, cur.alloc.n_slots);
+        fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, cur.alloc.layers_per_device, opts.n_ctx, cur.alloc.n_slots, cur.alloc.layer_home);
         for (const auto & g : S.build_groups(cur.wl)) {
             const int h = home.tensor_device[g.idx[0]];
             if (h >= 0 && S.group_gain(g, h, cur.wl, cur.alloc.n_slots) > 0) {
@@ -565,19 +582,19 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             if (inv.tensors[i].nbytes < (size_t) UNIT && uni(rng) < 0.8) {
                 i = singles[(size_t) (uni(rng) * singles.size()) % singles.size()];
             }
-            fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots);
+            fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots, nxt.alloc.layer_home);
             nxt.alloc.tensor_device[i] = nxt.alloc.tensor_device[i] == fit_advisor_allocation::DEV_CPU ? home.tensor_device[i] : fit_advisor_allocation::DEV_CPU;
             n_single_tried++;
         } else if (mv < 0.55) {
             // toggle one group between its home and the CPU
             const searcher::group & g = movable[(size_t) (uni(rng) * movable.size()) % movable.size()];
-            fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots);
+            fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots, nxt.alloc.layer_home);
             const int h = home.tensor_device[g.idx[0]];
             set_group(nxt.alloc, g, nxt.alloc.tensor_device[g.idx[0]] == fit_advisor_allocation::DEV_CPU ? h : fit_advisor_allocation::DEV_CPU);
         } else if (mv < 0.85) {
             // swap one on-device group with one CPU group of the same home
             std::vector<size_t> on, off;
-            fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots);
+            fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots, nxt.alloc.layer_home);
             const int d = (int) ((size_t) (uni(rng) * nd) % nd);
             for (size_t k = 0; k < movable.size(); k++) {
                 if (home.tensor_device[movable[k].idx[0]] != d) continue;
@@ -594,13 +611,27 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             if (to_right ? part[d] == 0 : part[d + 1] <= 1) continue; // keep the output layer with the last device
             if (to_right) { part[d]--; part[d + 1]++; } else { part[d]++; part[d + 1]--; }
             // tensors keep their on/off status relative to their (new) home
-            fit_advisor_allocation old_home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots);
-            fit_advisor_allocation new_home = fit_advisor_allocation::from_layer_split(inv, device_bufts, part, opts.n_ctx, nxt.alloc.n_slots);
+            fit_advisor_allocation old_home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots, nxt.alloc.layer_home);
+            fit_advisor_allocation new_home = fit_advisor_allocation::from_layer_split(inv, device_bufts, part, opts.n_ctx, nxt.alloc.n_slots, nxt.alloc.layer_home);
             for (size_t i = 0; i < inv.tensors.size(); i++) {
                 const bool on_home = nxt.alloc.tensor_device[i] == old_home.tensor_device[i];
                 nxt.alloc.tensor_device[i] = on_home ? new_home.tensor_device[i] : fit_advisor_allocation::DEV_CPU;
             }
             nxt.alloc.layers_per_device = part;
+        } else if (mv < 0.955 && nd > 1) {
+            // re-home one whole layer on another device: its KV cache, state and pinned ops go with it (-old).
+            // MTP layers and the output layer sit at the end of the numbering, so they get half the draws
+            const uint32_t n_layer_all = S.n_layer_all;
+            uint32_t il;
+            if (uni(rng) < 0.5) {
+                il = inv.n_layer + (uint32_t) (uni(rng) * (inv.n_layer_nextn + 1)) % (inv.n_layer_nextn + 1); // an MTP layer or the output
+            } else {
+                il = (uint32_t) (uni(rng) * (n_layer_all + 1)) % (n_layer_all + 1);
+            }
+            const int h = nxt.alloc.layer_device(il, n_layer_all);
+            if (h == fit_advisor_allocation::DEV_CPU) continue; // the leading CPU block is the partition's business
+            const int d = (int) ((h + 1 + (size_t) (uni(rng) * (nd - 1)) % (nd - 1)) % nd);
+            nxt.alloc = nxt.alloc.with_layer_home(inv, il, d);
         } else if (mv < 0.97) {
             // step the ubatch
             const auto & ubs = opts.ubatch_options;
@@ -619,9 +650,9 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         }
 
         // a key never probed needs one probe for its overheads
-        const std::string key = cell_key(nxt.alloc.layers_per_device, nxt.alloc.n_ubatch, nxt.alloc.n_slots);
+        const std::string key = alloc_key(nxt.alloc);
         if (!proj_by_key.count(key)) {
-            const fit_advisor_projection & pj = S.probe_alloc(nxt.alloc, cell_name(nxt.alloc.layers_per_device, nxt.alloc.n_ubatch, nxt.alloc.n_slots));
+            const fit_advisor_projection & pj = S.probe_alloc(nxt.alloc, alloc_name(nxt.alloc));
             if (!pj.ok) continue;
             proj_by_key[key] = pj;
         }
@@ -667,8 +698,8 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         }
         // verify the best state with the real loader at most every 200 iterations, or when the walk is nearly done
         if (best_seen_dirty && (it - last_probe_iter >= 200 || it == iters - 1)) {
-            const std::string bkey = cell_key(best_seen.alloc.layers_per_device, best_seen.alloc.n_ubatch, best_seen.alloc.n_slots);
-            const fit_advisor_projection & pj = S.probe_alloc(best_seen.alloc, cell_name(best_seen.alloc.layers_per_device, best_seen.alloc.n_ubatch, best_seen.alloc.n_slots));
+            const std::string bkey = alloc_key(best_seen.alloc);
+            const fit_advisor_projection & pj = S.probe_alloc(best_seen.alloc, alloc_name(best_seen.alloc));
             last_probe_iter = it;
             best_seen_dirty = false;
             proj_by_key[bkey] = pj;
@@ -698,7 +729,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     // first, while the memory model has room; the probe verifies the result below
     {
         searcher::state st = incumbent;
-        fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, st.alloc.layers_per_device, opts.n_ctx, st.alloc.n_slots);
+        fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, st.alloc.layers_per_device, opts.n_ctx, st.alloc.n_slots, st.alloc.layer_home);
         struct cand { size_t i; double density; };
         std::vector<cand> cands;
         // every CPU-resident single is tried, whatever its weight-only gain: the full model with the excursion cost
@@ -710,7 +741,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         }
         std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.density > b.density; });
         int n_filled = 0;
-        const std::string fkey = cell_key(st.alloc.layers_per_device, st.alloc.n_ubatch, st.alloc.n_slots);
+        const std::string fkey = alloc_key(st.alloc);
         for (const cand & c : cands) {
             searcher::state nxt = st;
             nxt.alloc.tensor_device[c.i] = home.tensor_device[c.i];
@@ -734,7 +765,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
 
     // final verification of the incumbent
     {
-        const fit_advisor_projection & pj = S.probe_alloc(incumbent.alloc, cell_name(incumbent.alloc.layers_per_device, incumbent.alloc.n_ubatch, incumbent.alloc.n_slots));
+        const fit_advisor_projection & pj = S.probe_alloc(incumbent.alloc, alloc_name(incumbent.alloc));
         if (pj.ok && pj.fits_all()) {
             incumbent_proj = pj;
         } else {
@@ -746,7 +777,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     }
 
     best.ok    = true;
-    best.name  = cell_name(incumbent.alloc.layers_per_device, incumbent.alloc.n_ubatch, incumbent.alloc.n_slots);
+    best.name  = alloc_name(incumbent.alloc);
     best.alloc = incumbent.alloc;
     best.wl    = incumbent.wl;
     best.proj  = incumbent_proj;

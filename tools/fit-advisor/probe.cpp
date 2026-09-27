@@ -26,7 +26,31 @@ std::string fit_advisor_candidate::key() const {
     if (!ot.empty()) {
         ss << " ot=" << ot;
     }
+    if (!layer_devices.empty()) {
+        ss << " old=" << layer_devices;
+    }
     return ss.str();
+}
+
+std::string fit_advisor_candidate::layer_devices_cli() const {
+    std::string ret;
+    for (const auto & item : string_split<std::string>(layer_devices, ',')) {
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        std::string dname = item.substr(eq + 1);
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+            if (buft && dname == ggml_backend_buft_name(buft)) {
+                dname = ggml_backend_dev_name(dev);
+                break;
+            }
+        }
+        ret += (ret.empty() ? "" : ",") + item.substr(0, eq + 1) + dname;
+    }
+    return ret;
 }
 
 std::string fit_advisor_candidate::overrides_str() const {
@@ -220,6 +244,14 @@ bool fit_advisor_apply_candidate(common_params & p, const fit_advisor_candidate 
         p.tensor_buft_overrides.push_back({ patterns.back().c_str(), b->second });
     }
     p.tensor_buft_overrides.push_back({ nullptr, nullptr });
+
+    // whole-layer homes: the candidate names buffer types, the loader wants devices
+    p.layer_dev_overrides.clear();
+    if (!cand.layer_devices.empty()) {
+        if (!common_parse_layer_dev_overrides(cand.layer_devices_cli(), p.layer_dev_overrides, error)) {
+            return false;
+        }
+    }
     return true;
 }
 

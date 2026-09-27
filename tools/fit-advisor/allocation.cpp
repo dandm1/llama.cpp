@@ -11,6 +11,35 @@
 #include <set>
 
 int fit_advisor_allocation::layer_device(uint32_t il, uint32_t n_layer_all) const {
+    const auto it = layer_home.find(il);
+    if (it != layer_home.end()) {
+        return it->second;
+    }
+    return layer_device_natural(il, n_layer_all);
+}
+
+fit_advisor_allocation fit_advisor_allocation::with_layer_home(const fit_advisor_inventory & inv, uint32_t il, int dev) const {
+    fit_advisor_allocation a = *this;
+    const uint32_t n_layer_all = inv.n_layer + inv.n_layer_nextn;
+    const int old_home = layer_device(il, n_layer_all);
+    if (dev == layer_device_natural(il, n_layer_all)) {
+        a.layer_home.erase(il); // back to what -ngl / -ts give, keep the description canonical
+    } else {
+        a.layer_home[il] = dev;
+    }
+    for (size_t i = 0; i < inv.tensors.size() && i < a.tensor_device.size(); i++) {
+        const auto & t = inv.tensors[i];
+        const bool of_layer = il == n_layer_all
+            ? (t.kind == FIT_ADVISOR_TENSOR_OUTPUT || t.kind == FIT_ADVISOR_TENSOR_GLOBAL)
+            : t.layer == (int32_t) il;
+        if (of_layer && a.tensor_device[i] == old_home) {
+            a.tensor_device[i] = dev;
+        }
+    }
+    return a;
+}
+
+int fit_advisor_allocation::layer_device_natural(uint32_t il, uint32_t n_layer_all) const {
     const int32_t ngl = n_gpu_layers();
     const int64_t i_gpu_start = (int64_t) n_layer_all + 1 - ngl;
     if ((int64_t) il < i_gpu_start) {
@@ -36,12 +65,14 @@ int32_t fit_advisor_allocation::n_gpu_layers() const {
 }
 
 fit_advisor_allocation fit_advisor_allocation::from_layer_split(const fit_advisor_inventory & inv, const std::vector<std::string> & device_bufts,
-                                                                const std::vector<uint32_t> & layers_per_device, uint32_t n_ctx, uint32_t n_slots) {
+                                                                const std::vector<uint32_t> & layers_per_device, uint32_t n_ctx, uint32_t n_slots,
+                                                                const std::map<uint32_t, int> & layer_home) {
     fit_advisor_allocation a;
     a.n_ctx   = n_ctx;
     a.n_slots = n_slots;
     a.layers_per_device = layers_per_device;
     a.layers_per_device.resize(device_bufts.size(), 0);
+    a.layer_home = layer_home;
 
     const uint32_t n_layer_all = inv.n_layer + inv.n_layer_nextn;
     a.tensor_device.resize(inv.tensors.size());
@@ -102,6 +133,11 @@ fit_advisor_candidate fit_advisor_allocation::to_candidate(const fit_advisor_inv
     auto buft_name = [&](int dev) -> std::string {
         return dev == DEV_CPU ? "CPU" : device_bufts.at(dev);
     };
+
+    // -old for the layers with an explicit home
+    for (const auto & [il, dev] : layer_home) {
+        c.layer_devices += (c.layer_devices.empty() ? "" : ",") + (il == n_layer_all ? std::string("output") : std::to_string(il)) + "=" + buft_name(dev);
+    }
 
     for (const auto & [key, layers] : groups) {
         std::string alt;

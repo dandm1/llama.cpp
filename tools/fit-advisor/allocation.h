@@ -14,6 +14,7 @@
 #include "probe.h"
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -31,14 +32,24 @@ struct fit_advisor_allocation {
     // device of each inventory tensor, DEV_CPU or an index into the device list
     std::vector<int> tensor_device;
 
+    // layers whose home is chosen explicitly (-old): il -> device index or DEV_CPU; il == n_layer_all is the output
+    // layer. the KV cache, recurrent state and pinned ops of the layer follow its home, tensors default to it
+    std::map<uint32_t, int> layer_home;
+
     // device index for a layer, DEV_CPU for the leading CPU block; il == n_layer_all is the output layer
     int layer_device(uint32_t il, uint32_t n_layer_all) const;
+    // the same without the explicit homes, i.e. what -ngl and -ts alone give
+    int layer_device_natural(uint32_t il, uint32_t n_layer_all) const;
+
+    // this allocation with layer il re-homed to dev: tensors of the layer that sat on the old home move with it
+    fit_advisor_allocation with_layer_home(const fit_advisor_inventory & inv, uint32_t il, int dev) const;
 
     int32_t n_gpu_layers() const;
 
     // an allocation with all layers on the devices in the given proportions and every tensor following its layer
     static fit_advisor_allocation from_layer_split(const fit_advisor_inventory & inv, const std::vector<std::string> & device_bufts,
-                                                   const std::vector<uint32_t> & layers_per_device, uint32_t n_ctx, uint32_t n_slots);
+                                                   const std::vector<uint32_t> & layers_per_device, uint32_t n_ctx, uint32_t n_slots,
+                                                   const std::map<uint32_t, int> & layer_home = {});
 
     // loader arguments that reproduce this allocation
     // device_bufts: buffer type name of each device in device order, e.g. {"CUDA0", "CUDA1"}

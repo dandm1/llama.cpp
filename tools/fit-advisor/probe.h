@@ -25,12 +25,16 @@ struct fit_advisor_candidate {
     uint32_t n_ubatch     = 0;              // 0: the base parameters' ubatch
     std::vector<float> tensor_split;        // empty: default split
     std::vector<fit_advisor_override> overrides;
+    std::string layer_devices;              // -old spec with buffer type names ("47=CUDA0,output=CUDA0"), empty for none
 
     // canonical description used for memoization and display
     std::string key() const;
 
     // the value of an equivalent -ot argument, empty if there are no overrides
     std::string overrides_str() const;
+
+    // the value of an equivalent -old argument: layer_devices with device names instead of buffer type names
+    std::string layer_devices_cli() const;
 };
 
 struct fit_advisor_device_projection {

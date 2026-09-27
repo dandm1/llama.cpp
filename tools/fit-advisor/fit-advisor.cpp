@@ -128,6 +128,15 @@ static fit_advisor_candidate user_candidate(const common_params & params) {
             c.overrides.push_back({ o.pattern, ggml_backend_buft_name(o.buft) });
         }
     }
+    // -old as given, translated to buffer type names like the rest of the candidate
+    for (const auto & o : params.layer_dev_overrides) {
+        if (o.il == -1) {
+            break;
+        }
+        ggml_backend_buffer_type_t buft = o.dev ? ggml_backend_dev_buffer_type(o.dev) : nullptr;
+        c.layer_devices += (c.layer_devices.empty() ? "" : ",") + (o.il == LLAMA_LAYER_OUTPUT ? std::string("output") : std::to_string(o.il))
+                         + "=" + (buft ? ggml_backend_buft_name(buft) : "CPU");
+    }
     return c;
 }
 
@@ -204,6 +213,9 @@ static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_ad
         }
         if (!c.overrides.empty()) {
             args += " -ot \"" + c.overrides_str() + "\"";
+        }
+        if (!c.layer_devices.empty()) {
+            args += " -old " + c.layer_devices_cli();
         }
         args += passthrough_cli;
         printf("  %-16s %s\n", c.name.c_str(), args.c_str());
@@ -408,6 +420,7 @@ static fit_advisor_search_result search_and_report(const common_params & params,
             for (size_t i = 0; i < c.tensor_split.size(); i++) args += (i ? "/" : "") + std::to_string((long long) std::llround(c.tensor_split[i]));
         }
         if (!c.overrides.empty()) args += " -ot \"" + c.overrides_str() + "\"";
+        if (!c.layer_devices.empty()) args += " -old " + c.layer_devices_cli();
         args += fit_advisor_passthrough_cli(params);
         printf("  args: %s\n", args.c_str());
     }
@@ -426,6 +439,13 @@ int llama_fit_advisor(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+
+    // the op offload threshold is a device setting; apply it before anything reads it (measurements, probes)
+    if (params.op_offload_min_batch > 0) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_set_op_offload_min_batch(ggml_backend_dev_get(i), params.op_offload_min_batch);
+        }
+    }
 
     fit_advisor_inventory inv;
     try {

@@ -76,6 +76,10 @@ std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common
         }
         ret.push_back({ "LLAMA_ARG_DEVICE", v, "-dev " + v });
     }
+    if (params.op_offload_min_batch > 0) {
+        const std::string v = std::to_string(params.op_offload_min_batch);
+        ret.push_back({ "LLAMA_ARG_OP_OFFLOAD_MIN_BATCH", v, "--op-offload-min-batch " + v });
+    }
     if (!params.speculative.types.empty()) {
         std::string v;
         for (const auto t : params.speculative.types) {
@@ -126,6 +130,9 @@ fit_advisor_emit_result fit_advisor_emit_ini(const std::string & path, const std
     }
     if (!cand.overrides.empty()) {
         kv.push_back({ "LLAMA_ARG_OVERRIDE_TENSOR", cand.overrides_str() });
+    }
+    if (!cand.layer_devices.empty()) {
+        kv.push_back({ "LLAMA_ARG_OVERRIDE_LAYER_DEVICE", cand.layer_devices_cli() });
     }
     if (cand.n_ubatch > 0) {
         kv.push_back({ "LLAMA_ARG_UBATCH", std::to_string(cand.n_ubatch) });
