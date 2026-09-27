@@ -1826,7 +1826,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         coverage = n_expert > 0 ? 1.0 - pow(1.0 - n_used / n_expert, n_tokens) : 0.0;
         return true;
     };
-    // returns true when at least one input was prefetched
+    // returns true when the split has slot-resident inputs (whether copied now or already on their way), so that
+    // the caller does not move on to a later group on the same backend, which would reuse the slot
     auto prefetch_split_inputs = [&](int target_id) {
         struct ggml_backend_sched_split * split = &splits[target_id];
         const int backend_id = split->backend_id;
@@ -1835,6 +1836,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             struct ggml_tensor * input = split->inputs[input_id];
             if (!ggml_backend_sched_weight_slot_eligible(sched, split, input)) {
+                continue;
+            }
+            if (is_prefetched(target_id, input_id)) {
+                any = true; // issued in an earlier iteration whose window already reached this split
                 continue;
             }
             struct ggml_tensor * input_cpy = tensor_copy(input, backend_id, sched->cur_copy);
