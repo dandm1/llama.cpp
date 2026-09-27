@@ -1710,11 +1710,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     if (params.layer_dev_overrides.empty()) {
         mparams.layer_dev_overrides = NULL;
     } else {
-        // the API wants a terminated array; keep a terminated copy alive for the life of the process
-        static std::vector<llama_model_layer_dev_override> terminated;
-        terminated = params.layer_dev_overrides;
-        terminated.push_back({ -1, nullptr });
-        mparams.layer_dev_overrides = terminated.data();
+        GGML_ASSERT(params.layer_dev_overrides.back().il == -1 && "Layer device overrides not terminated with il == -1");
+        mparams.layer_dev_overrides = params.layer_dev_overrides.data();
     }
 
     mparams.progress_callback           = params.load_progress_callback;
@@ -2376,6 +2373,14 @@ void common_prompt_checkpoint::clear_dft() {
 //
 
 bool common_parse_layer_dev_overrides(const std::string & value, std::vector<llama_model_layer_dev_override> & out, std::string & error) {
+    // the vector carries its terminator (il == -1) like the tensor buffer overrides carry theirs; strip it, append, restore
+    if (!out.empty() && out.back().il == -1) {
+        out.pop_back();
+    }
+    struct restore_terminator {
+        std::vector<llama_model_layer_dev_override> & v;
+        ~restore_terminator() { if (!v.empty()) { v.push_back({ -1, nullptr }); } }
+    } guard{ out };
     for (const auto & item : string_split<std::string>(value, ',')) {
         if (item.empty()) {
             continue;

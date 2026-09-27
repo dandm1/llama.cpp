@@ -539,7 +539,7 @@ struct common_params {
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
-    std::vector<llama_model_layer_dev_override>   layer_dev_overrides;   // layers with an explicit device (-old), unterminated
+    std::vector<llama_model_layer_dev_override>   layer_dev_overrides;   // layers with an explicit device (-old), terminated with il == -1 when non-empty
     int32_t op_offload_min_batch = 0; // batch size from which devices take ops on CPU-resident weights, 0 = backend default
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
