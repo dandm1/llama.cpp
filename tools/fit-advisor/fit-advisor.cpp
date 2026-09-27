@@ -409,6 +409,10 @@ static fit_advisor_search_result search_and_report(const common_params & params,
             printf("    %-12s layers %s\n", fit_advisor_tensor_kind_name(kind), ranges.c_str());
         }
     }
+    for (const auto & [il, dev] : sr.alloc.layer_home) {
+        printf("  layer %s re-homed to %s (-old): its KV cache and state go with it\n",
+            il == n_layer_all ? "output" : std::to_string(il).c_str(), dev < 0 ? "CPU" : device_bufts[dev].c_str());
+    }
     {
         const fit_advisor_candidate & c = sr.cand;
         std::string args = "-c " + std::to_string(c.n_ctx) + " -np " + std::to_string(c.n_slots) + " -ngl " + std::to_string(c.n_gpu_layers);

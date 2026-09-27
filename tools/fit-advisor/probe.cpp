@@ -347,6 +347,48 @@ fit_advisor_graph_profile fit_advisor_probe::graph_profile(uint32_t n_layer_all,
         record_uses(gf, index_by_name, gp.use_pp);
     }
     llama_free(ctx);
+
+    // with MTP drafting the NextN layer(s) run in their own context and graph; profile that graph too, attributing
+    // every node to the MTP layers (its embedding and head ops are part of the draft run), and record what it reads
+    const uint32_t n_layer_nextn = (uint32_t) llama_model_n_layer_nextn(model);
+    const bool spec_mtp = std::find(p.speculative.types.begin(), p.speculative.types.end(),
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != p.speculative.types.end();
+    if (spec_mtp && n_layer_nextn > 0 && n_layer_all > n_layer_nextn) {
+        const uint32_t n_layer = n_layer_all - n_layer_nextn;
+        common_params p_dft = common_base_params_to_speculative(p);
+        llama_context_params cparams_dft = common_context_params_to_llama(p_dft);
+        cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams_dft.n_rs_seq = 0;
+        cparams_dft.n_ctx    = cparams.n_ctx;
+        if (llama_context * ctx_mtp = llama_init_from_model(model, cparams_dft)) {
+            auto profile_mtp = [&](ggml_cgraph * gf, std::vector<uint32_t> & per_layer, std::vector<fit_advisor_tensor_use> & uses) {
+                std::vector<uint32_t> ops;
+                uint32_t global = 0, n_nodes = 0;
+                count_ops(gf, n_layer_all, ops, global, n_nodes);
+                per_layer.resize(n_layer_all, 0);
+                for (uint32_t il = n_layer; il < n_layer_all && il < ops.size(); il++) {
+                    per_layer[il] += ops[il];
+                }
+                per_layer[n_layer] += global; // the draft graph's own embedding, norm and head ops
+                std::vector<fit_advisor_tensor_use> mtp_uses(uses.size());
+                record_uses(gf, index_by_name, mtp_uses);
+                for (size_t i = 0; i < uses.size(); i++) {
+                    if (uses[i].op == 0 && mtp_uses[i].op != 0) {
+                        uses[i] = mtp_uses[i]; // tensors only the draft graph reads: the MTP layers' own
+                    }
+                }
+            };
+            if (ggml_cgraph * gf = llama_graph_reserve(ctx_mtp, 1, 1, 1)) {
+                profile_mtp(gf, gp.ops_per_layer_tg, gp.use_tg);
+            }
+            if (ggml_cgraph * gf = llama_graph_reserve(ctx_mtp, gp.n_batch_pp, 1, gp.n_batch_pp)) {
+                profile_mtp(gf, gp.ops_per_layer_pp, gp.use_pp);
+            }
+            llama_free(ctx_mtp);
+        } else {
+            LOG_WRN("%s: could not create the MTP draft context, the MTP layers are priced as unused\n", __func__);
+        }
+    }
     llama_model_free(model);
     gp.ok = gp.n_nodes_tg > 0;
     return gp;

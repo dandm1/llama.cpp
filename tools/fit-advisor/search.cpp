@@ -561,7 +561,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     };
 
     int n_improvements = 0;
-    int n_single_tried = 0, n_single_accepted = 0;
+    int n_single_tried = 0, n_single_accepted = 0, n_rehome_tried = 0;
     const char * trace_tensor = getenv("FIT_ADVISOR_TRACE"); // substring of a tensor name whose moves are logged
     const double T0 = std::max(1.0, 0.005 * std::fabs(cur.cost_score));
     const double T1 = std::max(0.01, 0.00002 * std::fabs(cur.cost_score));
@@ -632,6 +632,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             if (h == fit_advisor_allocation::DEV_CPU) continue; // the leading CPU block is the partition's business
             const int d = (int) ((h + 1 + (size_t) (uni(rng) * (nd - 1)) % (nd - 1)) % nd);
             nxt.alloc = nxt.alloc.with_layer_home(inv, il, d);
+            n_rehome_tried++;
         } else if (mv < 0.97) {
             // step the ubatch
             const auto & ubs = opts.ubatch_options;
@@ -721,8 +722,8 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         }
     }
 
-    LOG_INF("%s: annealing: %d accepted of %d, %d single-tensor moves proposed, %d model improvements over the seed\n", __func__,
-        accepted, iters, n_single_tried, n_improvements);
+    LOG_INF("%s: annealing: %d accepted of %d, %d single-tensor moves and %d layer re-homes proposed, %d model improvements over the seed\n", __func__,
+        accepted, iters, n_single_tried, n_rehome_tried, n_improvements);
     GGML_UNUSED(n_single_accepted);
 
     // fill: from the incumbent, add every CPU-resident tensor that the model says pays for itself, best gain per byte
