@@ -1711,10 +1711,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         coverage = n_expert > 0 ? 1.0 - pow(1.0 - n_used / n_expert, n_tokens) : 0.0;
         return true;
     };
+    // returns true when at least one input was prefetched
     auto prefetch_split_inputs = [&](int target_id) {
         struct ggml_backend_sched_split * split = &splits[target_id];
         const int backend_id = split->backend_id;
         ggml_backend_t backend = sched->backends[backend_id];
+        bool any = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             struct ggml_tensor * input = split->inputs[input_id];
             if ((input->flags & GGML_TENSOR_FLAG_INPUT) || input->buffer == NULL ||
@@ -1738,7 +1740,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 prefetched[target_id].resize(split->n_inputs, 0);
             }
             prefetched[target_id][input_id] = 1;
+            any = true;
         }
+        return any;
     };
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -1930,19 +1934,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
-        // with this split's compute enqueued, start the weight copies of the next splits that run on other backends:
-        // at most one split per backend so that a backend's own copies never queue ahead of its pending compute
+        // with this split's compute enqueued, start the weight copies of upcoming splits on other backends: the first
+        // split with host weights on each other backend within the window (a layer's attention split usually
+        // precedes its expert split on the same backend), at most one such split per backend so that a backend's
+        // copies never queue far ahead of its pending compute
         if (prefetch_enabled) {
-            bool seen[GGML_SCHED_MAX_BACKENDS] = { false };
-            seen[split_backend_id] = true;
-            for (int j = split_id + 1; j < sched->n_splits && j <= split_id + sched->n_backends; j++) {
+            bool done[GGML_SCHED_MAX_BACKENDS] = { false };
+            done[split_backend_id] = true;
+            for (int j = split_id + 1; j < sched->n_splits && j <= split_id + 4 * sched->n_backends; j++) {
                 const int b = splits[j].backend_id;
-                if (seen[b]) {
+                if (done[b] || splits[j].n_inputs == 0) {
                     continue;
                 }
-                seen[b] = true;
-                if (splits[j].n_inputs > 0) {
-                    prefetch_split_inputs(j);
+                if (prefetch_split_inputs(j)) {
+                    done[b] = true;
                 }
             }
         }
