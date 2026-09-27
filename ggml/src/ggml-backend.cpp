@@ -1003,6 +1003,11 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                         if (act == NULL || act == src || (act->buffer != NULL && act->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
                             continue;
                         }
+                        // activations usually arrive as a reshape or view whose own backend is assigned only in a later
+                        // pass; the tensor it views has been assigned already (it precedes this node in the graph)
+                        while (act->view_src != NULL && tensor_backend_id(act) == -1) {
+                            act = act->view_src;
+                        }
                         const int act_backend_id = tensor_backend_id(act);
                         if (act_backend_id >= 0 && act_backend_id < src_backend_id &&
                             ggml_backend_supports_op(sched->backends[act_backend_id], tensor) && ggml_backend_offload_op(sched->backends[act_backend_id], tensor)) {
@@ -1640,37 +1645,63 @@ static bool ggml_backend_sched_weight_slot_eligible(ggml_backend_sched_t sched, 
         ggml_backend_buffer_is_host(input->buffer);
 }
 
-// bytes the slot of this split's backend needs for the split's eligible inputs, assigning offsets when asked
-static size_t ggml_backend_sched_weight_slot_layout(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, bool assign, size_t * offsets) {
-    const int backend_id = split->backend_id;
-    const size_t align = ggml_backend_buft_get_alignment(sched->bufts[backend_id]);
-    size_t total = 0;
-    for (int j = 0; j < split->n_inputs; j++) {
-        struct ggml_tensor * input = split->inputs[j];
-        if (!ggml_backend_sched_weight_slot_eligible(sched, split, input)) {
-            continue;
-        }
-        struct ggml_tensor * input_cpy = tensor_copy(input, backend_id, sched->cur_copy);
-        const size_t size = ggml_backend_buft_get_alloc_size(sched->bufts[backend_id], input_cpy);
-        if (offsets) {
-            offsets[j] = total;
-        }
-        if (assign && input_cpy->data == NULL) {
-            ggml_backend_tensor_alloc(sched->weight_slot_buf[backend_id], input_cpy, (char *) ggml_backend_buffer_get_base(sched->weight_slot_buf[backend_id]) + total);
-        }
-        total += (size + align - 1) / align * align;
+// the routing tensor a split's first MUL_MAT_ID uses, NULL for anything else: the expert splits of one layer
+// (gate, up, down) share it and are copied together as one group
+static const struct ggml_tensor * ggml_backend_sched_split_ids(const struct ggml_backend_sched_split * split) {
+    if (split->graph.n_nodes == 0 || split->graph.nodes[0]->op != GGML_OP_MUL_MAT_ID) {
+        return NULL;
     }
-    return total;
+    return split->graph.nodes[0]->src[2];
+}
+
+// consecutive eligible splits on the same backend sharing a routing tensor are one group: their inputs get distinct
+// offsets in the backend's slot so a whole layer's expert weights can be in flight at once
+static bool ggml_backend_sched_same_weight_group(ggml_backend_sched_t sched, int split_a, int split_b) {
+    const struct ggml_backend_sched_split * a = &sched->splits[split_a];
+    const struct ggml_backend_sched_split * b = &sched->splits[split_b];
+    if (a->backend_id != b->backend_id) {
+        return false;
+    }
+    const struct ggml_tensor * ids_a = ggml_backend_sched_split_ids(a);
+    const struct ggml_tensor * ids_b = ggml_backend_sched_split_ids(b);
+    return ids_a != NULL && ids_a == ids_b;
+}
+
+// lay every eligible input copy out in its backend's slot, group by group; returns the largest group per backend
+// and, when assign is set, places the copies there so that the graph allocator leaves them alone
+static void ggml_backend_sched_weight_slot_layout(ggml_backend_sched_t sched, bool assign, size_t * need) {
+    for (int b = 0; b < sched->n_backends; b++) {
+        need[b] = 0;
+    }
+    size_t offset = 0;
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        const int backend_id = split->backend_id;
+        if (i == 0 || !ggml_backend_sched_same_weight_group(sched, i - 1, i)) {
+            offset = 0; // a new group starts at the base of the slot
+        }
+        const size_t align = ggml_backend_buft_get_alignment(sched->bufts[backend_id]);
+        for (int j = 0; j < split->n_inputs; j++) {
+            struct ggml_tensor * input = split->inputs[j];
+            if (!ggml_backend_sched_weight_slot_eligible(sched, split, input)) {
+                continue;
+            }
+            struct ggml_tensor * input_cpy = tensor_copy(input, backend_id, sched->cur_copy);
+            const size_t size = ggml_backend_buft_get_alloc_size(sched->bufts[backend_id], input_cpy);
+            if (assign && input_cpy->data == NULL) {
+                ggml_backend_tensor_alloc(sched->weight_slot_buf[backend_id], input_cpy, (char *) ggml_backend_buffer_get_base(sched->weight_slot_buf[backend_id]) + offset);
+            }
+            offset += (size + align - 1) / align * align;
+            need[backend_id] = std::max(need[backend_id], offset);
+        }
+    }
 }
 
 // size the slots for the current splits, allocate them, and place the eligible input copies in them so that the
 // graph allocator leaves those tensors alone
 static bool ggml_backend_sched_alloc_weight_slots(ggml_backend_sched_t sched) {
     size_t need[GGML_SCHED_MAX_BACKENDS] = { 0 };
-    for (int i = 0; i < sched->n_splits; i++) {
-        struct ggml_backend_sched_split * split = &sched->splits[i];
-        need[split->backend_id] = std::max(need[split->backend_id], ggml_backend_sched_weight_slot_layout(sched, split, false, NULL));
-    }
+    ggml_backend_sched_weight_slot_layout(sched, false, need);
     for (int b = 0; b < sched->n_backends; b++) {
         if (need[b] == 0) {
             continue;
@@ -1691,12 +1722,8 @@ static bool ggml_backend_sched_alloc_weight_slots(ggml_backend_sched_t sched) {
             sched->weight_slot_size[b] = need[b];
         }
     }
-    for (int i = 0; i < sched->n_splits; i++) {
-        struct ggml_backend_sched_split * split = &sched->splits[i];
-        if (need[split->backend_id] > 0) {
-            ggml_backend_sched_weight_slot_layout(sched, split, true, NULL);
-        }
-    }
+    size_t placed[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_sched_weight_slot_layout(sched, true, placed);
     return true;
 }
 
@@ -2065,6 +2092,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 if (prefetch_split_inputs(j)) {
                     done[b] = true;
+                    // the rest of the group (the layer's other expert tensors) has its own offsets in the slot
+                    for (int k = j + 1; k < sched->n_splits && ggml_backend_sched_same_weight_group(sched, k - 1, k); k++) {
+                        prefetch_split_inputs(k);
+                    }
                 }
             }
         }
