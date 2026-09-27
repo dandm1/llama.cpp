@@ -77,8 +77,9 @@ double fit_advisor_s_per_byte(const fit_advisor_matmul_rate & r, uint32_t batch)
 // microseconds one op over this tensor costs when it lives on dev_idx (DEV_CPU = -1) at a batch size:
 //   - matmul weights: bytes on the measured per-byte curve, plus the per-ubatch copy when offloaded
 //   - anything else: the device's per-op cost plus the op's activation bytes over the device's memory rate
+// home_idx: the device of the tensor's layer, where an offloaded op runs when that device wants it (-1: the first willing one)
 double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
-                                  int dev_idx, const std::vector<fit_advisor_cost_device> & devices, uint32_t batch);
+                                  int dev_idx, const std::vector<fit_advisor_cost_device> & devices, uint32_t batch, int home_idx = -1);
 
 // whether the cost of this tensor on this device rests on measurements (false: a fallback rate was used, or the
 // device has no measurements); the search never lets an unknown cost decide a placement
@@ -87,4 +88,4 @@ bool fit_advisor_tensor_cost_known(const fit_advisor_inventory & inv, const fit_
 
 // microseconds per request attributable to this tensor on this device under the workload
 double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fit_advisor_graph_profile & gp, size_t tensor_idx, int dev_idx,
-                                     const std::vector<fit_advisor_cost_device> & devices, const fit_advisor_workload & wl, uint32_t n_slots);
+                                     const std::vector<fit_advisor_cost_device> & devices, const fit_advisor_workload & wl, uint32_t n_slots, int home_idx = -1);

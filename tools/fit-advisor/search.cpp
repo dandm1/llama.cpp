@@ -148,8 +148,8 @@ struct searcher {
 
     // request-time gain of placing tensor i on device d instead of the CPU, from the op that reads it
     double gain(size_t i, int d, const fit_advisor_workload & wl, uint32_t slots) const {
-        return fit_advisor_tensor_request_us(inv, gp, i, fit_advisor_allocation::DEV_CPU, cost_devs, wl, slots)
-             - fit_advisor_tensor_request_us(inv, gp, i, d, cost_devs, wl, slots);
+        return fit_advisor_tensor_request_us(inv, gp, i, fit_advisor_allocation::DEV_CPU, cost_devs, wl, slots, d)
+             - fit_advisor_tensor_request_us(inv, gp, i, d, cost_devs, wl, slots, d);
     }
 
     // movable groups: the expert tensors of a layer move together (a partially moved layer still costs its split),
