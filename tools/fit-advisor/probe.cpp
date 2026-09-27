@@ -110,6 +110,10 @@ static std::map<std::string, ggml_backend_buffer_type_t> get_buft_by_name() {
         if (buft) {
             ret[ggml_backend_buft_name(buft)] = buft;
         }
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft) {
+            ret[ggml_backend_buft_name(host_buft)] = host_buft; // pinned host memory, e.g. CUDA_Host
+        }
     }
     return ret;
 }
