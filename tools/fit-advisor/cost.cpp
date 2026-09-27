@@ -58,6 +58,16 @@ static double interp_per_token(const std::map<int, double> & points, uint32_t ba
     return std::exp(std::log(per_token(*lo)) + f * (std::log(per_token(*hi)) - std::log(per_token(*lo))));
 }
 
+double fit_advisor_device_rate(const fit_advisor_cost_device & d) {
+    double best = 0;
+    if (d.meas) {
+        for (const auto & [type, r] : d.meas->matmul) {
+            best = std::max(best, r.bytes_per_s);
+        }
+    }
+    return best;
+}
+
 double fit_advisor_s_per_byte(const fit_advisor_matmul_rate & r, uint32_t batch) {
     if (!r.supported || r.s_per_byte_b1 <= 0) {
         return 0;

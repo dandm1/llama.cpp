@@ -496,17 +496,39 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             std::vector<uint32_t> per(nd, 0);
             const double sum = std::accumulate(w.begin(), w.end(), 0.0);
             uint32_t assigned = 0;
+            size_t last = 0;
             for (size_t d = 0; d < nd; d++) {
                 per[d] = (uint32_t) std::floor(S.ngl_max * w[d] / sum);
                 assigned += per[d];
+                if (w[d] > 0) last = d;
             }
-            per[nd - 1] += S.ngl_max - assigned;
+            per[last] += S.ngl_max - assigned; // rounding remainder to the last device that takes layers
             return per;
         };
-        partitions.push_back(split(w_free));
-        const std::vector<uint32_t> even = split(std::vector<double>(nd, 1.0));
-        if (even != partitions[0]) {
-            partitions.push_back(even);
+        auto add_partition = [&](const std::vector<uint32_t> & part) {
+            if (std::find(partitions.begin(), partitions.end(), part) == partitions.end()) {
+                partitions.push_back(part);
+            }
+        };
+        add_partition(split(w_free));
+        add_partition(split(std::vector<double>(nd, 1.0)));
+
+        // unequal devices: every layer's home on the fastest k cards only, the rest hold no layers and get expert
+        // stacks from the fill pass instead; a slow card with a slow link is a store, not a place to run attention
+        std::vector<size_t> by_rate(nd);
+        for (size_t d = 0; d < nd; d++) by_rate[d] = d;
+        std::stable_sort(by_rate.begin(), by_rate.end(), [&](size_t a, size_t b) {
+            return fit_advisor_device_rate(cost_devs[a]) > fit_advisor_device_rate(cost_devs[b]);
+        });
+        for (size_t k = nd - 1; k >= 1 && nd > 1; k--) {
+            const double rate_k = fit_advisor_device_rate(cost_devs[by_rate[k - 1]]);
+            const double rate_x = fit_advisor_device_rate(cost_devs[by_rate[k]]);
+            if (rate_x <= 0 || rate_k <= 1.5 * rate_x) {
+                continue; // the excluded card is not much slower, the memory-proportional seeds cover it
+            }
+            std::vector<double> w(nd, 0.0);
+            for (size_t i = 0; i < k; i++) w[by_rate[i]] = w_free[by_rate[i]];
+            add_partition(split(w));
         }
     }
     std::vector<uint32_t> slot_options;

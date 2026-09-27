@@ -87,6 +87,9 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
                                            const std::vector<fit_advisor_cost_device> & devices, const fit_advisor_pair_table & pairs,
                                            const fit_advisor_workload & wl);
 
+// the device's measured weight-streaming rate (best matmul type), bytes/s; 0 without measurements
+double fit_advisor_device_rate(const fit_advisor_cost_device & d);
+
 // seconds per weight byte at a batch size, interpolated on the measured curve
 double fit_advisor_s_per_byte(const fit_advisor_matmul_rate & r, uint32_t batch);
 

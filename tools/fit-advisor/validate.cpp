@@ -38,14 +38,19 @@ bool coverage_cb(struct ggml_tensor * t, bool ask, void * ud) {
     if (!wanted || t->ne[1] < 32 || (uint32_t) t->ne[1] != p.n_ubatch) {
         return true; // generation steps and partial ubatches are not what the copies are priced on
     }
-    std::vector<int32_t> ids((size_t) ggml_nelements(t));
-    ggml_backend_tensor_get(t, ids.data(), 0, ggml_nbytes(t));
+    // the ids are a strided view of the argsort output (the first n_used of n_expert columns): read the view's bytes
+    // and walk it with its strides
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
     p.seen.assign(p.n_expert, 0);
     uint32_t distinct = 0;
-    for (const int32_t id : ids) {
-        if (id >= 0 && (uint32_t) id < p.n_expert && !p.seen[id]) {
-            p.seen[id] = 1;
-            distinct++;
+    for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
+        for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
+            const int32_t id = *(const int32_t *) (buf.data() + i1 * t->nb[1] + i0 * t->nb[0]);
+            if (id >= 0 && (uint32_t) id < p.n_expert && !p.seen[id]) {
+                p.seen[id] = 1;
+                distinct++;
+            }
         }
     }
     p.sum_share += (double) distinct / p.n_expert;
