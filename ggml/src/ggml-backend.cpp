@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <cmath>
 #include <unordered_map>
 #include <vector>
 
@@ -1686,6 +1687,60 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // weight prefetch: the copy of a host-resident weight for a later split on another backend can be enqueued
+    // before the current split has finished, so that several backends copy over their own links at the same time.
+    // the copy is the whole tensor; for MoE weights that gives up the used-experts-only copy, which is worth
+    // nothing once a batch is large enough to touch (nearly) every expert. controlled by GGML_SCHED_PREFETCH (0 off)
+    static const int prefetch_enabled = getenv("GGML_SCHED_PREFETCH") ? atoi(getenv("GGML_SCHED_PREFETCH")) : 1;
+    std::vector<std::vector<uint8_t>> prefetched(sched->n_splits);
+    auto is_prefetched = [&](int split_id, int input_id) {
+        return (size_t) input_id < prefetched[split_id].size() && prefetched[split_id][input_id];
+    };
+    // the full-copy policy for a host weight feeding a MUL_MAT_ID: the expected share of experts a batch touches
+    auto moe_coverage = [&](struct ggml_backend_sched_split * split, struct ggml_tensor * input_cpy, double & coverage) {
+        if (split->graph.n_nodes == 0) {
+            return false;
+        }
+        ggml_tensor * node = split->graph.nodes[0];
+        if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != input_cpy || node->src[2] == NULL) {
+            return false;
+        }
+        const double n_expert = (double) input_cpy->ne[2];
+        const double n_used   = (double) node->src[2]->ne[0];
+        const double n_tokens = (double) node->src[2]->ne[1];
+        coverage = n_expert > 0 ? 1.0 - pow(1.0 - n_used / n_expert, n_tokens) : 0.0;
+        return true;
+    };
+    auto prefetch_split_inputs = [&](int target_id) {
+        struct ggml_backend_sched_split * split = &splits[target_id];
+        const int backend_id = split->backend_id;
+        ggml_backend_t backend = sched->backends[backend_id];
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            struct ggml_tensor * input = split->inputs[input_id];
+            if ((input->flags & GGML_TENSOR_FLAG_INPUT) || input->buffer == NULL ||
+                ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                !ggml_backend_buffer_is_host(input->buffer)) {
+                continue;
+            }
+            struct ggml_tensor * input_cpy = tensor_copy(input, backend_id, sched->cur_copy);
+            double coverage = 1.0;
+            if (moe_coverage(split, input_cpy, coverage) && coverage < 0.9) {
+                continue; // the used-experts copy would move much less, let the normal path do it
+            }
+            // the slot may still be read by this backend's earlier work: wait on its stream, not on the host
+            if (sched->events[backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_wait(backend, sched->events[backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(backend);
+            }
+            ggml_backend_tensor_set_async(backend, input_cpy, input->data, 0, ggml_nbytes(input));
+            if (prefetched[target_id].size() <= (size_t) input_id) {
+                prefetched[target_id].resize(split->n_inputs, 0);
+            }
+            prefetched[target_id][input_id] = 1;
+        }
+    };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1703,6 +1758,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            if (is_prefetched(split_id, input_id)) {
+                continue; // already on its way, enqueued while an earlier split ran elsewhere
+            }
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
@@ -1870,6 +1928,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        }
+
+        // with this split's compute enqueued, start the weight copies of the next splits that run on other backends:
+        // at most one split per backend so that a backend's own copies never queue ahead of its pending compute
+        if (prefetch_enabled) {
+            bool seen[GGML_SCHED_MAX_BACKENDS] = { false };
+            seen[split_backend_id] = true;
+            for (int j = split_id + 1; j < sched->n_splits && j <= split_id + sched->n_backends; j++) {
+                const int b = splits[j].backend_id;
+                if (seen[b]) {
+                    continue;
+                }
+                seen[b] = true;
+                if (splits[j].n_inputs > 0) {
+                    prefetch_split_inputs(j);
+                }
+            }
         }
 
         prev_backend_id = split_backend_id;
