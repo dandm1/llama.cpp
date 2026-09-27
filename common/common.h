@@ -539,6 +539,8 @@ struct common_params {
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+    std::vector<llama_model_layer_dev_override>   layer_dev_overrides;   // layers with an explicit device (-old), unterminated
+    int32_t op_offload_min_batch = 0; // batch size from which devices take ops on CPU-resident weights, 0 = backend default
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
@@ -1225,3 +1227,13 @@ struct common_prompt_checkpoint {
     void clear_tgt();
     void clear_dft();
 };
+
+//
+// layer device overrides
+//
+
+// parse "IL=DEV,IL-IL=DEV,output=DEV,..." into overrides (device names as ggml reports them, or CPU); false with error set
+bool common_parse_layer_dev_overrides(const std::string & value, std::vector<llama_model_layer_dev_override> & out, std::string & error);
+
+// the inverse, as accepted by -old / --override-layer-device
+std::string common_layer_dev_overrides_to_str(const std::vector<llama_model_layer_dev_override> & overrides);

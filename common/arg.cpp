@@ -2753,6 +2753,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
+        {"-old", "--override-layer-device"}, "IL=DEVICE,IL-IL=DEVICE,output=DEVICE,...",
+        "place whole layers on a device regardless of -ngl / -ts: weights, KV cache, recurrent state and pinned ops follow "
+        "(-ot still applies to individual tensors); e.g. 78=CUDA1,5-9=CUDA0",
+        [](common_params & params, const std::string & value) {
+            std::string error;
+            if (!common_parse_layer_dev_overrides(value, params.layer_dev_overrides, error)) {
+                throw std::invalid_argument("--override-layer-device: " + error);
+            }
+        }
+    ).set_env("LLAMA_ARG_OVERRIDE_LAYER_DEVICE"));
+    add_opt(common_arg(
+        {"--op-offload-min-batch"}, "N",
+        "batch size from which devices run ops on CPU-resident weights themselves by copying the weights "
+        "(default: the backend's, usually 32 or GGML_OP_OFFLOAD_MIN_BATCH)",
+        [](common_params & params, int value) {
+            params.op_offload_min_batch = value;
+        }
+    ).set_env("LLAMA_ARG_OP_OFFLOAD_MIN_BATCH"));
+    add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {

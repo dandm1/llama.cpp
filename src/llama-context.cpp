@@ -274,8 +274,7 @@ llama_context::llama_context(
 
     if (params.op_offload_min_batch > 0) {
         // a device-wide setting: every context on these devices sees it, the last one set wins
-        for (int i = 0; i < llama_model_n_devices(&model); i++) {
-            ggml_backend_dev_t dev = llama_model_get_device(&model, i);
+        for (ggml_backend_dev_t dev : model.devices) {
             if (!ggml_backend_dev_set_op_offload_min_batch(dev, params.op_offload_min_batch)) {
                 LLAMA_LOG_WARN("%s: device %s has no op offload threshold to set, keeping its default\n", __func__, ggml_backend_dev_name(dev));
             } else {

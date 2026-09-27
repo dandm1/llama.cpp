@@ -1707,6 +1707,16 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
     }
 
+    if (params.layer_dev_overrides.empty()) {
+        mparams.layer_dev_overrides = NULL;
+    } else {
+        // the API wants a terminated array; keep a terminated copy alive for the life of the process
+        static std::vector<llama_model_layer_dev_override> terminated;
+        terminated = params.layer_dev_overrides;
+        terminated.push_back({ -1, nullptr });
+        mparams.layer_dev_overrides = terminated.data();
+    }
+
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
@@ -1745,6 +1755,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
+    cparams.op_offload_min_batch = params.op_offload_min_batch;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 
@@ -2358,4 +2369,75 @@ void common_prompt_checkpoint::clear_tgt() {
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
+}
+
+//
+// layer device overrides
+//
+
+bool common_parse_layer_dev_overrides(const std::string & value, std::vector<llama_model_layer_dev_override> & out, std::string & error) {
+    for (const auto & item : string_split<std::string>(value, ',')) {
+        if (item.empty()) {
+            continue;
+        }
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos) {
+            error = "expected IL=DEVICE in '" + item + "'";
+            return false;
+        }
+        const std::string range = item.substr(0, eq);
+        const std::string dname = item.substr(eq + 1);
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(dname.c_str());
+        if (dev == nullptr && dname == "CPU") {
+            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        }
+        if (dev == nullptr) {
+            error = "unknown device '" + dname + "' in '" + item + "'";
+            return false;
+        }
+        if (range == "output") {
+            out.push_back({ LLAMA_LAYER_OUTPUT, dev });
+            continue;
+        }
+        const size_t dash = range.find('-');
+        try {
+            const int first = std::stoi(range.substr(0, dash));
+            const int last  = dash == std::string::npos ? first : std::stoi(range.substr(dash + 1));
+            if (first < 0 || last < first) {
+                error = "bad layer range '" + range + "'";
+                return false;
+            }
+            for (int il = first; il <= last; il++) {
+                out.push_back({ il, dev });
+            }
+        } catch (const std::exception &) {
+            error = "bad layer range '" + range + "'";
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string common_layer_dev_overrides_to_str(const std::vector<llama_model_layer_dev_override> & overrides) {
+    // group consecutive layers on the same device into ranges
+    std::string ret;
+    for (size_t i = 0; i < overrides.size();) {
+        if (overrides[i].il == -1) {
+            break;
+        }
+        const char * dname = overrides[i].dev ? ggml_backend_dev_name(overrides[i].dev) : "CPU";
+        if (overrides[i].il == LLAMA_LAYER_OUTPUT) {
+            ret += (ret.empty() ? "" : ",") + std::string("output=") + dname;
+            i++;
+            continue;
+        }
+        size_t j = i;
+        while (j + 1 < overrides.size() && overrides[j + 1].dev == overrides[i].dev && overrides[j + 1].il == overrides[j].il + 1) {
+            j++;
+        }
+        ret += (ret.empty() ? "" : ",") + std::to_string(overrides[i].il)
+             + (j > i ? "-" + std::to_string(overrides[j].il) : "") + "=" + dname;
+        i = j + 1;
+    }
+    return ret;
 }
