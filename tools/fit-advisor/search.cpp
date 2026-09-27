@@ -51,7 +51,7 @@ std::string cell_key(const std::vector<uint32_t> & part, uint32_t ub, uint32_t s
 
 // the key of a state: its cell plus any explicit layer homes, which change the KV and compute of the devices
 std::string alloc_key(const fit_advisor_allocation & a) {
-    std::string ret = alloc_key(a);
+    std::string ret = cell_key(a.layers_per_device, a.n_ubatch, a.n_slots);
     for (const auto & [il, dev] : a.layer_home) {
         ret += "|" + std::to_string(il) + "=" + std::to_string(dev);
     }
