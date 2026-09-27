@@ -88,7 +88,7 @@ std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common
         ret.push_back({ "LLAMA_ARG_SPEC_TYPE", v, "--spec-type " + v });
         if (params.speculative.draft.n_max != defaults.speculative.draft.n_max) {
             const std::string n = std::to_string(params.speculative.draft.n_max);
-            ret.push_back({ "LLAMA_ARG_DRAFT_MAX", n, "--draft-max " + n });
+            ret.push_back({ "LLAMA_ARG_SPEC_DRAFT_N_MAX", n, "--spec-draft-n-max " + n });
         }
     }
     return ret;

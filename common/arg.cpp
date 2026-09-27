@@ -2965,7 +2965,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
     add_opt(common_arg(
         {"--mtp-accept"}, "P",
-        string_format("assumed probability that one drafted MTP token is accepted, used with --spec-type draft-mtp (default: %.2f)", params.fit_advisor_mtp_accept),
+        string_format("assumed probability that one drafted MTP token is accepted, used with --spec-type draft-mtp and --spec-draft-n-max (default: %.2f)", params.fit_advisor_mtp_accept),
         [](common_params & params, const std::string & value) {
             params.fit_advisor_mtp_accept = std::stod(value);
             if (params.fit_advisor_mtp_accept < 0.0 || params.fit_advisor_mtp_accept > 1.0) {
@@ -4240,7 +4240,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.speculative.draft.n_max = value;
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_FIT_ADVISOR}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
@@ -4484,7 +4484,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & /*params*/, int /*value*/) {
             arg_removed("use --spec-draft-n-max or --spec-ngram-mod-n-max");
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_FIT_ADVISOR}).set_env("LLAMA_ARG_DRAFT_MAX"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
     add_opt(common_arg(
         {"--draft-min", "--draft-n-min"}, "N",
         "the argument has been removed. use --spec-draft-n-min or --spec-ngram-mod-n-min",
