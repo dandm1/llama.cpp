@@ -10,9 +10,97 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <vector>
+
+namespace {
+
+// the router's chosen experts are graph tensors named ffn_moe_topk-<il> of shape [n_used, n_tokens]; the context's
+// evaluation callback lets the validation read them and count how many distinct experts each ubatch touched
+struct coverage_probe {
+    uint32_t n_expert = 0;
+    uint32_t n_ubatch = 0;
+    double   sum_share = 0;
+    uint32_t n_samples = 0;
+    std::vector<char> seen;
+};
+
+bool coverage_cb(struct ggml_tensor * t, bool ask, void * ud) {
+    coverage_probe & p = *(coverage_probe *) ud;
+    const bool wanted = std::strncmp(ggml_get_name(t), "ffn_moe_topk-", 13) == 0 && t->type == GGML_TYPE_I32;
+    if (ask) {
+        return wanted;
+    }
+    if (!wanted || t->ne[1] < 32 || (uint32_t) t->ne[1] != p.n_ubatch) {
+        return true; // generation steps and partial ubatches are not what the copies are priced on
+    }
+    std::vector<int32_t> ids((size_t) ggml_nelements(t));
+    ggml_backend_tensor_get(t, ids.data(), 0, ggml_nbytes(t));
+    p.seen.assign(p.n_expert, 0);
+    uint32_t distinct = 0;
+    for (const int32_t id : ids) {
+        if (id >= 0 && (uint32_t) id < p.n_expert && !p.seen[id]) {
+            p.seen[id] = 1;
+            distinct++;
+        }
+    }
+    p.sum_share += (double) distinct / p.n_expert;
+    p.n_samples++;
+    return true;
+}
+
+// English prose for the validation prompt: routing on real text is skewed in a way random tokens are not
+const char * builtin_prompt_text =
+    "The city council met on Tuesday evening to discuss the proposed changes to the bus network, which would replace "
+    "three of the older routes with a single loop serving the hospital, the university and the retail park. Residents of "
+    "the eastern suburbs argued that the loop would add twenty minutes to their journey into the centre, while the "
+    "operator pointed to falling passenger numbers and the cost of maintaining the current fleet. After two hours of "
+    "debate the council agreed to commission an independent survey of travel patterns before taking a decision. "
+    "In other business, the planning committee approved an extension to the primary school, rejected an application "
+    "for a drive-through restaurant on the ring road, and noted a report on flood defences that recommended raising "
+    "the embankment along the river by half a metre over the next five years. The meeting closed at ten past nine. ";
+
+std::vector<llama_token> validation_tokens(const llama_vocab * vocab, const std::string & file, uint32_t n_tokens, std::string & source) {
+    std::string text;
+    if (!file.empty()) {
+        std::ifstream f(file);
+        if (f.good()) {
+            std::stringstream ss;
+            ss << f.rdbuf();
+            text = ss.str();
+            source = file;
+        } else {
+            LOG_WRN("%s: cannot read %s, using the built-in text\n", __func__, file.c_str());
+        }
+    }
+    if (text.empty()) {
+        text   = builtin_prompt_text;
+        source = "built-in paragraph";
+    }
+    // repeat the text until it tokenizes to enough tokens
+    std::vector<llama_token> toks;
+    std::string repeated = text;
+    for (int k = 0; k < 16; k++) {
+        toks = common_tokenize(vocab, repeated, true);
+        if (toks.size() >= n_tokens) {
+            break;
+        }
+        repeated += " " + text;
+    }
+    if (toks.size() < n_tokens) {
+        while (toks.size() < n_tokens) {
+            toks.push_back(toks[toks.size() % std::max<size_t>(1, toks.size() / 2)]);
+        }
+    }
+    toks.resize(n_tokens);
+    return toks;
+}
+
+} // namespace
 
 int64_t fit_advisor_validate_result::suggested_margin(size_t device) const {
     if (device >= devices.size()) {
@@ -71,7 +159,11 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
     }
 
     const llama_model_params   mparams = common_model_params_to_llama(p);
-    const llama_context_params cparams = common_context_params_to_llama(p);
+    llama_context_params cparams = common_context_params_to_llama(p);
+
+    coverage_probe probe;
+    cparams.cb_eval           = coverage_cb;
+    cparams.cb_eval_user_data = &probe;
 
     LOG_INF("%s: loading %s for real (ngl %d, ctx %u, slots %u, ubatch %d) ...\n", __func__, cand.name.c_str(),
         p.n_gpu_layers, p.n_ctx, cand.n_slots, p.n_ubatch);
@@ -82,6 +174,8 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
         vr.error = "model load failed";
         return vr;
     }
+    probe.n_expert = (uint32_t) std::max(0, llama_model_n_expert(model));
+    probe.n_ubatch = (uint32_t) p.n_ubatch;
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (ctx == nullptr) {
         llama_model_free(model);
@@ -121,8 +215,11 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    std::string prompt_source;
+    const std::vector<llama_token> prompt = validation_tokens(vocab, params.fit_advisor_validate_prompt, n_prompt_tokens + vr.n_gen_steps * n_slots + 16, prompt_source);
+    probe.n_ubatch = n_ubatch;
     auto token_at = [&](uint32_t i) -> llama_token {
-        return (llama_token) ((i * 7919u + 17u) % (uint32_t) n_vocab);
+        return i < prompt.size() ? prompt[i] : (llama_token) ((i * 7919u + 17u) % (uint32_t) n_vocab);
     };
 
     const int64_t t1 = ggml_time_us();
@@ -131,7 +228,7 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
 
     // every prompt token asks for logits: the reserve sizes the compute buffer and the scratch estimate for an
     // output matmul over the whole ubatch, so the validation has to exercise that path too
-    LOG_INF("%s: prompt of %u tokens in batches of %u, logits for every token ...\n", __func__, n_prompt_tokens, n_batch);
+    LOG_INF("%s: prompt of %u tokens (%s) in batches of %u, logits for every token ...\n", __func__, n_prompt_tokens, prompt_source.c_str(), n_batch);
     for (uint32_t pos = 0; pos < n_prompt_tokens && decode_ok; pos += n_batch) {
         const uint32_t n = std::min(n_batch, n_prompt_tokens - pos);
         common_batch_clear(batch);
@@ -162,6 +259,11 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
     }
     llama_synchronize(ctx);
     vr.t_run_s = (ggml_time_us() - t1) * 1e-6;
+    if (probe.n_samples > 0) {
+        vr.expert_coverage  = probe.sum_share / probe.n_samples;
+        vr.coverage_samples = probe.n_samples;
+        vr.coverage_ubatch  = probe.n_ubatch;
+    }
 
     // what the device holds now: every buffer plus the pool at its high-water mark plus the runtime's own state
     read_free(vr.devices, &fit_advisor_validate_device::free_after);
@@ -209,6 +311,11 @@ void fit_advisor_validate_print(const fit_advisor_validate_result & vr) {
     }
     printf("\nvalidation by a real load: %u prompt tokens + %u generation steps, load %.1f s, run %.1f s\n",
         vr.n_prompt_tokens, vr.n_gen_steps, vr.t_load_s, vr.t_run_s);
+    if (vr.coverage_samples > 0) {
+        printf("expert coverage: a %u-token ubatch routes to %.0f%% of a layer's experts on average (%u layer samples); "
+               "that share of each CPU-resident expert stack is copied per ubatch\n",
+            vr.coverage_ubatch, 100.0 * vr.expert_coverage, vr.coverage_samples);
+    }
     printf("%-34s %9s %9s %9s %9s %9s %9s %9s %9s %9s\n",
         "device", "projected", "actual", "buffers", "overhead", "scratch", "unmodel.", "margin", "suggest", "leak");
     for (size_t d = 0; d < vr.devices.size(); d++) {

@@ -3010,6 +3010,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
     add_opt(common_arg(
+        {"--validate-prompt"}, "FILE",
+        "text the validation prompt is built from (repeated to the requested length); the expert coverage measured on it "
+        "prices the per-ubatch expert copies, so use text like the workload's (default: a built-in paragraph)",
+        [](common_params & params, const std::string & value) {
+            params.fit_advisor_validate_prompt = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
+    add_opt(common_arg(
         {"--validate-tokens"}, "N",
         "prompt tokens to run in the validation load (default: two ubatches, at least 1024)",
         [](common_params & params, int value) {

@@ -659,7 +659,7 @@ int llama_fit_advisor(int argc, char ** argv) {
     print_layer_costs(inv, devs, meas);
 
     // cost of every allocation under the workload
-    const fit_advisor_workload wl = [&]() {
+    fit_advisor_workload wl = [&]() {
         fit_advisor_workload w = fit_advisor_workload::preset(params.fit_advisor_workload);
         w.n_ubatch = (uint32_t) params.n_ubatch;
         w.use_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
@@ -802,8 +802,17 @@ int llama_fit_advisor(int argc, char ** argv) {
         const uint32_t n_tokens = (uint32_t) std::max(0, params.fit_advisor_validate_tokens);
         fit_advisor_validate_result vr = fit_advisor_validate(params, sr.cand, sr.proj, n_tokens);
         fit_advisor_validate_print(vr);
+        bool changed = false;
+        if (vr.ok && vr.coverage_samples > 0 && params.fit_advisor_expert_coverage <= 0) {
+            // the copies were priced on an assumed share; the validation measured it on real text
+            const double assumed = wl.expert_coverage > 0 ? wl.expert_coverage : 0.6;
+            LOG_INF("%s: expert coverage measured at %.2f (assumed %.2f)\n", __func__, vr.expert_coverage, assumed);
+            if (std::fabs(vr.expert_coverage - assumed) > 0.1) {
+                wl.expert_coverage = vr.expert_coverage;
+                changed = true;
+            }
+        }
         if (vr.ok && !params.fit_params_target_set) {
-            bool changed = false;
             for (size_t d = 0; d < vr.devices.size() && d < sr.proj.devices.size(); d++) {
                 const int64_t suggested = vr.suggested_margin(d);
                 const int64_t current   = sr.proj.devices[d].margin;
@@ -814,8 +823,10 @@ int llama_fit_advisor(int argc, char ** argv) {
                     changed = true;
                 }
             }
+        }
+        {
             if (changed) {
-                LOG_INF("%s: searching again with the validated margins ...\n", __func__);
+                LOG_INF("%s: searching again with the validated margins and coverage ...\n", __func__);
                 fit_advisor_search_result sr2 = search_and_report(params, inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts);
                 if (sr2.ok) {
                     fit_advisor_validate_result vr2 = fit_advisor_validate(params, sr2.cand, sr2.proj, n_tokens);

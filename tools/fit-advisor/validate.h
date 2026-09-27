@@ -37,6 +37,12 @@ struct fit_advisor_validate_result {
     std::vector<fit_advisor_validate_device> devices; // model device order, like the projection
     uint32_t n_prompt_tokens = 0;
     uint32_t n_gen_steps     = 0;
+
+    // MoE models: share of a layer's experts a prompt ubatch routed to, averaged over layers and full ubatches of
+    // the validation text (0 for dense models or when nothing was sampled); what the scheduler copies per ubatch
+    double   expert_coverage = 0;
+    uint32_t coverage_samples = 0;
+    uint32_t coverage_ubatch  = 0; // tokens per ubatch the samples were taken at
     double   t_load_s = 0;
     double   t_run_s  = 0;
 
