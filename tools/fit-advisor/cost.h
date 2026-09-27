@@ -20,6 +20,11 @@ struct fit_advisor_workload {
     bool     throughput    = false; // optimise aggregate tokens/s instead of per-request latency
     uint32_t n_ubatch      = 512;  // prompt-processing micro-batch
     bool     use_mtp       = false; // MTP layers are executed (speculative MTP drafting on), otherwise they are not even loaded
+    uint32_t mtp_draft_n   = 3;     // draft tokens per step when drafting (--draft-max)
+    double   mtp_accept    = 0.8;   // probability that one drafted token is accepted, a heuristic like the token counts
+
+    // tokens produced per generation step and slot: 1 verified token plus the expected accepted drafts
+    double tokens_per_step() const;
 
     static fit_advisor_workload preset(const std::string & name); // "chat", "rag", "batch", "agent"
 };
@@ -46,11 +51,15 @@ struct fit_advisor_cost {
     double gen_tokens_per_s = 0; // aggregate over the active batch
     double prompt_tokens_per_s = 0;
 
-    // breakdown of one decode step, microseconds
+    // breakdown of one decode step, microseconds (with drafting: the verification pass over 1 + draft tokens)
     double step_weights_us  = 0;
     double step_attn_us     = 0;
     double step_overhead_us = 0;
     double step_boundary_us = 0;
+
+    // drafting: one run of the MTP layer(s) at the generation batch, and the tokens a step yields per slot
+    double t_mtp_draft_us   = 0;
+    double tokens_per_step  = 1;
 
     // objective: lower is better
     double score() const { return t_request_us; }

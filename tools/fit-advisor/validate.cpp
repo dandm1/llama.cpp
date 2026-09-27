@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "../../src/llama-ext.h"
 #include "log.h"
+#include "speculative.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -87,6 +88,19 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
         vr.error = "context creation failed (out of memory?)";
         return vr;
     }
+    // the MTP draft context on the same weights, as the server creates it; its buffers count, its kernels are not run
+    llama_context * ctx_mtp = nullptr;
+    if (std::find(p.speculative.types.begin(), p.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != p.speculative.types.end()) {
+        common_params p_dft = common_base_params_to_speculative(p);
+        llama_context_params cparams_dft = common_context_params_to_llama(p_dft);
+        cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams_dft.n_rs_seq = 0;
+        cparams_dft.n_ctx    = cparams.n_ctx;
+        ctx_mtp = llama_init_from_model(model, cparams_dft);
+        if (ctx_mtp == nullptr) {
+            LOG_WRN("%s: MTP draft context creation failed, validating without it\n", __func__);
+        }
+    }
     vr.t_load_s = (ggml_time_us() - t0) * 1e-6;
     LOG_INF("%s: loaded in %.1f s\n", __func__, vr.t_load_s);
 
@@ -152,21 +166,32 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
     // what the device holds now: every buffer plus the pool at its high-water mark plus the runtime's own state
     read_free(vr.devices, &fit_advisor_validate_device::free_after);
 
-    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
-        if (ggml_backend_buft_is_host(buft)) {
-            continue;
+    auto add_breakdown = [&](llama_context * c, bool with_model) {
+        for (const auto & [buft, mb] : llama_get_memory_breakdown(c)) {
+            if (ggml_backend_buft_is_host(buft)) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            const int id = dev ? find_device(vr.devices, dev) : -1;
+            if (id < 0) {
+                continue;
+            }
+            if (with_model) {
+                vr.devices[id].model += mb.model;
+            }
+            vr.devices[id].context += mb.context;
+            vr.devices[id].compute += mb.compute;
         }
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        const int id = dev ? find_device(vr.devices, dev) : -1;
-        if (id < 0) {
-            continue;
-        }
-        vr.devices[id].model   += mb.model;
-        vr.devices[id].context += mb.context;
-        vr.devices[id].compute += mb.compute;
+    };
+    add_breakdown(ctx, true);
+    if (ctx_mtp) {
+        add_breakdown(ctx_mtp, false); // shares the weights
     }
 
     llama_batch_free(batch);
+    if (ctx_mtp) {
+        llama_free(ctx_mtp);
+    }
     llama_free(ctx);
     llama_model_free(model);
     read_free(vr.devices, &fit_advisor_validate_device::free_final);

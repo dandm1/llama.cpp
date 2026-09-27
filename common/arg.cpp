@@ -2945,6 +2945,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
     add_opt(common_arg(
+        {"--mtp-accept"}, "P",
+        string_format("assumed probability that one drafted MTP token is accepted, used with --spec-type draft-mtp (default: %.2f)", params.fit_advisor_mtp_accept),
+        [](common_params & params, const std::string & value) {
+            params.fit_advisor_mtp_accept = std::stod(value);
+            if (params.fit_advisor_mtp_accept < 0.0 || params.fit_advisor_mtp_accept > 1.0) {
+                throw std::invalid_argument("--mtp-accept must be between 0 and 1");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
+    add_opt(common_arg(
         {"--validate"},
         "load the chosen allocation for real, run a prompt and a few generation steps, and measure the device memory the "
         "projection missed; the margin is then set from that measurement and the search repeated if it changed",

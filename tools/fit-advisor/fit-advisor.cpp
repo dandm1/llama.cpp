@@ -135,7 +135,7 @@ static std::string mib(double bytes) {
     return std::to_string((long long) std::llround(bytes / (1024.0 * 1024.0)));
 }
 
-static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_advisor_probe & probe, int32_t n_batch) {
+static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_advisor_probe & probe, int32_t n_batch, const std::string & passthrough_cli) {
     constexpr double MiB = 1024.0 * 1024.0;
 
     printf("\n");
@@ -205,6 +205,7 @@ static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_ad
         if (!c.overrides.empty()) {
             args += " -ot \"" + c.overrides_str() + "\"";
         }
+        args += passthrough_cli;
         printf("  %-16s %s\n", c.name.c_str(), args.c_str());
     }
     fflush(stdout); // stdout is block-buffered when redirected, keep the tables separate from the log lines
@@ -317,7 +318,8 @@ static void emit_if_requested(const common_params & params, const fit_advisor_ca
             name = name.substr(0, dot);
         }
     }
-    const fit_advisor_emit_result er = fit_advisor_emit_ini(params.fit_advisor_emit_ini, name, params.model.path, cand, params.n_batch);
+    const fit_advisor_emit_result er = fit_advisor_emit_ini(params.fit_advisor_emit_ini, name, params.model.path, cand, params.n_batch,
+                                                            fit_advisor_passthrough(params));
     if (er.ok) {
         LOG_INF("%s: wrote the %s allocation as section [%s] to %s and verified it reloads unchanged\n", __func__, what, er.section.c_str(), er.path.c_str());
         common_log_flush(common_log_main());
@@ -352,6 +354,10 @@ static fit_advisor_search_result search_and_report(const common_params & params,
         sr.wl.n_ubatch, sr.alloc.n_slots);
     printf("  generation step %.0f us: weights %.0f, attention %.0f, per-node overhead %.0f, boundaries %.0f\n",
         sr.cost.t_gen_step_us, sr.cost.step_weights_us, sr.cost.step_attn_us, sr.cost.step_overhead_us, sr.cost.step_boundary_us);
+    if (sr.wl.use_mtp) {
+        printf("  drafting: verification batch of %u, MTP draft run %.0f us x %u, %.2f tokens per step\n",
+            1 + sr.wl.mtp_draft_n, sr.cost.t_mtp_draft_us, sr.wl.mtp_draft_n, sr.cost.tokens_per_step);
+    }
     for (size_t d = 0; d < sr.proj.devices.size(); d++) {
         const auto & pd = sr.proj.devices[d];
         printf("  %-34.34s model %6.0f MiB, ctx+cmp %5.0f, scratch %4.0f, left %6.0f MiB%s\n", pd.name.c_str(),
@@ -402,6 +408,7 @@ static fit_advisor_search_result search_and_report(const common_params & params,
             for (size_t i = 0; i < c.tensor_split.size(); i++) args += (i ? "/" : "") + std::to_string((long long) std::llround(c.tensor_split[i]));
         }
         if (!c.overrides.empty()) args += " -ot \"" + c.overrides_str() + "\"";
+        args += fit_advisor_passthrough_cli(params);
         printf("  args: %s\n", args.c_str());
     }
     fflush(stdout);
@@ -463,7 +470,7 @@ int llama_fit_advisor(int argc, char ** argv) {
     LOG_INF("%s: probing %zu candidates ...\n", __func__, cands.size());
     common_log_flush(common_log_main());
 
-    print_table(cands, probe, params.n_batch);
+    print_table(cands, probe, params.n_batch, fit_advisor_passthrough_cli(params));
     LOG_INF("%s: %zu probes executed\n", __func__, probe.n_probes);
 
     if (params.fit_advisor_verify) {
@@ -571,6 +578,12 @@ int llama_fit_advisor(int argc, char ** argv) {
         w.n_ubatch = (uint32_t) params.n_ubatch;
         w.use_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
                                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        w.mtp_draft_n = (uint32_t) std::max(0, params.speculative.draft.n_max);
+        w.mtp_accept  = params.fit_advisor_mtp_accept;
+        if (w.use_mtp && inv.n_layer_nextn == 0) {
+            LOG_WRN("%s: --spec-type draft-mtp given but the model has no MTP layers, pricing without drafting\n", __func__);
+            w.use_mtp = false;
+        }
         return w;
     }();
 
@@ -641,6 +654,10 @@ int llama_fit_advisor(int argc, char ** argv) {
 
     printf("\nestimated cost per request, workload '%s': %u prompt + %u generated tokens, %u concurrent, ubatch %u\n",
         params.fit_advisor_workload.c_str(), wl.prompt_tokens, wl.gen_tokens, wl.concurrency, wl.n_ubatch);
+    if (wl.use_mtp) {
+        printf("  MTP drafting: %u draft tokens per step at %.0f%% acceptance each -> %.2f tokens per step (--mtp-accept)\n",
+            wl.mtp_draft_n, 100.0 * wl.mtp_accept, wl.tokens_per_step());
+    }
     for (const auto & cd : cost_devs) {
         if (!cd.is_cpu) {
             printf("  %s runs CPU-resident weights itself from batch %d\n", cd.name.c_str(), cd.offload_min_batch);

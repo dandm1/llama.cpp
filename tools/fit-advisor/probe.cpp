@@ -4,7 +4,9 @@
 #include "llama.h"
 #include "../../src/llama-ext.h"
 #include "log.h"
+#include "speculative.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -94,8 +96,38 @@ const fit_advisor_projection & fit_advisor_probe::run(const fit_advisor_candidat
         uint32_t hp_ngl = 0;
         uint32_t hp_nct = 0;
         uint32_t hp_nex = 0;
-        const common_device_memory_data_vec dmds = common_get_device_memory_data(
+        common_device_memory_data_vec dmds = common_get_device_memory_data(
             p.model.path.c_str(), &mparams, &cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+        // with MTP drafting the server creates a second context on the same weights for the MTP layer(s); its
+        // KV cache and compute buffers compete for the same devices, so they are measured and added like the fitter does
+        const bool spec_mtp = std::find(p.speculative.types.begin(), p.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != p.speculative.types.end();
+        if (spec_mtp) {
+            common_params p_dft = common_base_params_to_speculative(p);
+            llama_model_params   mparams_dft = common_model_params_to_llama(p_dft);
+            llama_context_params cparams_dft = common_context_params_to_llama(p_dft);
+            cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_dft.n_rs_seq = 0;
+            cparams_dft.n_ctx    = cparams.n_ctx;
+            std::vector<ggml_backend_dev_t> devs_dft;
+            uint32_t ngl_dft = 0, nct_dft = 0, nex_dft = 0;
+            const common_device_memory_data_vec dmds_dft = common_get_device_memory_data(
+                p.model.path.c_str(), &mparams_dft, &cparams_dft, devs_dft, ngl_dft, nct_dft, nex_dft, log_level);
+            for (size_t je = 0; je < devs_dft.size(); je++) {
+                for (size_t id = 0; id < devs.size(); id++) {
+                    if (devs_dft[je] == devs[id]) {
+                        // the weights are the main model's, already counted; context, compute and scratch are extra
+                        dmds[id].context += dmds_dft[je].context;
+                        dmds[id].compute += dmds_dft[je].compute;
+                        dmds[id].scratch  = std::max(dmds[id].scratch, dmds_dft[je].scratch);
+                        break;
+                    }
+                }
+            }
+            dmds.back().context += dmds_dft.back().context;
+            dmds.back().compute += dmds_dft.back().compute;
+        }
 
         // dmds has one entry per device followed by the host
         proj.n_ctx_train = hp_nct;

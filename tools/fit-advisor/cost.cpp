@@ -87,6 +87,19 @@ double fit_advisor_s_per_byte(const fit_advisor_matmul_rate & r, uint32_t batch)
     return cp;
 }
 
+double fit_advisor_workload::tokens_per_step() const {
+    if (!use_mtp || mtp_draft_n == 0) {
+        return 1.0;
+    }
+    // acceptances treated as independent: the k-th draft token counts only if every earlier one was accepted
+    double ret = 1.0, pk = 1.0;
+    for (uint32_t k = 0; k < mtp_draft_n; k++) {
+        pk  *= std::min(1.0, std::max(0.0, mtp_accept));
+        ret += pk;
+    }
+    return ret;
+}
+
 namespace {
 
 // expert tensors: at batch b each token routes to n_used of n_expert experts, so an expert sees on average
@@ -207,10 +220,21 @@ double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fi
     const uint32_t n_ub      = std::max<uint32_t>(1, wl.n_ubatch);
     const double n_pp_steps  = std::ceil((double) wl.prompt_tokens / n_ub);
     const fit_advisor_tensor & t = inv.tensors[tensor_idx];
-    const fit_advisor_tensor_use & u_tg = tensor_idx < gp.use_tg.size() ? gp.use_tg[tensor_idx] : fit_advisor_tensor_use{};
     const fit_advisor_tensor_use & u_pp = tensor_idx < gp.use_pp.size() ? gp.use_pp[tensor_idx] : fit_advisor_tensor_use{};
-    return wl.gen_tokens * fit_advisor_tensor_cost_us(inv, t, u_tg, dev_idx, devices, batch_gen)
-         + n_pp_steps    * fit_advisor_tensor_cost_us(inv, t, u_pp, dev_idx, devices, n_ub);
+    const double pp_us = n_pp_steps * fit_advisor_tensor_cost_us(inv, t, u_pp, dev_idx, devices, n_ub);
+
+    const bool is_mtp = t.layer >= (int32_t) inv.n_layer;
+    if (is_mtp && !wl.use_mtp) {
+        return pp_us;
+    }
+    // generation: without drafting one step per token; with drafting a step verifies 1 + draft tokens in one batch
+    // through the trunk and runs the MTP layer once per draft token, yielding tokens_per_step() tokens
+    const double n_steps = wl.gen_tokens / wl.tokens_per_step();
+    const uint32_t batch_step = is_mtp ? batch_gen : batch_gen * (wl.use_mtp ? 1 + wl.mtp_draft_n : 1);
+    const fit_advisor_tensor_use & u_gen = batch_step > 4
+        ? u_pp : (tensor_idx < gp.use_tg.size() ? gp.use_tg[tensor_idx] : fit_advisor_tensor_use{});
+    const double runs_per_step = is_mtp ? (double) wl.mtp_draft_n : 1.0;
+    return n_steps * runs_per_step * fit_advisor_tensor_cost_us(inv, t, u_gen, dev_idx, devices, batch_step) + pp_us;
 }
 
 fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, const fit_advisor_allocation & alloc,
@@ -231,13 +255,22 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
     const double   fill_frac   = std::min(1.0, (wl.prompt_tokens + wl.gen_tokens / 2.0) / n_ctx_slot);
 
     // one decode step: every weight once for the batch, attention over each active slot's KV, boundaries
-    auto step_us = [&](uint32_t batch, double & weights, double & attn, double & overhead, double & boundary) {
+    // sel: 0 = trunk layers only, 1 = MTP layers only (one draft run), 2 = everything loaded in one graph
+    enum { SEL_TRUNK = 0, SEL_MTP = 1, SEL_ALL = 2 };
+    auto layer_selected = [&](int32_t layer, int sel) {
+        const bool is_mtp = layer >= (int32_t) inv.n_layer;
+        if (is_mtp && !wl.use_mtp) {
+            return false; // MTP layer, not loaded and not executed
+        }
+        return sel == SEL_ALL || (sel == SEL_MTP) == is_mtp;
+    };
+    auto step_us = [&](uint32_t batch, int sel, double & weights, double & attn, double & overhead, double & boundary) {
         weights = attn = overhead = boundary = 0;
         const std::vector<fit_advisor_tensor_use> & uses = batch > 4 ? gp.use_pp : gp.use_tg;
         for (size_t i = 0; i < inv.tensors.size(); i++) {
             const auto & t = inv.tensors[i];
-            if (t.layer >= (int32_t) inv.n_layer && !wl.use_mtp) {
-                continue; // MTP layer, not loaded and not executed
+            if (t.layer >= 0 ? !layer_selected(t.layer, sel) : sel == SEL_MTP) {
+                continue; // global tensors (embeddings, output) belong to the trunk graph
             }
             if (t.kind == FIT_ADVISOR_TENSOR_TOKEN_EMBD) {
                 continue; // a row lookup, not a matmul
@@ -246,7 +279,11 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             weights += tensor_us(inv, t, use, alloc.tensor_device[i], devices, batch, c.error);
         }
 
-        // attention: the KV bytes each device holds for this candidate, scaled by fill and active slots
+        // attention: the KV bytes each device holds for this candidate, scaled by fill and active slots; the MTP layers
+        // hold their share of the cache, so a draft run attends over that share and the trunk over the rest
+        const double attn_share = sel == SEL_ALL ? 1.0
+            : sel == SEL_MTP ? (double) inv.n_layer_nextn / std::max<uint32_t>(1, n_layer_all)
+            : (wl.use_mtp ? (double) inv.n_layer / std::max<uint32_t>(1, n_layer_all) : 1.0);
         for (size_t d = 0; d < proj.devices.size() && d < devices.size(); d++) {
             const auto & pd = proj.devices[d];
             const auto * m  = devices[d].meas;
@@ -258,7 +295,7 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
                 best = std::max({ best, r.kv_bytes_per_s_fa, r.kv_bytes_per_s_nofa });
             }
             if (best > 0) {
-                attn += pd.context * fill_frac * ((double) batch_gen / alloc.n_slots) / best * 1e6;
+                attn += attn_share * pd.context * fill_frac * ((double) batch_gen / alloc.n_slots) / best * 1e6;
             }
         }
         {
@@ -269,7 +306,7 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
                     best = std::max({ best, r.kv_bytes_per_s_fa, r.kv_bytes_per_s_nofa });
                 }
                 if (best > 0) {
-                    attn += proj.host.context * fill_frac * ((double) batch_gen / alloc.n_slots) / best * 1e6;
+                    attn += attn_share * proj.host.context * fill_frac * ((double) batch_gen / alloc.n_slots) / best * 1e6;
                 }
             }
         }
@@ -278,7 +315,7 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
         const bool pp = batch > 4;
         const std::vector<uint32_t> & ops = pp ? gp.ops_per_layer_pp : gp.ops_per_layer_tg;
         for (uint32_t il = 0; il < n_layer_all && il < ops.size(); il++) {
-            if (il >= inv.n_layer && !wl.use_mtp) {
+            if (!layer_selected((int32_t) il, sel)) {
                 continue;
             }
             const int d = alloc.layer_device(il, n_layer_all);
@@ -336,10 +373,7 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
         std::vector<away_op> aways;
         for (size_t i = 0; i < inv.tensors.size() && i < uses.size(); i++) {
             const auto & t = inv.tensors[i];
-            if (t.layer < 0 || uses[i].op == 0) {
-                continue;
-            }
-            if (t.layer >= (int32_t) inv.n_layer && !wl.use_mtp) {
+            if (t.layer < 0 || uses[i].op == 0 || !layer_selected(t.layer, sel)) {
                 continue;
             }
             const int home = alloc.layer_device((uint32_t) t.layer, n_layer_all);
@@ -369,14 +403,26 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
         }
     };
 
-    step_us(batch_gen, c.step_weights_us, c.step_attn_us, c.step_overhead_us, c.step_boundary_us);
-    c.t_gen_step_us = c.step_weights_us + c.step_attn_us + c.step_overhead_us + c.step_boundary_us;
+    c.tokens_per_step = wl.tokens_per_step();
+    if (wl.use_mtp && inv.n_layer_nextn > 0 && wl.mtp_draft_n > 0) {
+        // drafting: the trunk verifies 1 + draft tokens per slot in one batch, then the MTP layer runs once per
+        // draft token at the generation batch; the step yields tokens_per_step tokens per slot
+        step_us(batch_gen * (1 + wl.mtp_draft_n), SEL_TRUNK, c.step_weights_us, c.step_attn_us, c.step_overhead_us, c.step_boundary_us);
+        double w, a, o, b;
+        step_us(batch_gen, SEL_MTP, w, a, o, b);
+        c.t_mtp_draft_us = w + a + o + b;
+        c.t_gen_step_us  = c.step_weights_us + c.step_attn_us + c.step_overhead_us + c.step_boundary_us
+                         + wl.mtp_draft_n * c.t_mtp_draft_us;
+    } else {
+        step_us(batch_gen, SEL_ALL, c.step_weights_us, c.step_attn_us, c.step_overhead_us, c.step_boundary_us);
+        c.t_gen_step_us = c.step_weights_us + c.step_attn_us + c.step_overhead_us + c.step_boundary_us;
+    }
 
     // prompt: ubatches of wl.n_ubatch tokens, attention grows with the prefix, approximated at half fill
     {
         double w, a, o, b;
         const uint32_t n_ub = std::max<uint32_t>(1, wl.n_ubatch);
-        step_us(n_ub, w, a, o, b);
+        step_us(n_ub, SEL_ALL, w, a, o, b); // the draft context processes the prompt as well
         const double n_steps = std::ceil((double) wl.prompt_tokens / n_ub);
         // attention during the prompt sees on average half the prompt, per ubatch of n_ub query rows:
         // scale the batch-1 attention figure by rows and by the prompt's share of the fill
@@ -384,8 +430,8 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
         c.t_prompt_us = n_steps * (w + a_prompt + o + b);
     }
 
-    c.t_request_us = c.t_prompt_us + wl.gen_tokens * c.t_gen_step_us;
-    c.gen_tokens_per_s    = c.t_gen_step_us > 0 ? batch_gen * 1e6 / c.t_gen_step_us : 0;
+    c.t_request_us = c.t_prompt_us + wl.gen_tokens / c.tokens_per_step * c.t_gen_step_us;
+    c.gen_tokens_per_s    = c.t_gen_step_us > 0 ? batch_gen * c.tokens_per_step * 1e6 / c.t_gen_step_us : 0;
     c.prompt_tokens_per_s = c.t_prompt_us > 0 ? wl.prompt_tokens * 1e6 / c.t_prompt_us : 0;
     c.ok = true;
     return c;

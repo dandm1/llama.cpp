@@ -2,6 +2,8 @@
 
 #include "common.h"
 #include "log.h"
+#include "speculative.h"
+#include "ggml-backend.h"
 #include "preset.h"
 
 #include <fstream>
@@ -39,8 +41,66 @@ std::string without_section(const std::string & text, const std::string & sectio
 
 } // namespace
 
+std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common_params & params) {
+    const common_params defaults = {};
+    std::vector<fit_advisor_passthrough_option> ret;
+    if (params.cache_type_k != defaults.cache_type_k) {
+        ret.push_back({ "LLAMA_ARG_CACHE_TYPE_K", ggml_type_name(params.cache_type_k), std::string("-ctk ") + ggml_type_name(params.cache_type_k) });
+    }
+    if (params.cache_type_v != defaults.cache_type_v) {
+        ret.push_back({ "LLAMA_ARG_CACHE_TYPE_V", ggml_type_name(params.cache_type_v), std::string("-ctv ") + ggml_type_name(params.cache_type_v) });
+    }
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_AUTO) {
+        const char * v = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ? "on" : "off";
+        ret.push_back({ "LLAMA_ARG_FLASH_ATTN", v, std::string("-fa ") + v });
+    }
+    if (params.cpuparams.n_threads != defaults.cpuparams.n_threads && params.cpuparams.n_threads > 0) {
+        const std::string v = std::to_string(params.cpuparams.n_threads);
+        ret.push_back({ "LLAMA_ARG_THREADS", v, "-t " + v });
+    }
+    if (params.no_kv_offload) {
+        ret.push_back({ "LLAMA_ARG_KV_OFFLOAD", "false", "-nkvo" });
+    }
+    if (params.kv_unified) {
+        ret.push_back({ "LLAMA_ARG_KV_UNIFIED", "true", "-kvu" });
+    }
+    if (params.load_mode != defaults.load_mode) {
+        const char * v = params.load_mode == LLAMA_LOAD_MODE_NONE ? "none" : params.load_mode == LLAMA_LOAD_MODE_MMAP ? "mmap"
+                       : params.load_mode == LLAMA_LOAD_MODE_MLOCK ? "mlock" : params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? "mmap+mlock" : "auto";
+        ret.push_back({ "LLAMA_ARG_LOAD_MODE", v, std::string("--load-mode ") + v });
+    }
+    if (!params.devices.empty()) {
+        std::string v;
+        for (ggml_backend_dev_t dev : params.devices) {
+            v += (v.empty() ? "" : ",") + std::string(ggml_backend_dev_name(dev));
+        }
+        ret.push_back({ "LLAMA_ARG_DEVICE", v, "-dev " + v });
+    }
+    if (!params.speculative.types.empty()) {
+        std::string v;
+        for (const auto t : params.speculative.types) {
+            v += (v.empty() ? "" : ",") + common_speculative_type_to_str(t);
+        }
+        ret.push_back({ "LLAMA_ARG_SPEC_TYPE", v, "--spec-type " + v });
+        if (params.speculative.draft.n_max != defaults.speculative.draft.n_max) {
+            const std::string n = std::to_string(params.speculative.draft.n_max);
+            ret.push_back({ "LLAMA_ARG_DRAFT_MAX", n, "--draft-max " + n });
+        }
+    }
+    return ret;
+}
+
+std::string fit_advisor_passthrough_cli(const common_params & params) {
+    std::string ret;
+    for (const auto & o : fit_advisor_passthrough(params)) {
+        ret += " " + o.cli;
+    }
+    return ret;
+}
+
 fit_advisor_emit_result fit_advisor_emit_ini(const std::string & path, const std::string & section, const std::string & model_path,
-                                             const fit_advisor_candidate & cand, int32_t n_batch_base) {
+                                             const fit_advisor_candidate & cand, int32_t n_batch_base,
+                                             const std::vector<fit_advisor_passthrough_option> & passthrough) {
     fit_advisor_emit_result r;
     r.path    = path;
     r.section = section;
@@ -70,6 +130,9 @@ fit_advisor_emit_result fit_advisor_emit_ini(const std::string & path, const std
     if (cand.n_ubatch > 0) {
         kv.push_back({ "LLAMA_ARG_UBATCH", std::to_string(cand.n_ubatch) });
         kv.push_back({ "LLAMA_ARG_BATCH", std::to_string(std::max<int32_t>((int32_t) cand.n_ubatch, n_batch_base)) });
+    }
+    for (const auto & o : passthrough) {
+        kv.push_back({ o.env, o.value });
     }
 
     try {
