@@ -58,8 +58,10 @@ std::string alloc_key(const fit_advisor_allocation & a) {
     if (a.draft_mtp) {
         ret += "|mtp";
     }
-    if (a.op_offload_min_batch > 0) {
-        ret += "|off" + std::to_string(a.op_offload_min_batch);
+    for (size_t d = 0; d < a.op_offload_min_batch_dev.size(); d++) {
+        if (a.op_offload_min_batch_dev[d] > 0) {
+            ret += "|off" + std::to_string(d) + "=" + std::to_string(a.op_offload_min_batch_dev[d]);
+        }
     }
     return ret;
 }
@@ -80,8 +82,11 @@ std::string alloc_name(const fit_advisor_allocation & a) {
     if (a.draft_mtp) {
         ret += "-mtp";
     }
-    if (a.op_offload_min_batch > 0) {
-        ret += a.op_offload_min_batch >= FIT_ADVISOR_OFFLOAD_NEVER ? "-nooff" : "-off" + std::to_string(a.op_offload_min_batch);
+    for (size_t d = 0; d < a.op_offload_min_batch_dev.size(); d++) {
+        const int32_t v = a.op_offload_min_batch_dev[d];
+        if (v > 0) {
+            ret += "-off" + std::to_string(d) + (v >= FIT_ADVISOR_OFFLOAD_NEVER ? "never" : std::to_string(v));
+        }
     }
     return ret;
 }
@@ -120,7 +125,7 @@ struct searcher {
     }
     fit_advisor_workload workload(const fit_advisor_allocation & a) const {
         fit_advisor_workload wl = workload(a.n_ubatch, a.draft_mtp);
-        wl.op_offload_min_batch = a.op_offload_min_batch;
+        wl.op_offload_min_batch_dev = a.op_offload_min_batch_dev;
         return wl;
     }
     // drafting is explored when the user allowed it (--spec-type draft-mtp) and the model has MTP layers
@@ -324,7 +329,10 @@ struct searcher {
 
         fit_advisor_allocation base = fit_advisor_allocation::from_layer_split(inv, device_bufts, part, opts.n_ctx, slots);
         base.draft_mtp = wl_base.use_mtp;
-        base.op_offload_min_batch = wl_base.op_offload_min_batch;
+        base.op_offload_min_batch_dev = wl_base.op_offload_min_batch_dev;
+        if (base.op_offload_min_batch_dev.empty() && wl_base.op_offload_min_batch > 0) {
+            base.op_offload_min_batch_dev.assign(nd, wl_base.op_offload_min_batch);
+        }
         base.n_ubatch = ub;
         const std::vector<group> groups = build_groups(wl);
 
@@ -659,13 +667,16 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             nxt.alloc = nxt.alloc.with_layer_home(inv, il, d);
             n_rehome_tried++;
         } else if (mv < 0.96 && opts.offload_options.size() > 1) {
-            // step the op offload threshold: when CPU-resident weights are copied to a device and run there
+            // step one device's op offload threshold: from which batch it takes CPU-resident weights of its layers;
+            // a device that declines leaves them to the first willing device and keeps a small compute buffer
             const auto & oo = opts.offload_options;
-            size_t k = std::find(oo.begin(), oo.end(), nxt.alloc.op_offload_min_batch) - oo.begin();
+            const size_t d = (size_t) (uni(rng) * nd) % nd;
+            if (nxt.alloc.op_offload_min_batch_dev.size() < nd) nxt.alloc.op_offload_min_batch_dev.resize(nd, 0);
+            size_t k = std::find(oo.begin(), oo.end(), nxt.alloc.op_offload_min_batch_dev[d]) - oo.begin();
             if (k >= oo.size()) continue;
             k = uni(rng) < 0.5 ? (k == 0 ? 1 : k - 1) : (k + 1 >= oo.size() ? k - 1 : k + 1);
             if (k >= oo.size()) continue;
-            nxt.alloc.op_offload_min_batch = oo[k];
+            nxt.alloc.op_offload_min_batch_dev[d] = oo[k];
             nxt.wl = S.workload(nxt.alloc);
             n_offload_tried++;
         } else if (mv < 0.965 && S.mtp_searchable()) {

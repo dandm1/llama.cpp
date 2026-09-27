@@ -314,6 +314,7 @@ extern "C" {
     // a layer whose device is chosen explicitly instead of by n_gpu_layers / tensor_split; its weights (unless a
     // tensor buffer type override says otherwise), KV cache, recurrent state and pinned ops all follow
     #define LLAMA_LAYER_OUTPUT (-2) // il of the output layer (output norm and output head)
+    #define LLAMA_OP_OFFLOAD_NEVER (1 << 30) // op offload threshold no batch reaches: the device never takes host-weight ops
     struct llama_model_layer_dev_override {
         int32_t il;              // layer index, LLAMA_LAYER_OUTPUT, or -1 to end the list
         ggml_backend_dev_t dev;  // a device of the model, or the CPU device
@@ -408,8 +409,11 @@ extern "C" {
         void *              abort_callback_data;
 
         // batch size from which devices take ops on host-resident weights (op offload) by copying the weights;
-        // 0 keeps each backend's default (GGML_OP_OFFLOAD_MIN_BATCH or 32). applies to the model's devices as a whole
-        int32_t op_offload_min_batch;
+        // 0 keeps each backend's default (GGML_OP_OFFLOAD_MIN_BATCH or 32), LLAMA_OP_OFFLOAD_NEVER disables it.
+        // op_offload_min_batch applies to every device of the model; op_offload_min_batch_dev, if not NULL, gives
+        // one value per device in the model's device order and overrides it where the entry is not 0
+        int32_t         op_offload_min_batch;
+        const int32_t * op_offload_min_batch_dev;
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)

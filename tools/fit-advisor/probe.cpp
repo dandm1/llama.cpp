@@ -32,10 +32,19 @@ std::string fit_advisor_candidate::key() const {
     if (spec_mtp) {
         ss << " mtp";
     }
-    if (op_offload_min_batch > 0) {
-        ss << " offload=" << op_offload_min_batch;
+    const std::string off = op_offload_str();
+    if (!off.empty()) {
+        ss << " offload=" << off;
     }
     return ss.str();
+}
+
+std::string fit_advisor_candidate::op_offload_str() const {
+    bool any = false;
+    for (const int32_t v : op_offload_min_batch_dev) {
+        any = any || v > 0;
+    }
+    return any ? common_op_offload_min_batch_to_str(0, op_offload_min_batch_dev) : "";
 }
 
 static int32_t g_default_op_offload = 0;
@@ -255,8 +264,12 @@ bool fit_advisor_apply_candidate(common_params & p, const fit_advisor_candidate 
     }
     p.tensor_buft_overrides.push_back({ nullptr, nullptr });
 
-    // the offload threshold is device-wide; always set it explicitly so probes do not inherit each other's value
-    p.op_offload_min_batch = cand.op_offload_min_batch > 0 ? cand.op_offload_min_batch : g_default_op_offload;
+    // the offload threshold is device-wide; always set every device explicitly so probes do not inherit each other's value
+    p.op_offload_min_batch = g_default_op_offload;
+    p.op_offload_min_batch_dev.assign(llama_max_devices(), 0);
+    for (size_t d = 0; d < cand.op_offload_min_batch_dev.size() && d < p.op_offload_min_batch_dev.size(); d++) {
+        p.op_offload_min_batch_dev[d] = cand.op_offload_min_batch_dev[d] > 0 ? cand.op_offload_min_batch_dev[d] : g_default_op_offload;
+    }
 
     // drafting is the candidate's decision: with it the MTP layers are loaded and priced, without it neither
     p.speculative.types.erase(std::remove(p.speculative.types.begin(), p.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP),

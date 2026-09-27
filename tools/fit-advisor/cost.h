@@ -7,6 +7,7 @@
 
 #include "allocation.h"
 #include "inventory.h"
+#include "llama.h"
 #include "measure.h"
 #include "probe.h"
 
@@ -20,6 +21,15 @@ struct fit_advisor_workload {
     bool     throughput    = false; // optimise aggregate tokens/s instead of per-request latency
     uint32_t n_ubatch      = 512;  // prompt-processing micro-batch
     int32_t  op_offload_min_batch = 0; // batch from which CPU-resident weights are copied to a device and run there; 0 = each device's own
+    std::vector<int32_t> op_offload_min_batch_dev; // per allocation device, overrides the scalar where > 0 (empty: none)
+
+    // the threshold that applies to allocation device d (its own measured one when nothing overrides it)
+    int32_t offload_min_for(size_t d, int32_t device_own) const {
+        if (d < op_offload_min_batch_dev.size() && op_offload_min_batch_dev[d] > 0) {
+            return op_offload_min_batch_dev[d];
+        }
+        return op_offload_min_batch > 0 ? op_offload_min_batch : device_own;
+    }
     bool     use_mtp       = false; // MTP layers are executed (speculative MTP drafting on), otherwise they are not even loaded
     uint32_t mtp_draft_n   = 3;     // draft tokens per step when drafting (--draft-max)
     double   mtp_accept    = 0.8;   // probability that one drafted token is accepted, a heuristic like the token counts
@@ -79,11 +89,15 @@ double fit_advisor_s_per_byte(const fit_advisor_matmul_rate & r, uint32_t batch)
 //   - matmul weights: bytes on the measured per-byte curve, plus the per-ubatch copy when offloaded
 //   - anything else: the device's per-op cost plus the op's activation bytes over the device's memory rate
 // home_idx: the device of the tensor's layer, where an offloaded op runs when that device wants it (-1: the first willing one)
-// offload_min: threshold overriding the devices' own when > 0 (FIT_ADVISOR_OFFLOAD_NEVER disables offload)
-constexpr int32_t FIT_ADVISOR_OFFLOAD_NEVER = 1 << 30;
+// wl: the workload whose offload thresholds apply (nullptr: the devices' own)
+constexpr int32_t FIT_ADVISOR_OFFLOAD_NEVER = LLAMA_OP_OFFLOAD_NEVER;
 double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
                                   int dev_idx, const std::vector<fit_advisor_cost_device> & devices, uint32_t batch, int home_idx = -1,
-                                  int32_t offload_min = 0);
+                                  const fit_advisor_workload * wl = nullptr);
+
+// the allocation device that takes an offloaded op of a layer whose home is home_idx at this batch: the home when it
+// wants it, else the first willing one; -1 when none does (the op runs on the CPU)
+int fit_advisor_offload_taker(const std::vector<fit_advisor_cost_device> & devices, uint32_t batch, int home_idx, const fit_advisor_workload * wl);
 
 // whether the cost of this tensor on this device rests on measurements (false: a fallback rate was used, or the
 // device has no measurements); the search never lets an unknown cost decide a placement

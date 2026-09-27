@@ -1752,7 +1752,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
-    cparams.op_offload_min_batch = params.op_offload_min_batch;
+    cparams.op_offload_min_batch     = params.op_offload_min_batch;
+    cparams.op_offload_min_batch_dev = params.op_offload_min_batch_dev.empty() ? NULL : params.op_offload_min_batch_dev.data();
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 
@@ -2443,6 +2444,70 @@ std::string common_layer_dev_overrides_to_str(const std::vector<llama_model_laye
         ret += (ret.empty() ? "" : ",") + std::to_string(overrides[i].il)
              + (j > i ? "-" + std::to_string(overrides[j].il) : "") + "=" + dname;
         i = j + 1;
+    }
+    return ret;
+}
+
+//
+// op offload threshold
+//
+
+static bool parse_op_offload_value(const std::string & item, int32_t & out, std::string & error) {
+    if (item == "never" || item == "off") {
+        out = LLAMA_OP_OFFLOAD_NEVER;
+        return true;
+    }
+    if (item == "default" || item == "auto") {
+        out = 0;
+        return true;
+    }
+    try {
+        out = std::stoi(item);
+    } catch (const std::exception &) {
+        error = "bad op offload threshold '" + item + "'";
+        return false;
+    }
+    if (out < 0) {
+        error = "bad op offload threshold '" + item + "'";
+        return false;
+    }
+    return true;
+}
+
+bool common_parse_op_offload_min_batch(const std::string & value, int32_t & scalar, std::vector<int32_t> & per_dev, std::string & error) {
+    const auto items = string_split<std::string>(value, ',');
+    per_dev.clear();
+    scalar = 0;
+    if (items.size() == 1) {
+        return parse_op_offload_value(items[0], scalar, error);
+    }
+    for (const auto & item : items) {
+        int32_t v = 0;
+        if (!parse_op_offload_value(item, v, error)) {
+            return false;
+        }
+        per_dev.push_back(v);
+    }
+    // the list must cover every device the model may use; pad with the default
+    per_dev.resize(std::max<size_t>(per_dev.size(), llama_max_devices()), 0);
+    return true;
+}
+
+std::string common_op_offload_min_batch_to_str(int32_t scalar, const std::vector<int32_t> & per_dev) {
+    auto one = [](int32_t v) -> std::string {
+        return v >= LLAMA_OP_OFFLOAD_NEVER ? "never" : v <= 0 ? "default" : std::to_string(v);
+    };
+    if (per_dev.empty()) {
+        return one(scalar);
+    }
+    // trim trailing defaults, keep at least one entry
+    size_t n = per_dev.size();
+    while (n > 1 && per_dev[n - 1] <= 0) {
+        n--;
+    }
+    std::string ret;
+    for (size_t i = 0; i < n; i++) {
+        ret += (i ? "," : "") + one(per_dev[i]);
     }
     return ret;
 }

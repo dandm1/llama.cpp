@@ -2764,11 +2764,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_OVERRIDE_LAYER_DEVICE"));
     add_opt(common_arg(
-        {"--op-offload-min-batch"}, "N",
-        "batch size from which devices run ops on CPU-resident weights themselves by copying the weights "
+        {"--op-offload-min-batch"}, "N|N,N,...",
+        "batch size from which devices run ops on CPU-resident weights themselves by copying the weights; one value for "
+        "every device or one per device in model order, 'never' disables it on a device "
         "(default: the backend's, usually 32 or GGML_OP_OFFLOAD_MIN_BATCH)",
-        [](common_params & params, int value) {
-            params.op_offload_min_batch = value;
+        [](common_params & params, const std::string & value) {
+            std::string error;
+            if (!common_parse_op_offload_min_batch(value, params.op_offload_min_batch, params.op_offload_min_batch_dev, error)) {
+                throw std::invalid_argument("--op-offload-min-batch: " + error);
+            }
         }
     ).set_env("LLAMA_ARG_OP_OFFLOAD_MIN_BATCH"));
     add_opt(common_arg(

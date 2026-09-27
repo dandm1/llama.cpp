@@ -541,6 +541,7 @@ struct common_params {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     std::vector<llama_model_layer_dev_override>   layer_dev_overrides;   // layers with an explicit device (-old), terminated with il == -1 when non-empty
     int32_t op_offload_min_batch = 0; // batch size from which devices take ops on CPU-resident weights, 0 = backend default
+    std::vector<int32_t> op_offload_min_batch_dev; // per device in model order (--op-offload-min-batch N,N,...), empty = the scalar
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
@@ -1237,3 +1238,8 @@ bool common_parse_layer_dev_overrides(const std::string & value, std::vector<lla
 
 // the inverse, as accepted by -old / --override-layer-device
 std::string common_layer_dev_overrides_to_str(const std::vector<llama_model_layer_dev_override> & overrides);
+
+// parse "N" or "N,N,..." (N a batch size, 0 for the backend default, "never"/"off" to disable) into the scalar and the
+// per-device list; false with error set
+bool common_parse_op_offload_min_batch(const std::string & value, int32_t & scalar, std::vector<int32_t> & per_dev, std::string & error);
+std::string common_op_offload_min_batch_to_str(int32_t scalar, const std::vector<int32_t> & per_dev);

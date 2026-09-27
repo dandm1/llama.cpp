@@ -135,9 +135,30 @@ double device_bandwidth(const fit_advisor_cost_device & d) {
 
 // time for one op over a tensor: per-token cost times tokens; matmuls on the measured curve, other ops by the
 // activation bytes they touch. weights on the CPU above a device's offload threshold are copied there and run there.
+} // namespace
+
+int fit_advisor_offload_taker(const std::vector<fit_advisor_cost_device> & devices, uint32_t batch, int home_idx, const fit_advisor_workload * wl) {
+    auto takes = [&](size_t d) {
+        const auto & dev = devices[d];
+        const int32_t min_batch = wl ? wl->offload_min_for(d, dev.offload_min_batch) : dev.offload_min_batch;
+        return !dev.is_cpu && dev.meas && min_batch > 0 && batch >= (uint32_t) min_batch;
+    };
+    if (home_idx >= 0 && (size_t) home_idx < devices.size() && takes((size_t) home_idx)) {
+        return home_idx;
+    }
+    for (size_t d = 0; d < devices.size(); d++) {
+        if (takes(d)) {
+            return (int) d;
+        }
+    }
+    return -1;
+}
+
+namespace {
+
 double tensor_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
                  int dev_idx, const std::vector<fit_advisor_cost_device> & devices, uint32_t batch, std::string & error, int home_idx,
-                 int32_t offload_min) {
+                 const fit_advisor_workload * wl) {
     if (use.op == 0) {
         return 0; // not read by the graph (e.g. an MTP tensor with MTP off)
     }
@@ -148,22 +169,9 @@ double tensor_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t
         // op offload: the scheduler hands an op with a CPU-resident weight to a device that wants it at this batch
         // size, preferring the device that holds the op's activations, i.e. the layer's home, and otherwise the
         // first willing one; the weight is copied there for every ubatch
-        auto takes = [&](const fit_advisor_cost_device & d) {
-            const int32_t min_batch = offload_min > 0 ? offload_min : d.offload_min_batch;
-            return !d.is_cpu && d.meas && min_batch > 0 && batch >= (uint32_t) min_batch;
-        };
-        const fit_advisor_cost_device * target = nullptr;
-        if (home_idx >= 0 && (size_t) home_idx < devices.size() && takes(devices[home_idx])) {
-            target = &devices[home_idx];
-        } else {
-            for (const auto & d : devices) {
-                if (takes(d)) {
-                    target = &d;
-                    break;
-                }
-            }
-        }
-        if (target) {
+        const int taker = fit_advisor_offload_taker(devices, batch, home_idx, wl);
+        if (taker >= 0) {
+            const fit_advisor_cost_device * target = &devices[taker];
             if (target->meas->copy.h2d_gb_s > 0) {
                 copy_us = t.nbytes / (target->meas->copy.h2d_gb_s * 1e9) * 1e6;
             }
@@ -207,9 +215,9 @@ double tensor_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t
 
 double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
                                   int dev_idx, const std::vector<fit_advisor_cost_device> & devices, uint32_t batch, int home_idx,
-                                  int32_t offload_min) {
+                                  const fit_advisor_workload * wl) {
     std::string err;
-    return tensor_us(inv, t, use, dev_idx, devices, batch, err, home_idx, offload_min);
+    return tensor_us(inv, t, use, dev_idx, devices, batch, err, home_idx, wl);
 }
 
 bool fit_advisor_tensor_cost_known(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
@@ -236,7 +244,7 @@ double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fi
     const double n_pp_steps  = std::ceil((double) wl.prompt_tokens / n_ub);
     const fit_advisor_tensor & t = inv.tensors[tensor_idx];
     const fit_advisor_tensor_use & u_pp = tensor_idx < gp.use_pp.size() ? gp.use_pp[tensor_idx] : fit_advisor_tensor_use{};
-    const double pp_us = n_pp_steps * fit_advisor_tensor_cost_us(inv, t, u_pp, dev_idx, devices, n_ub, home_idx, wl.op_offload_min_batch);
+    const double pp_us = n_pp_steps * fit_advisor_tensor_cost_us(inv, t, u_pp, dev_idx, devices, n_ub, home_idx, &wl);
 
     const bool is_mtp = t.layer >= (int32_t) inv.n_layer;
     if (is_mtp && !wl.use_mtp) {
@@ -249,7 +257,7 @@ double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fi
     const fit_advisor_tensor_use & u_gen = batch_step > 4
         ? u_pp : (tensor_idx < gp.use_tg.size() ? gp.use_tg[tensor_idx] : fit_advisor_tensor_use{});
     const double runs_per_step = is_mtp ? (double) wl.mtp_draft_n : 1.0;
-    return n_steps * runs_per_step * fit_advisor_tensor_cost_us(inv, t, u_gen, dev_idx, devices, batch_step, home_idx, wl.op_offload_min_batch) + pp_us;
+    return n_steps * runs_per_step * fit_advisor_tensor_cost_us(inv, t, u_gen, dev_idx, devices, batch_step, home_idx, &wl) + pp_us;
 }
 
 fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, const fit_advisor_allocation & alloc,
@@ -292,7 +300,7 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             }
             const fit_advisor_tensor_use use = i < uses.size() ? uses[i] : fit_advisor_tensor_use{};
             const int home = t.layer >= 0 ? alloc.layer_device((uint32_t) t.layer, n_layer_all) : alloc.layer_device(n_layer_all, n_layer_all);
-            weights += tensor_us(inv, t, use, alloc.tensor_device[i], devices, batch, c.error, home, wl.op_offload_min_batch);
+            weights += tensor_us(inv, t, use, alloc.tensor_device[i], devices, batch, c.error, home, &wl);
         }
 
         // attention: the KV bytes each device holds for this candidate, scaled by fill and active slots; the MTP layers
@@ -379,14 +387,6 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
         // excursions: tensors away from their layer's device, in graph order; consecutive away ops on the same device
         // share one excursion, anything else in between starts a new one. each excursion moves its first op's inputs
         // out and its last op's output back
-        int offload_min = wl.op_offload_min_batch;
-        if (offload_min <= 0) {
-            for (const auto & d : devices) {
-                if (!d.is_cpu && d.offload_min_batch > 0) {
-                    offload_min = offload_min == 0 ? d.offload_min_batch : std::min(offload_min, d.offload_min_batch);
-                }
-            }
-        }
         struct away_op { int node_idx; int dev; int home; size_t act_bytes; };
         std::vector<away_op> aways;
         for (size_t i = 0; i < inv.tensors.size() && i < uses.size(); i++) {
@@ -399,8 +399,15 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             if (dev == home) {
                 continue;
             }
-            if (dev == fit_advisor_allocation::DEV_CPU && offload_min > 0 && batch >= (uint32_t) offload_min) {
-                continue; // offloaded, no split
+            if (dev == fit_advisor_allocation::DEV_CPU) {
+                const int taker = fit_advisor_offload_taker(devices, batch, home, &wl);
+                if (taker == home) {
+                    continue; // offloaded to the layer's own device, no split
+                }
+                if (taker >= 0) {
+                    aways.push_back({ uses[i].node_idx, taker, home, uses[i].act_bytes }); // a trip to the taking device
+                    continue;
+                }
             }
             aways.push_back({ uses[i].node_idx, dev, home, uses[i].act_bytes });
         }

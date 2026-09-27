@@ -27,7 +27,10 @@ struct fit_advisor_candidate {
     std::vector<fit_advisor_override> overrides;
     std::string layer_devices;              // -old spec with buffer type names ("47=CUDA0,output=CUDA0"), empty for none
     bool        spec_mtp = false;           // MTP drafting on: the MTP layers are loaded and a draft context is created
-    int32_t     op_offload_min_batch = 0;   // 0 = the devices' default threshold (see fit_advisor_set_default_op_offload)
+    std::vector<int32_t> op_offload_min_batch_dev; // per device, 0 = the device's default (see fit_advisor_set_default_op_offload)
+
+    // the value of an equivalent --op-offload-min-batch argument, empty when everything is at the default
+    std::string op_offload_str() const;
 
     // canonical description used for memoization and display
     std::string key() const;

@@ -77,10 +77,12 @@ std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common
         ret.push_back({ "LLAMA_ARG_DEVICE", v, "-dev " + v });
     }
     {
-        // the candidate's threshold, or the user's; 0 means the backend default and needs no flag
-        const int32_t v_i = cand.op_offload_min_batch > 0 ? cand.op_offload_min_batch : params.op_offload_min_batch;
-        if (v_i > 0) {
-            const std::string v = std::to_string(v_i);
+        // the candidate's thresholds, else the user's; all-default needs no flag
+        std::string v = cand.op_offload_str();
+        if (v.empty() && (params.op_offload_min_batch > 0 || !params.op_offload_min_batch_dev.empty())) {
+            v = common_op_offload_min_batch_to_str(params.op_offload_min_batch, params.op_offload_min_batch_dev);
+        }
+        if (!v.empty() && v != "default") {
             ret.push_back({ "LLAMA_ARG_OP_OFFLOAD_MIN_BATCH", v, "--op-offload-min-batch " + v });
         }
     }

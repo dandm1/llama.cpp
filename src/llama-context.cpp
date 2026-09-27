@@ -272,14 +272,23 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
-    if (params.op_offload_min_batch > 0) {
+    {
         // a device-wide setting: every context on these devices sees it, the last one set wins
+        size_t i_dev = 0;
         for (const auto & d : model.devices) {
             ggml_backend_dev_t dev = d.dev;
-            if (!ggml_backend_dev_set_op_offload_min_batch(dev, params.op_offload_min_batch)) {
+            const int32_t per_dev = params.op_offload_min_batch_dev ? params.op_offload_min_batch_dev[i_dev] : 0;
+            const int32_t value   = per_dev > 0 ? per_dev : params.op_offload_min_batch;
+            i_dev++;
+            if (value <= 0) {
+                continue;
+            }
+            if (!ggml_backend_dev_set_op_offload_min_batch(dev, value)) {
                 LLAMA_LOG_WARN("%s: device %s has no op offload threshold to set, keeping its default\n", __func__, ggml_backend_dev_name(dev));
+            } else if (value >= LLAMA_OP_OFFLOAD_NEVER) {
+                LLAMA_LOG_INFO("%s: op_offload_min_batch  = never on %s\n", __func__, ggml_backend_dev_name(dev));
             } else {
-                LLAMA_LOG_INFO("%s: op_offload_min_batch  = %d on %s\n", __func__, params.op_offload_min_batch, ggml_backend_dev_name(dev));
+                LLAMA_LOG_INFO("%s: op_offload_min_batch  = %d on %s\n", __func__, value, ggml_backend_dev_name(dev));
             }
         }
     }
@@ -3715,6 +3724,7 @@ llama_context_params llama_context_default_params() {
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.op_offload_min_batch        =*/ 0,
+        /*.op_offload_min_batch_dev    =*/ nullptr,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
