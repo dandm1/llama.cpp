@@ -2143,15 +2143,18 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
-    // weight prefetch only pays when a second non-CPU backend can run while the first copies; a single device, or
-    // GGML_SCHED_PREFETCH=0, keeps the allocator's time-shared input copies and no slots are created
+    // weight prefetch (GGML_SCHED_PREFETCH=1): copy the host-resident weights of upcoming splits on other devices
+    // ahead of time. off by default: it copies whole expert stacks where the default path copies only the experts a
+    // batch uses, which on real text is about half of them, and measured host-to-device concurrency across two
+    // devices was 1.4x rather than 2x, so it lost on the hardware it was measured on. it needs a second non-CPU
+    // backend and a single copy set; without it no slots are created and the allocator time-shares the copies
     {
         const char * env = getenv("GGML_SCHED_PREFETCH");
         int n_devices = 0;
         for (int b = 0; b < n_backends; b++) {
             n_devices += ggml_backend_dev_type(ggml_backend_get_device(backends[b])) != GGML_BACKEND_DEVICE_TYPE_CPU;
         }
-        sched->weight_prefetch = (env ? atoi(env) != 0 : true) && n_devices >= 2 && !parallel;
+        sched->weight_prefetch = (env ? atoi(env) != 0 : false) && n_devices >= 2 && !parallel;
     }
 
     // initialize hash table
