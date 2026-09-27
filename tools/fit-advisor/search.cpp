@@ -601,20 +601,104 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     if (movable.empty()) {
         LOG_INF("%s: nothing movable, keeping the seed\n", __func__);
     }
+    const char * trace_tensor = getenv("FIT_ADVISOR_TRACE"); // substring of a tensor name whose moves are logged
     auto set_group = [&](fit_advisor_allocation & a, const searcher::group & g, int dev) {
         for (const size_t i : g.idx) {
             a.tensor_device[i] = dev;
         }
     };
+    // a destination for a move: the home device, any other device, or the CPU, never where the tensor already is.
+    // the home and the CPU get half the draws between them, other devices share the rest (an expert store on a
+    // third card is exactly the arrangement worth finding on unequal hardware)
+    auto pick_target = [&](int current, int home_dev) -> int {
+        std::vector<int> options;
+        if (current != home_dev) options.push_back(home_dev);
+        if (current != fit_advisor_allocation::DEV_CPU) options.push_back(fit_advisor_allocation::DEV_CPU);
+        std::vector<int> others;
+        for (int d = 0; d < (int) nd; d++) {
+            if (d != current && d != home_dev) others.push_back(d);
+        }
+        if (others.empty() || (!options.empty() && uni(rng) < 0.5)) {
+            return options.empty() ? current : options[(size_t) (uni(rng) * options.size()) % options.size()];
+        }
+        return others[(size_t) (uni(rng) * others.size()) % others.size()];
+    };
+    auto cost_known_on = [&](size_t i, int d) {
+        return i < gp.use_tg.size()
+            && fit_advisor_tensor_cost_known(inv, inv.tensors[i], gp.use_tg[i], d, cost_devs)
+            && fit_advisor_tensor_cost_known(inv, inv.tensors[i], gp.use_pp[i], d, cost_devs);
+    };
+
+    // fill pass: from a state, try every CPU-resident movable group on every device and every CPU-resident single on
+    // its home, best weight-only gain per byte first, keeping each move the full model accepts within the memory
+    // model. run before annealing so an expert store on a spare card is in the seed, and again at the end
+    auto fill_pass = [&](searcher::state & st, std::map<std::string, fit_advisor_projection> & pbk, const char * when) {
+        fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, st.alloc.layers_per_device, opts.n_ctx, st.alloc.n_slots, st.alloc.layer_home);
+        struct cand { int group; size_t single; int dev; double density; };
+        std::vector<cand> cands;
+        for (size_t k = 0; k < movable.size(); k++) {
+            const searcher::group & g = movable[k];
+            if (st.alloc.tensor_device[g.idx[0]] != fit_advisor_allocation::DEV_CPU) continue;
+            for (int d = 0; d < (int) nd; d++) {
+                double gsum = 0;
+                bool known = true;
+                for (const size_t i : g.idx) {
+                    known = known && cost_known_on(i, d);
+                    gsum += S.gain(i, d, st.wl, st.alloc.n_slots);
+                }
+                if (known) cands.push_back({ (int) k, 0, d, gsum / (double) g.bytes });
+            }
+        }
+        for (const size_t i : singles) {
+            if (st.alloc.tensor_device[i] != fit_advisor_allocation::DEV_CPU || home.tensor_device[i] < 0) continue;
+            cands.push_back({ -1, i, home.tensor_device[i], S.gain(i, home.tensor_device[i], st.wl, st.alloc.n_slots) / (double) inv.tensors[i].nbytes });
+        }
+        std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.density > b.density; });
+        int n_filled = 0;
+        const std::string fkey = alloc_key(st.alloc);
+        if (!pbk.count(fkey)) return 0;
+        for (const cand & c : cands) {
+            searcher::state nxt = st;
+            if (c.group >= 0) {
+                if (st.alloc.tensor_device[movable[c.group].idx[0]] != fit_advisor_allocation::DEV_CPU) continue; // taken by an earlier candidate
+                set_group(nxt.alloc, movable[c.group], c.dev);
+            } else {
+                if (st.alloc.tensor_device[c.single] != fit_advisor_allocation::DEV_CPU) continue;
+                nxt.alloc.tensor_device[c.single] = c.dev;
+            }
+            const bool feasible = S.evaluate(nxt, pbk[fkey]);
+            if (trace_tensor) {
+                const size_t i = c.group >= 0 ? movable[c.group].idx[0] : c.single;
+                if (inv.tensors[i].name.find(trace_tensor) != std::string::npos) {
+                    LOG_INF("%s: fill %-34s CPU -> %s: %s, cost %.4f -> %.4f s\n", __func__, inv.tensors[i].name.c_str(),
+                        device_bufts[c.dev].c_str(), feasible ? "fits" : "over budget", st.cost_score * 1e-6, nxt.cost_score * 1e-6);
+                }
+            }
+            if (feasible && nxt.objective < st.objective) {
+                st = nxt;
+                n_filled++;
+            }
+        }
+        if (n_filled > 0) {
+            LOG_INF("%s: fill pass %s placed %d more groups or tensors, model now %.3f s\n", __func__, when, n_filled, st.objective * 1e-6);
+        }
+        return n_filled;
+    };
 
     int n_improvements = 0;
     int n_single_tried = 0, n_single_accepted = 0, n_rehome_tried = 0, n_mtp_tried = 0, n_offload_tried = 0, n_attn_tried = 0;
-    const char * trace_tensor = getenv("FIT_ADVISOR_TRACE"); // substring of a tensor name whose moves are logged
     const double T0 = std::max(1.0, 0.005 * std::fabs(cur.cost_score));
     const double T1 = std::max(0.01, 0.00002 * std::fabs(cur.cost_score));
     const int iters = std::max(0, opts.anneal_iters);
     int accepted = 0;
     int last_probe_iter = 0;
+
+    // spare capacity anywhere, e.g. a smaller third card with no layers of its own, is filled with the best CPU-resident
+    // groups before the walk starts, so the annealer refines that arrangement instead of having to discover it
+    if (fill_pass(cur, proj_by_key, "before annealing") > 0 && cur.penalty == 0 && cur.objective < best_seen.objective) {
+        best_seen = cur;
+        best_seen_dirty = true;
+    }
 
     for (int it = 0; it < iters && (!movable.empty() || !singles.empty()); it++) {
         const double T = T0 * std::pow(T1 / T0, (double) it / std::max(1, iters));
@@ -630,14 +714,21 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
                 i = singles[(size_t) (uni(rng) * singles.size()) % singles.size()];
             }
             fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots, nxt.alloc.layer_home);
-            nxt.alloc.tensor_device[i] = nxt.alloc.tensor_device[i] == fit_advisor_allocation::DEV_CPU ? home.tensor_device[i] : fit_advisor_allocation::DEV_CPU;
+            const int target = pick_target(nxt.alloc.tensor_device[i], home.tensor_device[i]);
+            if (target == nxt.alloc.tensor_device[i] || (target >= 0 && !cost_known_on(i, target))) continue;
+            nxt.alloc.tensor_device[i] = target;
             n_single_tried++;
         } else if (mv < 0.55) {
             // toggle one group between its home and the CPU
             const searcher::group & g = movable[(size_t) (uni(rng) * movable.size()) % movable.size()];
             fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots, nxt.alloc.layer_home);
             const int h = home.tensor_device[g.idx[0]];
-            set_group(nxt.alloc, g, nxt.alloc.tensor_device[g.idx[0]] == fit_advisor_allocation::DEV_CPU ? h : fit_advisor_allocation::DEV_CPU);
+            const int target = pick_target(nxt.alloc.tensor_device[g.idx[0]], h);
+            if (target == nxt.alloc.tensor_device[g.idx[0]]) continue;
+            bool known = true;
+            for (const size_t i : g.idx) known = known && (target < 0 || cost_known_on(i, target));
+            if (!known) continue;
+            set_group(nxt.alloc, g, target);
         } else if (mv < 0.85) {
             // swap one on-device group with one CPU group of the same home
             std::vector<size_t> on, off;
@@ -799,40 +890,10 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         accepted, iters, n_single_tried, n_rehome_tried, n_mtp_tried, n_offload_tried, n_attn_tried, n_improvements);
     GGML_UNUSED(n_single_accepted);
 
-    // fill: from the incumbent, add every CPU-resident tensor that the model says pays for itself, best gain per byte
-    // first, while the memory model has room; the probe verifies the result below
+    // fill: from the incumbent, everything CPU-resident that the full model says pays for itself, on any device
     {
         searcher::state st = incumbent;
-        fit_advisor_allocation home = fit_advisor_allocation::from_layer_split(inv, device_bufts, st.alloc.layers_per_device, opts.n_ctx, st.alloc.n_slots, st.alloc.layer_home);
-        struct cand { size_t i; double density; };
-        std::vector<cand> cands;
-        // every CPU-resident single is tried, whatever its weight-only gain: the full model with the excursion cost
-        // decides, so a tensor the walk parked on the CPU at high temperature comes back if that was a bad trade
-        for (const size_t i : singles) {
-            if (st.alloc.tensor_device[i] != fit_advisor_allocation::DEV_CPU || home.tensor_device[i] < 0) continue;
-            const double g = S.gain(i, home.tensor_device[i], st.wl, st.alloc.n_slots);
-            cands.push_back({ i, g / (double) inv.tensors[i].nbytes });
-        }
-        std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.density > b.density; });
-        int n_filled = 0;
-        const std::string fkey = alloc_key(st.alloc);
-        for (const cand & c : cands) {
-            searcher::state nxt = st;
-            nxt.alloc.tensor_device[c.i] = home.tensor_device[c.i];
-            const bool feasible = S.evaluate(nxt, proj_by_key[fkey]);
-            if (trace_tensor && inv.tensors[c.i].name.find(trace_tensor) != std::string::npos) {
-                LOG_INF("%s: fill %-34s CPU -> %s: %s, cost %.4f -> %.4f s, weight-only gain %+.4f s\n", __func__,
-                    inv.tensors[c.i].name.c_str(), device_bufts[home.tensor_device[c.i]].c_str(),
-                    feasible ? "fits" : "over budget", st.cost_score * 1e-6, nxt.cost_score * 1e-6,
-                    c.density * (double) inv.tensors[c.i].nbytes * 1e-6);
-            }
-            if (feasible && nxt.objective < st.objective) {
-                st = nxt;
-                n_filled++;
-            }
-        }
-        if (n_filled > 0) {
-            LOG_INF("%s: fill pass placed %d more tensors, model %.3f s -> %.3f s\n", __func__, n_filled, incumbent.objective * 1e-6, st.objective * 1e-6);
+        if (fill_pass(st, proj_by_key, "after annealing") > 0) {
             incumbent = st;
         }
     }
