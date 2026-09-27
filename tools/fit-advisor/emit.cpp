@@ -3,6 +3,8 @@
 #include "common.h"
 #include "log.h"
 #include "speculative.h"
+
+#include <algorithm>
 #include "ggml-backend.h"
 #include "preset.h"
 
@@ -79,12 +81,31 @@ std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common
             ret.push_back({ "LLAMA_ARG_LOAD_MODE", "none", "--load-mode none" });
         }
     }
-    if (!params.devices.empty()) {
+    {
+        // the device list: what the user gave (or every non-CPU device), minus the devices the candidate leaves empty
+        std::vector<ggml_backend_dev_t> devs = params.devices;
+        if (devs.empty()) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    devs.push_back(dev);
+                }
+            }
+        }
         std::string v;
-        for (ggml_backend_dev_t dev : params.devices) {
+        size_t n_dropped = 0;
+        for (ggml_backend_dev_t dev : devs) {
+            ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+            const bool unused = buft && std::find(cand.unused_bufts.begin(), cand.unused_bufts.end(), ggml_backend_buft_name(buft)) != cand.unused_bufts.end();
+            if (unused) {
+                n_dropped++;
+                continue;
+            }
             v += (v.empty() ? "" : ",") + std::string(ggml_backend_dev_name(dev));
         }
-        ret.push_back({ "LLAMA_ARG_DEVICE", v, "-dev " + v });
+        if ((!params.devices.empty() || n_dropped > 0) && !v.empty()) {
+            ret.push_back({ "LLAMA_ARG_DEVICE", v, "-dev " + v });
+        }
     }
     {
         // the candidate's thresholds, else the user's; all-default needs no flag
