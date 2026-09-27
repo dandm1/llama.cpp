@@ -26,6 +26,7 @@ struct fit_advisor_candidate {
     std::vector<float> tensor_split;        // empty: default split
     std::vector<fit_advisor_override> overrides;
     std::string layer_devices;              // -old spec with buffer type names ("47=CUDA0,output=CUDA0"), empty for none
+    bool        spec_mtp = false;           // MTP drafting on: the MTP layers are loaded and a draft context is created
 
     // canonical description used for memoization and display
     std::string key() const;

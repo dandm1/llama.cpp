@@ -41,7 +41,7 @@ std::string without_section(const std::string & text, const std::string & sectio
 
 } // namespace
 
-std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common_params & params) {
+std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common_params & params, const fit_advisor_candidate & cand) {
     const common_params defaults = {};
     std::vector<fit_advisor_passthrough_option> ret;
     if (params.cache_type_k != defaults.cache_type_k) {
@@ -80,9 +80,18 @@ std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common
         const std::string v = std::to_string(params.op_offload_min_batch);
         ret.push_back({ "LLAMA_ARG_OP_OFFLOAD_MIN_BATCH", v, "--op-offload-min-batch " + v });
     }
-    if (!params.speculative.types.empty()) {
+    std::vector<common_speculative_type> types;
+    for (const auto t : params.speculative.types) {
+        if (t != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            types.push_back(t);
+        }
+    }
+    if (cand.spec_mtp) {
+        types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    }
+    if (!types.empty()) {
         std::string v;
-        for (const auto t : params.speculative.types) {
+        for (const auto t : types) {
             v += (v.empty() ? "" : ",") + common_speculative_type_to_str(t);
         }
         ret.push_back({ "LLAMA_ARG_SPEC_TYPE", v, "--spec-type " + v });
@@ -94,9 +103,9 @@ std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common
     return ret;
 }
 
-std::string fit_advisor_passthrough_cli(const common_params & params) {
+std::string fit_advisor_passthrough_cli(const common_params & params, const fit_advisor_candidate & cand) {
     std::string ret;
-    for (const auto & o : fit_advisor_passthrough(params)) {
+    for (const auto & o : fit_advisor_passthrough(params, cand)) {
         ret += " " + o.cli;
     }
     return ret;

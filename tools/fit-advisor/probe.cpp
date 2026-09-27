@@ -29,6 +29,9 @@ std::string fit_advisor_candidate::key() const {
     if (!layer_devices.empty()) {
         ss << " old=" << layer_devices;
     }
+    if (spec_mtp) {
+        ss << " mtp";
+    }
     return ss.str();
 }
 
@@ -244,6 +247,13 @@ bool fit_advisor_apply_candidate(common_params & p, const fit_advisor_candidate 
         p.tensor_buft_overrides.push_back({ patterns.back().c_str(), b->second });
     }
     p.tensor_buft_overrides.push_back({ nullptr, nullptr });
+
+    // drafting is the candidate's decision: with it the MTP layers are loaded and priced, without it neither
+    p.speculative.types.erase(std::remove(p.speculative.types.begin(), p.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP),
+                              p.speculative.types.end());
+    if (cand.spec_mtp) {
+        p.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    }
 
     // whole-layer homes: the candidate names buffer types, the loader wants devices
     p.layer_dev_overrides.clear();

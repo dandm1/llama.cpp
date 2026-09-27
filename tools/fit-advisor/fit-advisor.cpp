@@ -75,8 +75,12 @@ static std::vector<named_allocation> build_allocations(const common_params & par
         return per;
     };
 
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     auto add = [&](const std::string & name, uint32_t ngl, uint32_t n_ctx) {
-        ret.push_back({ name, fit_advisor_allocation::from_layer_split(inv, device_bufts, split(ngl), n_ctx, n_slots) });
+        fit_advisor_allocation a = fit_advisor_allocation::from_layer_split(inv, device_bufts, split(ngl), n_ctx, n_slots);
+        a.draft_mtp = spec_mtp;
+        ret.push_back({ name, a });
     };
 
     // everything on device with the minimum context the fitter would accept
@@ -91,6 +95,7 @@ static std::vector<named_allocation> build_allocations(const common_params & par
     // tensor-level moves: all layers on device, selected weights on the CPU
     auto move_kind = [&](const std::string & name, fit_advisor_tensor_kind kind, uint32_t il_begin, uint32_t il_end) {
         fit_advisor_allocation a = fit_advisor_allocation::from_layer_split(inv, device_bufts, split(ngl_max), params.n_ctx, n_slots);
+        a.draft_mtp = spec_mtp;
         for (size_t i = 0; i < inv.tensors.size(); i++) {
             const auto & t = inv.tensors[i];
             if (t.kind == kind && t.layer >= (int32_t) il_begin && t.layer < (int32_t) il_end) {
@@ -128,6 +133,8 @@ static fit_advisor_candidate user_candidate(const common_params & params) {
             c.overrides.push_back({ o.pattern, ggml_backend_buft_name(o.buft) });
         }
     }
+    c.spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                           COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     // -old as given, translated to buffer type names like the rest of the candidate
     for (const auto & o : params.layer_dev_overrides) {
         if (o.il == -1) {
@@ -144,7 +151,7 @@ static std::string mib(double bytes) {
     return std::to_string((long long) std::llround(bytes / (1024.0 * 1024.0)));
 }
 
-static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_advisor_probe & probe, int32_t n_batch, const std::string & passthrough_cli) {
+static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_advisor_probe & probe, int32_t n_batch, const common_params & params) {
     constexpr double MiB = 1024.0 * 1024.0;
 
     printf("\n");
@@ -217,7 +224,7 @@ static void print_table(const std::vector<fit_advisor_candidate> & cands, fit_ad
         if (!c.layer_devices.empty()) {
             args += " -old " + c.layer_devices_cli();
         }
-        args += passthrough_cli;
+        args += fit_advisor_passthrough_cli(params, c);
         printf("  %-16s %s\n", c.name.c_str(), args.c_str());
     }
     fflush(stdout); // stdout is block-buffered when redirected, keep the tables separate from the log lines
@@ -331,7 +338,7 @@ static void emit_if_requested(const common_params & params, const fit_advisor_ca
         }
     }
     const fit_advisor_emit_result er = fit_advisor_emit_ini(params.fit_advisor_emit_ini, name, params.model.path, cand, params.n_batch,
-                                                            fit_advisor_passthrough(params));
+                                                            fit_advisor_passthrough(params, cand));
     if (er.ok) {
         LOG_INF("%s: wrote the %s allocation as section [%s] to %s and verified it reloads unchanged\n", __func__, what, er.section.c_str(), er.path.c_str());
         common_log_flush(common_log_main());
@@ -367,8 +374,10 @@ static fit_advisor_search_result search_and_report(const common_params & params,
     printf("  generation step %.0f us: weights %.0f, attention %.0f, per-node overhead %.0f, boundaries %.0f\n",
         sr.cost.t_gen_step_us, sr.cost.step_weights_us, sr.cost.step_attn_us, sr.cost.step_overhead_us, sr.cost.step_boundary_us);
     if (sr.wl.use_mtp) {
-        printf("  drafting: verification batch of %u, MTP draft run %.0f us x %u, %.2f tokens per step\n",
+        printf("  drafting ON: verification batch of %u, MTP draft run %.0f us x %u, %.2f tokens per step\n",
             1 + sr.wl.mtp_draft_n, sr.cost.t_mtp_draft_us, sr.wl.mtp_draft_n, sr.cost.tokens_per_step);
+    } else if (inv.n_layer_nextn > 0) {
+        printf("  drafting OFF: the MTP layers are not loaded\n");
     }
     for (size_t d = 0; d < sr.proj.devices.size(); d++) {
         const auto & pd = sr.proj.devices[d];
@@ -425,7 +434,7 @@ static fit_advisor_search_result search_and_report(const common_params & params,
         }
         if (!c.overrides.empty()) args += " -ot \"" + c.overrides_str() + "\"";
         if (!c.layer_devices.empty()) args += " -old " + c.layer_devices_cli();
-        args += fit_advisor_passthrough_cli(params);
+        args += fit_advisor_passthrough_cli(params, c);
         printf("  args: %s\n", args.c_str());
     }
     fflush(stdout);
@@ -494,7 +503,7 @@ int llama_fit_advisor(int argc, char ** argv) {
     LOG_INF("%s: probing %zu candidates ...\n", __func__, cands.size());
     common_log_flush(common_log_main());
 
-    print_table(cands, probe, params.n_batch, fit_advisor_passthrough_cli(params));
+    print_table(cands, probe, params.n_batch, params);
     LOG_INF("%s: %zu probes executed\n", __func__, probe.n_probes);
 
     if (params.fit_advisor_verify) {
@@ -679,7 +688,7 @@ int llama_fit_advisor(int argc, char ** argv) {
     printf("\nestimated cost per request, workload '%s': %u prompt + %u generated tokens, %u concurrent, ubatch %u\n",
         params.fit_advisor_workload.c_str(), wl.prompt_tokens, wl.gen_tokens, wl.concurrency, wl.n_ubatch);
     if (wl.use_mtp) {
-        printf("  MTP drafting: %u draft tokens per step at %.0f%% acceptance each -> %.2f tokens per step (--mtp-accept)\n",
+        printf("  MTP drafting allowed: %u draft tokens per step at %.0f%% acceptance each -> %.2f tokens per step (--mtp-accept); the search decides per allocation\n",
             wl.mtp_draft_n, 100.0 * wl.mtp_accept, wl.tokens_per_step());
     }
     for (const auto & cd : cost_devs) {

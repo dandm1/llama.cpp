@@ -55,6 +55,9 @@ std::string alloc_key(const fit_advisor_allocation & a) {
     for (const auto & [il, dev] : a.layer_home) {
         ret += "|" + std::to_string(il) + "=" + std::to_string(dev);
     }
+    if (a.draft_mtp) {
+        ret += "|mtp";
+    }
     return ret;
 }
 
@@ -70,6 +73,9 @@ std::string alloc_name(const fit_advisor_allocation & a) {
     std::string ret = cell_name(a.layers_per_device, a.n_ubatch, a.n_slots);
     for (const auto & [il, dev] : a.layer_home) {
         ret += "-L" + std::to_string(il) + (dev < 0 ? "cpu" : std::to_string(dev));
+    }
+    if (a.draft_mtp) {
+        ret += "-mtp";
     }
     return ret;
 }
@@ -99,10 +105,19 @@ struct searcher {
         ngl_max = n_layer_all + 1;
     }
 
-    fit_advisor_workload workload(uint32_t ub) const {
+    // the workload of a state: the base workload at the state's ubatch, drafting as the allocation decides
+    fit_advisor_workload workload(uint32_t ub, bool draft_mtp) const {
         fit_advisor_workload wl = wl_base;
         wl.n_ubatch = ub;
+        wl.use_mtp  = draft_mtp;
         return wl;
+    }
+    fit_advisor_workload workload(const fit_advisor_allocation & a) const {
+        return workload(a.n_ubatch, a.draft_mtp);
+    }
+    // drafting is explored when the user allowed it (--spec-type draft-mtp) and the model has MTP layers
+    bool mtp_searchable() const {
+        return wl_base.use_mtp && inv.n_layer_nextn > 0;
     }
 
     bool tensor_counts(size_t i, const fit_advisor_workload & wl) const {
@@ -296,10 +311,11 @@ struct searcher {
 
     cell solve_cell(const std::vector<uint32_t> & part, uint32_t ub, uint32_t slots) {
         cell r;
-        const fit_advisor_workload wl = workload(ub);
+        const fit_advisor_workload wl = workload(ub, wl_base.use_mtp);
         const std::string name = cell_name(part, ub, slots);
 
         fit_advisor_allocation base = fit_advisor_allocation::from_layer_split(inv, device_bufts, part, opts.n_ctx, slots);
+        base.draft_mtp = wl_base.use_mtp;
         base.n_ubatch = ub;
         const std::vector<group> groups = build_groups(wl);
 
@@ -480,8 +496,8 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
                     LOG_INF("%s: seed %-28s does not fit\n", __func__, name.c_str());
                     continue;
                 }
-                const fit_advisor_workload wl = S.workload(ub);
-                const bool better = !best_cell.fits || S.score(r.cost, wl) < S.score(best_cell.cost, S.workload(best_ub));
+                const fit_advisor_workload wl = S.workload(r.alloc);
+                const bool better = !best_cell.fits || S.score(r.cost, wl) < S.score(best_cell.cost, S.workload(best_cell.alloc));
                 LOG_INF("%s: seed %-28s gen %6.2f tok/s, pp %6.0f tok/s, request %7.2f s%s\n", __func__, name.c_str(),
                     r.cost.gen_tokens_per_s, r.cost.prompt_tokens_per_s, r.cost.t_request_us * 1e-6, better ? "  <- best seed" : "");
                 if (better) {
@@ -505,7 +521,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
 
     searcher::state cur;
     cur.alloc = best_cell.alloc;
-    cur.wl    = S.workload(best_ub);
+    cur.wl    = S.workload(cur.alloc);
     std::map<std::string, fit_advisor_projection> proj_by_key; // last probe per key, for the cost model's KV figures
     proj_by_key[alloc_key(cur.alloc)] = best_cell.proj;
     if (!S.evaluate(cur, best_cell.proj)) {
@@ -561,7 +577,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     };
 
     int n_improvements = 0;
-    int n_single_tried = 0, n_single_accepted = 0, n_rehome_tried = 0;
+    int n_single_tried = 0, n_single_accepted = 0, n_rehome_tried = 0, n_mtp_tried = 0;
     const char * trace_tensor = getenv("FIT_ADVISOR_TRACE"); // substring of a tensor name whose moves are logged
     const double T0 = std::max(1.0, 0.005 * std::fabs(cur.cost_score));
     const double T1 = std::max(0.01, 0.00002 * std::fabs(cur.cost_score));
@@ -633,6 +649,11 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             const int d = (int) ((h + 1 + (size_t) (uni(rng) * (nd - 1)) % (nd - 1)) % nd);
             nxt.alloc = nxt.alloc.with_layer_home(inv, il, d);
             n_rehome_tried++;
+        } else if (mv < 0.965 && S.mtp_searchable()) {
+            // drafting on or off: with it the MTP layers cost memory and a verification batch replaces single tokens
+            nxt.alloc.draft_mtp = !nxt.alloc.draft_mtp;
+            nxt.wl = S.workload(nxt.alloc);
+            n_mtp_tried++;
         } else if (mv < 0.97) {
             // step the ubatch
             const auto & ubs = opts.ubatch_options;
@@ -641,7 +662,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             k = uni(rng) < 0.5 ? (k == 0 ? 1 : k - 1) : (k + 1 >= ubs.size() ? k - 1 : k + 1);
             if (k >= ubs.size()) continue;
             nxt.alloc.n_ubatch = ubs[k];
-            nxt.wl = S.workload(ubs[k]);
+            nxt.wl = S.workload(nxt.alloc);
         } else {
             // step the slot count
             uint32_t s = nxt.alloc.n_slots;
@@ -722,8 +743,8 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         }
     }
 
-    LOG_INF("%s: annealing: %d accepted of %d, %d single-tensor moves and %d layer re-homes proposed, %d model improvements over the seed\n", __func__,
-        accepted, iters, n_single_tried, n_rehome_tried, n_improvements);
+    LOG_INF("%s: annealing: %d accepted of %d, %d single-tensor moves, %d layer re-homes and %d drafting toggles proposed, %d model improvements over the seed\n", __func__,
+        accepted, iters, n_single_tried, n_rehome_tried, n_mtp_tried, n_improvements);
     GGML_UNUSED(n_single_accepted);
 
     // fill: from the incumbent, add every CPU-resident tensor that the model says pays for itself, best gain per byte
@@ -772,7 +793,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         } else {
             LOG_WRN("%s: annealed incumbent does not fit on re-probe, falling back to the seed\n", __func__);
             incumbent.alloc = best_cell.alloc;
-            incumbent.wl    = S.workload(best_ub);
+            incumbent.wl    = S.workload(incumbent.alloc);
             incumbent_proj  = best_cell.proj;
         }
     }

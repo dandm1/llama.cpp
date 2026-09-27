@@ -486,7 +486,7 @@ struct common_params {
     std::string fit_advisor_emit_ini;          // llama-fit-advisor: write the chosen allocation as a preset section to this INI file
     std::string fit_advisor_emit_name;         // llama-fit-advisor: section name for the preset, default: the model file name
     std::string fit_advisor_search_ubatch = "512,1024,2048"; // llama-fit-advisor: ubatch sizes the search may choose from
-    double  fit_advisor_mtp_accept = 0.8;      // llama-fit-advisor: assumed acceptance probability per drafted MTP token
+    double  fit_advisor_mtp_accept = 0.75;     // llama-fit-advisor: assumed acceptance probability per drafted MTP token (GLM-5.3 measured ~0.72)
     bool    fit_advisor_validate = false;      // llama-fit-advisor: load the chosen allocation for real and measure what the projection missed
     int32_t fit_advisor_validate_tokens = 0;   // llama-fit-advisor: prompt tokens for the validation run, 0 = two ubatches
 

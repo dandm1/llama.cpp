@@ -25,10 +25,11 @@ struct fit_advisor_passthrough_option {
     std::string value;
     std::string cli;
 };
-std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common_params & params);
+// the speculative types follow the candidate: draft-mtp is added or removed according to its spec_mtp
+std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common_params & params, const fit_advisor_candidate & cand);
 
 // the command-line text of every pass-through option, with a leading space, or empty
-std::string fit_advisor_passthrough_cli(const common_params & params);
+std::string fit_advisor_passthrough_cli(const common_params & params, const fit_advisor_candidate & cand);
 
 // model_path: what the section's model key points at; n_batch_base: the -b to write when the candidate sets a ubatch
 // the file is created if missing; an existing section with the same name is replaced, everything else is kept
