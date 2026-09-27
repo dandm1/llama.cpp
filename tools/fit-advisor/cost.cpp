@@ -172,8 +172,16 @@ double tensor_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t
         const int taker = fit_advisor_offload_taker(devices, batch, home_idx, wl);
         if (taker >= 0) {
             const fit_advisor_cost_device * target = &devices[taker];
-            if (target->meas->copy.h2d_gb_s > 0) {
-                copy_us = t.nbytes / (target->meas->copy.h2d_gb_s * 1e9) * 1e6;
+            const double rate = (wl && wl->pinned_cpu_weights && target->meas->copy.h2d_pinned_gb_s > 0)
+                ? target->meas->copy.h2d_pinned_gb_s : target->meas->copy.h2d_gb_s;
+            if (rate > 0) {
+                // expert stacks: only the experts the batch routes to are copied
+                double share = 1.0;
+                if (t.kind == FIT_ADVISOR_TENSOR_FFN_EXPS && inv.n_expert > 0 && inv.n_expert_used > 0) {
+                    const double uniform = 1.0 - std::pow(1.0 - (double) inv.n_expert_used / inv.n_expert, (double) batch);
+                    share = wl && wl->expert_coverage > 0 ? wl->expert_coverage : std::min(uniform, batch >= 256 ? 0.6 : 1.0);
+                }
+                copy_us = t.nbytes * share / (rate * 1e9) * 1e6;
             }
             dev = target;
         }

@@ -2973,6 +2973,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
     add_opt(common_arg(
+        {"--expert-coverage"}, "F",
+        "share of a layer's experts a prompt ubatch touches, used to price the per-ubatch copies of CPU-resident experts "
+        "(default: estimated, 0.6 for prompt batches of 256 and more)",
+        [](common_params & params, const std::string & value) {
+            params.fit_advisor_expert_coverage = std::stod(value);
+            if (params.fit_advisor_expert_coverage <= 0.0 || params.fit_advisor_expert_coverage > 1.0) {
+                throw std::invalid_argument("--expert-coverage must be in (0, 1]");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
+    add_opt(common_arg(
+        {"--pin-cpu-weights"},
+        "place CPU-resident weights in the devices' pinned host buffer type (e.g. CUDA_Host) so that per-ubatch copies run "
+        "at the pinned rate; every CPU-resident byte is page-locked, keep it well below the machine's RAM",
+        [](common_params & params) {
+            params.fit_advisor_pin_cpu_weights = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
+    add_opt(common_arg(
         {"--mtp-accept"}, "P",
         string_format("assumed probability that one drafted MTP token is accepted, used with --spec-type draft-mtp and --spec-draft-n-max (default: %.2f)", params.fit_advisor_mtp_accept),
         [](common_params & params, const std::string & value) {

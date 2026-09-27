@@ -540,6 +540,26 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
             t1 = ggml_time_us();
             m.copy.d2h_gb_s = big_bytes / ((t1 - t0) * 1e-6) / 1e9;
 
+            // the same transfer from the device's pinned host buffer type: what weights placed in CUDA_Host (or the
+            // equivalent) are copied at when they are offloaded per ubatch
+            if (ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev)) {
+                ggml_init_params hip = { ggml_tensor_overhead() * 4, nullptr, true };
+                ggml_context * hctx = ggml_init(hip);
+                ggml_tensor * pinned = ggml_new_tensor_1d(hctx, GGML_TYPE_F32, big_bytes / sizeof(float));
+                if (ggml_backend_buffer_t hbuf = ggml_backend_alloc_ctx_tensors_from_buft(hctx, host_buft)) {
+                    std::memcpy(pinned->data, host.data(), big_bytes);
+                    ggml_backend_tensor_set(big, pinned->data, 0, big_bytes); // warm up
+                    ggml_backend_synchronize(backend);
+                    t0 = ggml_time_us();
+                    ggml_backend_tensor_set(big, pinned->data, 0, big_bytes);
+                    ggml_backend_synchronize(backend);
+                    t1 = ggml_time_us();
+                    m.copy.h2d_pinned_gb_s = big_bytes / ((t1 - t0) * 1e-6) / 1e9;
+                    ggml_backend_buffer_free(hbuf);
+                }
+                ggml_free(hctx);
+            }
+
             constexpr int n_small = 200;
             t0 = ggml_time_us();
             for (int i = 0; i < n_small; i++) {
@@ -554,8 +574,8 @@ fit_advisor_device_measurements fit_advisor_measure_device(ggml_backend_dev_t de
             LOG_WRN("%s: could not allocate copy test buffers on %s\n", __func__, m.fingerprint.name.c_str());
         }
         ggml_free(ctx);
-        LOG_INF("%s:   copy h2d %6.2f GB/s, d2h %6.2f GB/s, small transfer %6.1f us\n", __func__,
-            m.copy.h2d_gb_s, m.copy.d2h_gb_s, m.copy.latency_us);
+        LOG_INF("%s:   copy h2d %6.2f GB/s (pinned %6.2f GB/s), d2h %6.2f GB/s, small transfer %6.1f us\n", __func__,
+            m.copy.h2d_gb_s, m.copy.h2d_pinned_gb_s, m.copy.d2h_gb_s, m.copy.latency_us);
     }
 
     ggml_backend_synchronize(backend);
@@ -654,6 +674,7 @@ static json device_to_json(const fit_advisor_device_measurements & m) {
     }
     j["copy"] = {
         { "h2d_gb_s",   m.copy.h2d_gb_s },
+        { "h2d_pinned_gb_s", m.copy.h2d_pinned_gb_s },
         { "d2h_gb_s",   m.copy.d2h_gb_s },
         { "latency_us", m.copy.latency_us },
     };
@@ -722,6 +743,7 @@ static fit_advisor_device_measurements device_from_json(const json & j) {
     if (j.contains("copy")) {
         const auto & c = j.at("copy");
         m.copy.h2d_gb_s   = c.value("h2d_gb_s", 0.0);
+        m.copy.h2d_pinned_gb_s = c.value("h2d_pinned_gb_s", 0.0);
         m.copy.d2h_gb_s   = c.value("d2h_gb_s", 0.0);
         m.copy.latency_us = c.value("latency_us", 0.0);
     }
@@ -870,7 +892,7 @@ const fit_advisor_device_measurements & fit_advisor_measurements::ensure(ggml_ba
                 todo.kv_types.push_back(type);
             }
         }
-        todo.measure_copy = have.copy.h2d_gb_s <= 0;
+        todo.measure_copy = have.copy.h2d_gb_s <= 0 || (have.copy.h2d_pinned_gb_s <= 0 && ggml_backend_dev_host_buffer_type(dev) != nullptr);
         const bool need_launch = have.launch_us <= 0;
         if (have.runtime_overhead_bytes < 0) {
             // the runtime overhead is the memory the whole kernel set leaves behind, so measure everything again
@@ -946,8 +968,8 @@ void fit_advisor_measurements_print(const fit_advisor_device_measurements & m) {
             key.c_str(), r.n_kv, r.kv_bytes_per_s_fa / 1e9, r.us_pp_fa, r.kv_bytes_per_s_nofa / 1e9, r.us_pp_nofa,
             r.supported_fa ? "" : " [fa unsupported]", r.supported_nofa ? "" : " [no-fa unsupported]");
     }
-    LOG_INF("%s:   per-op overhead %.1f us, graph launch %.1f us; copy h2d %6.2f GB/s, d2h %6.2f GB/s, small transfer %6.1f us\n", __func__,
-        m.op_overhead_us, m.launch_us, m.copy.h2d_gb_s, m.copy.d2h_gb_s, m.copy.latency_us);
+    LOG_INF("%s:   per-op overhead %.1f us, graph launch %.1f us; copy h2d %6.2f GB/s (pinned %6.2f), d2h %6.2f GB/s, small transfer %6.1f us\n", __func__,
+        m.op_overhead_us, m.launch_us, m.copy.h2d_gb_s, m.copy.h2d_pinned_gb_s, m.copy.d2h_gb_s, m.copy.latency_us);
     if (m.runtime_overhead_bytes >= 0) {
         LOG_INF("%s:   runtime overhead %.0f MiB (kernel modules and driver state outside every buffer)\n", __func__,
             m.runtime_overhead_bytes / (1024.0 * 1024));

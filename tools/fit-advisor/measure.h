@@ -70,7 +70,8 @@ struct fit_advisor_attn_rate {
 };
 
 struct fit_advisor_copy_rate {
-    double h2d_gb_s     = 0;
+    double h2d_gb_s     = 0; // from pageable host memory, what a plain CPU buffer gives
+    double h2d_pinned_gb_s = 0; // from the device's pinned host buffer type (e.g. CUDA_Host), 0 if the device has none
     double d2h_gb_s     = 0;
     double latency_us   = 0; // one small host-to-device transfer including synchronization
 };

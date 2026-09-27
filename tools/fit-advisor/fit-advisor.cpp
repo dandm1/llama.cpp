@@ -496,6 +496,23 @@ int llama_fit_advisor(int argc, char ** argv) {
         }
     }
 
+    // CPU-resident weights go to a pinned host buffer type when asked; the name comes from the first device that has one
+    std::string cpu_buft = "CPU";
+    if (params.fit_advisor_pin_cpu_weights) {
+        for (size_t i = 0; i < ggml_backend_dev_count() && cpu_buft == "CPU"; i++) {
+            if (ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(ggml_backend_dev_get(i))) {
+                cpu_buft = ggml_backend_buft_name(hb);
+            }
+        }
+        if (cpu_buft == "CPU") {
+            LOG_WRN("%s: --pin-cpu-weights: no device offers a pinned host buffer type, using CPU\n", __func__);
+        } else {
+            LOG_INF("%s: CPU-resident weights will be placed in %s (pinned host memory)\n", __func__, cpu_buft.c_str());
+        }
+    }
+    fit_advisor_allocation::default_cpu_buft = cpu_buft;
+
+
     fit_advisor_inventory inv;
     try {
         inv = fit_advisor_inventory_load(params.model.path);
@@ -647,6 +664,8 @@ int llama_fit_advisor(int argc, char ** argv) {
         w.n_ubatch = (uint32_t) params.n_ubatch;
         w.use_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
                                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        w.expert_coverage    = params.fit_advisor_expert_coverage;
+        w.pinned_cpu_weights = params.fit_advisor_pin_cpu_weights;
         w.op_offload_min_batch     = params.op_offload_min_batch;
         w.op_offload_min_batch_dev = params.op_offload_min_batch_dev;
         w.mtp_draft_n = (uint32_t) std::max(0, params.speculative.draft.n_max);

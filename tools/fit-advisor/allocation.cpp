@@ -10,6 +10,8 @@
 #include <regex>
 #include <set>
 
+std::string fit_advisor_allocation::default_cpu_buft = "CPU";
+
 int fit_advisor_allocation::layer_device(uint32_t il, uint32_t n_layer_all) const {
     const auto it = layer_home.find(il);
     if (it != layer_home.end()) {
@@ -73,6 +75,7 @@ fit_advisor_allocation fit_advisor_allocation::from_layer_split(const fit_adviso
     a.layers_per_device = layers_per_device;
     a.layers_per_device.resize(device_bufts.size(), 0);
     a.layer_home = layer_home;
+    a.cpu_buft   = default_cpu_buft;
 
     const uint32_t n_layer_all = inv.n_layer + inv.n_layer_nextn;
     a.tensor_device.resize(inv.tensors.size());
@@ -135,12 +138,12 @@ fit_advisor_candidate fit_advisor_allocation::to_candidate(const fit_advisor_inv
     }
 
     auto buft_name = [&](int dev) -> std::string {
-        return dev == DEV_CPU ? "CPU" : device_bufts.at(dev);
+        return dev == DEV_CPU ? cpu_buft : device_bufts.at(dev);
     };
 
     // -old for the layers with an explicit home
     for (const auto & [il, dev] : layer_home) {
-        c.layer_devices += (c.layer_devices.empty() ? "" : ",") + (il == n_layer_all ? std::string("output") : std::to_string(il)) + "=" + buft_name(dev);
+        c.layer_devices += (c.layer_devices.empty() ? "" : ",") + (il == n_layer_all ? std::string("output") : std::to_string(il)) + "=" + (dev == DEV_CPU ? std::string("CPU") : device_bufts.at(dev));
     }
 
     for (const auto & [key, layers] : groups) {

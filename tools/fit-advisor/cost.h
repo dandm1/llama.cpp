@@ -30,6 +30,11 @@ struct fit_advisor_workload {
         }
         return op_offload_min_batch > 0 ? op_offload_min_batch : device_own;
     }
+    // share of a layer's experts a prompt ubatch touches: the scheduler copies only those when experts are offloaded.
+    // 0 = estimate: routing on real text is skewed, so a fixed 0.6 is used from batch 256 up (measured 0.49 on Qwen3-Next
+    // at 1369 tokens, ~0.7 on GLM-5.3 at 512) and the uniform-routing formula below that where it is smaller
+    double   expert_coverage = 0;
+    bool     pinned_cpu_weights = false; // CPU-resident weights live in the devices' pinned host buffer, copies run at the pinned rate
     bool     use_mtp       = false; // MTP layers are executed (speculative MTP drafting on), otherwise they are not even loaded
     uint32_t mtp_draft_n   = 3;     // draft tokens per step when drafting (--draft-max)
     double   mtp_accept    = 0.8;   // probability that one drafted token is accepted, a heuristic like the token counts
