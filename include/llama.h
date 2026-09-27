@@ -311,12 +311,23 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    // a layer whose device is chosen explicitly instead of by n_gpu_layers / tensor_split; its weights (unless a
+    // tensor buffer type override says otherwise), KV cache, recurrent state and pinned ops all follow
+    #define LLAMA_LAYER_OUTPUT (-2) // il of the output layer (output norm and output head)
+    struct llama_model_layer_dev_override {
+        int32_t il;              // layer index, LLAMA_LAYER_OUTPUT, or -1 to end the list
+        ggml_backend_dev_t dev;  // a device of the model, or the CPU device
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
 
         // NULL-terminated list of buffer types to use for tensors that match a pattern
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
+
+        // list of layers with an explicit device, ended by an entry with il == -1 (NULL for none)
+        const struct llama_model_layer_dev_override * layer_dev_overrides;
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
@@ -395,6 +406,10 @@ extern "C" {
         // currently works only with CPU execution
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
+
+        // batch size from which devices take ops on host-resident weights (op offload) by copying the weights;
+        // 0 keeps each backend's default (GGML_OP_OFFLOAD_MIN_BATCH or 32). applies to the model's devices as a whole
+        int32_t op_offload_min_batch;
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)

@@ -782,6 +782,7 @@ static const struct ggml_backend_device_i ggml_backend_zendnn_device_i = {
     /* .event_free             = */ NULL,
     /* .event_synchronize      = */ NULL,
     /* .get_op_scratch_size    = */ NULL,
+    /* .set_op_offload_min_batch = */ NULL,
 };
 
 // backend reg interface

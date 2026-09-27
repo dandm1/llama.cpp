@@ -15539,6 +15539,11 @@ static bool ggml_backend_vk_device_offload_op(ggml_backend_dev_t dev, const ggml
     return ggml_vk_get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
 
+static void ggml_backend_vk_device_set_op_offload_min_batch(ggml_backend_dev_t dev, int min_batch) {
+    ggml_backend_vk_device_context * dev_ctx = (ggml_backend_vk_device_context *)dev->context;
+    dev_ctx->op_offload_min_batch_size = min_batch;
+}
+
 static ggml_backend_event_t ggml_backend_vk_device_event_new(ggml_backend_dev_t dev) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     auto device = ggml_vk_get_device(ctx->device);
@@ -15651,6 +15656,7 @@ static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
     /* .event_free           = */ ggml_backend_vk_device_event_free,
     /* .event_synchronize    = */ ggml_backend_vk_device_event_synchronize,
     /* .get_op_scratch_size    = */ NULL,
+    /* .set_op_offload_min_batch = */ ggml_backend_vk_device_set_op_offload_min_batch,
 };
 
 static const char * ggml_backend_vk_reg_get_name(ggml_backend_reg_t reg) {

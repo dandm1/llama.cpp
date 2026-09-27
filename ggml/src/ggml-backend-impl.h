@@ -219,6 +219,10 @@ extern "C" {
         // (optional) bytes of backend-internal scratch memory (temporary pool allocations outside the compute buffer)
         // that computing this op on this device needs; return GGML_BACKEND_SCRATCH_UNKNOWN when there is no estimate
         size_t (*get_op_scratch_size)(ggml_backend_dev_t dev, const struct ggml_tensor * op);
+
+        // (optional) change the batch size from which the device offloads ops on host-resident weights to itself
+        // (see offload_op); the backend's default comes from GGML_OP_OFFLOAD_MIN_BATCH or its own constant
+        void (*set_op_offload_min_batch)(ggml_backend_dev_t dev, int min_batch);
     };
 
     struct ggml_backend_device {

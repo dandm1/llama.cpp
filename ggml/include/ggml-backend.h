@@ -196,6 +196,8 @@ extern "C" {
     // GGML_BACKEND_SCRATCH_UNKNOWN when the backend has no estimate for this op
 #define GGML_BACKEND_SCRATCH_UNKNOWN SIZE_MAX
     GGML_API size_t                        ggml_backend_dev_get_op_scratch_size(ggml_backend_dev_t device, const struct ggml_tensor * op);
+    // set the batch size from which the device takes ops on host-resident weights (op offload); false if the backend has no such setting
+    GGML_API bool                          ggml_backend_dev_set_op_offload_min_batch(ggml_backend_dev_t device, int min_batch);
 
     //
     // Backend (reg)

@@ -650,6 +650,15 @@ bool ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_te
     return false;
 }
 
+bool ggml_backend_dev_set_op_offload_min_batch(ggml_backend_dev_t device, int min_batch) {
+    GGML_ASSERT(device);
+    if (device->iface.set_op_offload_min_batch == NULL) {
+        return false;
+    }
+    device->iface.set_op_offload_min_batch(device, min_batch);
+    return true;
+}
+
 size_t ggml_backend_dev_get_op_scratch_size(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
     if (device->iface.get_op_scratch_size != NULL) {

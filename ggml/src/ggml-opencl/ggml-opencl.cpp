@@ -12861,6 +12861,7 @@ struct ggml_backend_device_i ggml_backend_opencl_device_i = {
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
     /* .get_op_scratch_size    = */ NULL,
+    /* .set_op_offload_min_batch = */ NULL,
 };
 }
 

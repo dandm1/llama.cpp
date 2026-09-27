@@ -1948,6 +1948,10 @@ const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_de
     return &dev->props;
 }
 
+void ggml_metal_device_set_op_offload_min_batch(ggml_metal_device_t dev, int min_batch) {
+    dev->props.op_offload_min_batch_size = min_batch;
+}
+
 static void ggml_metal_device_disable_tensor(ggml_metal_device_t dev) {
     dev->props.has_tensor = false;
 }

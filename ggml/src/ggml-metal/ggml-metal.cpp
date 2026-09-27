@@ -775,6 +775,11 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
             get_op_batch_size(op) >= ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
 }
 
+static void ggml_backend_metal_device_set_op_offload_min_batch(ggml_backend_dev_t dev, int min_batch) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_metal_device_set_op_offload_min_batch(ctx_dev, min_batch);
+}
+
 static ggml_backend_event_t ggml_backend_metal_device_event_new(ggml_backend_dev_t dev) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
@@ -824,6 +829,7 @@ static ggml_backend_device_i ggml_backend_metal_device_i = {
     /* .event_free           = */ ggml_backend_metal_device_event_free,
     /* .event_synchronize    = */ ggml_backend_metal_device_event_synchronize,
     /* .get_op_scratch_size    = */ NULL,
+    /* .set_op_offload_min_batch = */ ggml_backend_metal_device_set_op_offload_min_batch,
 };
 
 // backend registry

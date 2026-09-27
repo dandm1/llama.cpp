@@ -6862,6 +6862,7 @@ static const struct ggml_backend_device_i ggml_backend_hexagon_device_i = {
     /* .event_free           = */ ggml_backend_hexagon_device_event_free,
     /* .event_synchronize    = */ ggml_backend_hexagon_device_event_synchronize,
     /* .get_op_scratch_size    = */ NULL,
+    /* .set_op_offload_min_batch = */ NULL,
 };
 
 //** backend registry

@@ -6764,6 +6764,11 @@ static bool ggml_backend_sycl_device_offload_op(ggml_backend_dev_t dev, const gg
     return get_op_batch_size(op) >= sycl_ctx->op_offload_min_batch_size;
 }
 
+static void ggml_backend_sycl_device_set_op_offload_min_batch(ggml_backend_dev_t dev, int min_batch) {
+    ggml_backend_sycl_device_context * sycl_ctx = (ggml_backend_sycl_device_context *)dev->context;
+    sycl_ctx->op_offload_min_batch_size = min_batch;
+}
+
 static ggml_backend_event_t
 ggml_backend_sycl_device_event_new(ggml_backend_dev_t dev) {
 
@@ -6828,6 +6833,7 @@ static const ggml_backend_device_i ggml_backend_sycl_device_interface = {
     /* .event_free              = */ ggml_backend_sycl_device_event_free,
     /* .event_synchronize       = */ ggml_backend_sycl_device_event_synchronize,
     /* .get_op_scratch_size    = */ NULL,
+    /* .set_op_offload_min_batch = */ ggml_backend_sycl_device_set_op_offload_min_batch,
 };
 
 // backend reg

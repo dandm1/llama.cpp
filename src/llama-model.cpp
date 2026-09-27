@@ -1522,6 +1522,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+        // an explicit device for this layer wins over the n_gpu_layers / tensor_split arithmetic
+        for (const auto * o = params.layer_dev_overrides; o && o->il != -1; o++) {
+            const int o_il = o->il == LLAMA_LAYER_OUTPUT ? n_layer_all : o->il;
+            if (o_il != il || o->dev == nullptr) {
+                continue;
+            }
+            if (o->dev == cpu_dev || ggml_backend_dev_type(o->dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s by override, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+                return {cpu_dev, &pimpl->cpu_buft_list};
+            }
+            auto it = pimpl->gpu_buft_list.find(o->dev);
+            if (it == pimpl->gpu_buft_list.end()) {
+                LLAMA_LOG_WARN("load_tensors: layer %d override names device %s which the model does not use, ignoring\n", il, ggml_backend_dev_name(o->dev));
+                break;
+            }
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s by override, is_swa = %d\n", il, ggml_backend_dev_name(o->dev), is_swa);
+            return {o->dev, &it->second};
+        }
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
@@ -2788,6 +2806,7 @@ llama_model_params llama_model_default_params() {
     llama_model_params result = {
         /*.devices                     =*/ nullptr,
         /*.tensor_buft_overrides       =*/ nullptr,
+        /*.layer_dev_overrides         =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,

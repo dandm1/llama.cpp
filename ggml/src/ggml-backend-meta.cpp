@@ -194,6 +194,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .event_free           = */ nullptr,
     /* .event_synchronize    = */ nullptr,
     /* .get_op_scratch_size    = */ NULL,
+    /* .set_op_offload_min_batch = */ NULL,
 };
 
 static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {

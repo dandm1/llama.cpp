@@ -326,6 +326,7 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
 
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
+void ggml_metal_device_set_op_offload_min_batch(ggml_metal_device_t dev, int min_batch);
 
 struct ggml_metal_fusion_info;
 
