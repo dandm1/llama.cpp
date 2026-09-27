@@ -856,6 +856,7 @@ struct ggml_backend_sched {
     // the inputs of one split at a time; every write to it is ordered on the backend's own stream
     ggml_backend_buffer_t weight_slot_buf[GGML_SCHED_MAX_BACKENDS];
     size_t                weight_slot_size[GGML_SCHED_MAX_BACKENDS];
+    bool                  weight_prefetch; // slots and prefetch in use: needs a second non-CPU backend to overlap with
 
     int debug;
 
@@ -1631,7 +1632,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
 // a split input that lives in the backend's weight slot: a host-resident weight copied to a non-CPU backend
 static bool ggml_backend_sched_weight_slot_eligible(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split, const struct ggml_tensor * input) {
-    if (sched->n_copies != 1 || split->backend_id == sched->n_backends - 1) {
+    if (!sched->weight_prefetch || sched->n_copies != 1 || split->backend_id == sched->n_backends - 1) {
         return false;
     }
     return !(input->flags & GGML_TENSOR_FLAG_INPUT) && input->buffer != NULL &&
@@ -1771,7 +1772,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // before the current split has finished, so that several backends copy over their own links at the same time.
     // the copy is the whole tensor; for MoE weights that gives up the used-experts-only copy, which is worth
     // nothing once a batch is large enough to touch (nearly) every expert. controlled by GGML_SCHED_PREFETCH (0 off)
-    static const int prefetch_enabled = getenv("GGML_SCHED_PREFETCH") ? atoi(getenv("GGML_SCHED_PREFETCH")) : 1;
+    const bool prefetch_enabled = sched->weight_prefetch;
     std::vector<std::vector<uint8_t>> prefetched(sched->n_splits);
     auto is_prefetched = [&](int split_id, int input_id) {
         return (size_t) input_id < prefetched[split_id].size() && prefetched[split_id][input_id];
@@ -2064,6 +2065,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+
+    // weight prefetch only pays when a second non-CPU backend can run while the first copies; a single device, or
+    // GGML_SCHED_PREFETCH=0, keeps the allocator's time-shared input copies and no slots are created
+    {
+        const char * env = getenv("GGML_SCHED_PREFETCH");
+        int n_devices = 0;
+        for (int b = 0; b < n_backends; b++) {
+            n_devices += ggml_backend_dev_type(ggml_backend_get_device(backends[b])) != GGML_BACKEND_DEVICE_TYPE_CPU;
+        }
+        sched->weight_prefetch = (env ? atoi(env) != 0 : true) && n_devices >= 2 && !parallel;
+    }
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
