@@ -27,6 +27,7 @@ struct fit_advisor_candidate {
     std::vector<fit_advisor_override> overrides;
     std::string layer_devices;              // -old spec with buffer type names ("47=CUDA0,output=CUDA0"), empty for none
     bool        spec_mtp = false;           // MTP drafting on: the MTP layers are loaded and a draft context is created
+    int32_t     op_offload_min_batch = 0;   // 0 = the devices' default threshold (see fit_advisor_set_default_op_offload)
 
     // canonical description used for memoization and display
     std::string key() const;
@@ -104,6 +105,11 @@ struct fit_advisor_graph_profile {
 // headroom kept on top of a measured runtime overhead, for what the measurement cannot see: other processes,
 // driver updates, kernels the measurement did not exercise
 constexpr int64_t FIT_ADVISOR_MARGIN_PAD = 128ll * 1024 * 1024;
+
+// the devices' own offload threshold, read before any candidate changed it: a candidate with 0 restores this one, since
+// the setting is device-wide and every probe in this process would otherwise inherit the last candidate's value
+void fit_advisor_set_default_op_offload(int32_t min_batch);
+int32_t fit_advisor_default_op_offload();
 
 // apply a candidate to a copy of the base parameters exactly as the server would parse the equivalent command line;
 // patterns must outlive p because the override array points into them. false with error set on an unknown buffer type

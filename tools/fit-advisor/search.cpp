@@ -58,6 +58,9 @@ std::string alloc_key(const fit_advisor_allocation & a) {
     if (a.draft_mtp) {
         ret += "|mtp";
     }
+    if (a.op_offload_min_batch > 0) {
+        ret += "|off" + std::to_string(a.op_offload_min_batch);
+    }
     return ret;
 }
 
@@ -76,6 +79,9 @@ std::string alloc_name(const fit_advisor_allocation & a) {
     }
     if (a.draft_mtp) {
         ret += "-mtp";
+    }
+    if (a.op_offload_min_batch > 0) {
+        ret += a.op_offload_min_batch >= FIT_ADVISOR_OFFLOAD_NEVER ? "-nooff" : "-off" + std::to_string(a.op_offload_min_batch);
     }
     return ret;
 }
@@ -113,7 +119,9 @@ struct searcher {
         return wl;
     }
     fit_advisor_workload workload(const fit_advisor_allocation & a) const {
-        return workload(a.n_ubatch, a.draft_mtp);
+        fit_advisor_workload wl = workload(a.n_ubatch, a.draft_mtp);
+        wl.op_offload_min_batch = a.op_offload_min_batch;
+        return wl;
     }
     // drafting is explored when the user allowed it (--spec-type draft-mtp) and the model has MTP layers
     bool mtp_searchable() const {
@@ -316,6 +324,7 @@ struct searcher {
 
         fit_advisor_allocation base = fit_advisor_allocation::from_layer_split(inv, device_bufts, part, opts.n_ctx, slots);
         base.draft_mtp = wl_base.use_mtp;
+        base.op_offload_min_batch = wl_base.op_offload_min_batch;
         base.n_ubatch = ub;
         const std::vector<group> groups = build_groups(wl);
 
@@ -577,7 +586,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     };
 
     int n_improvements = 0;
-    int n_single_tried = 0, n_single_accepted = 0, n_rehome_tried = 0, n_mtp_tried = 0;
+    int n_single_tried = 0, n_single_accepted = 0, n_rehome_tried = 0, n_mtp_tried = 0, n_offload_tried = 0;
     const char * trace_tensor = getenv("FIT_ADVISOR_TRACE"); // substring of a tensor name whose moves are logged
     const double T0 = std::max(1.0, 0.005 * std::fabs(cur.cost_score));
     const double T1 = std::max(0.01, 0.00002 * std::fabs(cur.cost_score));
@@ -649,6 +658,16 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             const int d = (int) ((h + 1 + (size_t) (uni(rng) * (nd - 1)) % (nd - 1)) % nd);
             nxt.alloc = nxt.alloc.with_layer_home(inv, il, d);
             n_rehome_tried++;
+        } else if (mv < 0.96 && opts.offload_options.size() > 1) {
+            // step the op offload threshold: when CPU-resident weights are copied to a device and run there
+            const auto & oo = opts.offload_options;
+            size_t k = std::find(oo.begin(), oo.end(), nxt.alloc.op_offload_min_batch) - oo.begin();
+            if (k >= oo.size()) continue;
+            k = uni(rng) < 0.5 ? (k == 0 ? 1 : k - 1) : (k + 1 >= oo.size() ? k - 1 : k + 1);
+            if (k >= oo.size()) continue;
+            nxt.alloc.op_offload_min_batch = oo[k];
+            nxt.wl = S.workload(nxt.alloc);
+            n_offload_tried++;
         } else if (mv < 0.965 && S.mtp_searchable()) {
             // drafting on or off: with it the MTP layers cost memory and a verification batch replaces single tokens
             nxt.alloc.draft_mtp = !nxt.alloc.draft_mtp;
@@ -743,8 +762,8 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         }
     }
 
-    LOG_INF("%s: annealing: %d accepted of %d, %d single-tensor moves, %d layer re-homes and %d drafting toggles proposed, %d model improvements over the seed\n", __func__,
-        accepted, iters, n_single_tried, n_rehome_tried, n_mtp_tried, n_improvements);
+    LOG_INF("%s: annealing: %d accepted of %d, %d single-tensor moves, %d layer re-homes, %d drafting toggles and %d offload threshold steps proposed, %d model improvements over the seed\n", __func__,
+        accepted, iters, n_single_tried, n_rehome_tried, n_mtp_tried, n_offload_tried, n_improvements);
     GGML_UNUSED(n_single_accepted);
 
     // fill: from the incumbent, add every CPU-resident tensor that the model says pays for itself, best gain per byte

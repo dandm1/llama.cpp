@@ -76,9 +76,13 @@ std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common
         }
         ret.push_back({ "LLAMA_ARG_DEVICE", v, "-dev " + v });
     }
-    if (params.op_offload_min_batch > 0) {
-        const std::string v = std::to_string(params.op_offload_min_batch);
-        ret.push_back({ "LLAMA_ARG_OP_OFFLOAD_MIN_BATCH", v, "--op-offload-min-batch " + v });
+    {
+        // the candidate's threshold, or the user's; 0 means the backend default and needs no flag
+        const int32_t v_i = cand.op_offload_min_batch > 0 ? cand.op_offload_min_batch : params.op_offload_min_batch;
+        if (v_i > 0) {
+            const std::string v = std::to_string(v_i);
+            ret.push_back({ "LLAMA_ARG_OP_OFFLOAD_MIN_BATCH", v, "--op-offload-min-batch " + v });
+        }
     }
     std::vector<common_speculative_type> types;
     for (const auto t : params.speculative.types) {

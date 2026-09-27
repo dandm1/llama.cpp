@@ -32,8 +32,15 @@ std::string fit_advisor_candidate::key() const {
     if (spec_mtp) {
         ss << " mtp";
     }
+    if (op_offload_min_batch > 0) {
+        ss << " offload=" << op_offload_min_batch;
+    }
     return ss.str();
 }
+
+static int32_t g_default_op_offload = 0;
+void fit_advisor_set_default_op_offload(int32_t min_batch) { g_default_op_offload = min_batch; }
+int32_t fit_advisor_default_op_offload() { return g_default_op_offload; }
 
 std::string fit_advisor_candidate::layer_devices_cli() const {
     std::string ret;
@@ -247,6 +254,9 @@ bool fit_advisor_apply_candidate(common_params & p, const fit_advisor_candidate 
         p.tensor_buft_overrides.push_back({ patterns.back().c_str(), b->second });
     }
     p.tensor_buft_overrides.push_back({ nullptr, nullptr });
+
+    // the offload threshold is device-wide; always set it explicitly so probes do not inherit each other's value
+    p.op_offload_min_batch = cand.op_offload_min_batch > 0 ? cand.op_offload_min_batch : g_default_op_offload;
 
     // drafting is the candidate's decision: with it the MTP layers are loaded and priced, without it neither
     p.speculative.types.erase(std::remove(p.speculative.types.begin(), p.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP),

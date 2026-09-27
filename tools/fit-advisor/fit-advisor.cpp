@@ -80,6 +80,7 @@ static std::vector<named_allocation> build_allocations(const common_params & par
     auto add = [&](const std::string & name, uint32_t ngl, uint32_t n_ctx) {
         fit_advisor_allocation a = fit_advisor_allocation::from_layer_split(inv, device_bufts, split(ngl), n_ctx, n_slots);
         a.draft_mtp = spec_mtp;
+        a.op_offload_min_batch = params.op_offload_min_batch;
         ret.push_back({ name, a });
     };
 
@@ -96,6 +97,7 @@ static std::vector<named_allocation> build_allocations(const common_params & par
     auto move_kind = [&](const std::string & name, fit_advisor_tensor_kind kind, uint32_t il_begin, uint32_t il_end) {
         fit_advisor_allocation a = fit_advisor_allocation::from_layer_split(inv, device_bufts, split(ngl_max), params.n_ctx, n_slots);
         a.draft_mtp = spec_mtp;
+        a.op_offload_min_batch = params.op_offload_min_batch;
         for (size_t i = 0; i < inv.tensors.size(); i++) {
             const auto & t = inv.tensors[i];
             if (t.kind == kind && t.layer >= (int32_t) il_begin && t.layer < (int32_t) il_end) {
@@ -135,6 +137,7 @@ static fit_advisor_candidate user_candidate(const common_params & params) {
     }
     c.spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    c.op_offload_min_batch = params.op_offload_min_batch;
     // -old as given, translated to buffer type names like the rest of the candidate
     for (const auto & o : params.layer_dev_overrides) {
         if (o.il == -1) {
@@ -373,6 +376,11 @@ static fit_advisor_search_result search_and_report(const common_params & params,
         sr.wl.n_ubatch, sr.alloc.n_slots);
     printf("  generation step %.0f us: weights %.0f, attention %.0f, per-node overhead %.0f, boundaries %.0f\n",
         sr.cost.t_gen_step_us, sr.cost.step_weights_us, sr.cost.step_attn_us, sr.cost.step_overhead_us, sr.cost.step_boundary_us);
+    if (sr.alloc.op_offload_min_batch > 0) {
+        printf("  op offload threshold: %s (the devices' default is %d)\n",
+            sr.alloc.op_offload_min_batch >= FIT_ADVISOR_OFFLOAD_NEVER ? "never, CPU weights run on the CPU" : std::to_string(sr.alloc.op_offload_min_batch).c_str(),
+            fit_advisor_default_op_offload());
+    }
     if (sr.wl.use_mtp) {
         printf("  drafting ON: verification batch of %u, MTP draft run %.0f us x %u, %.2f tokens per step\n",
             1 + sr.wl.mtp_draft_n, sr.cost.t_mtp_draft_us, sr.wl.mtp_draft_n, sr.cost.tokens_per_step);
@@ -453,10 +461,20 @@ int llama_fit_advisor(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    // the op offload threshold is a device setting; apply it before anything reads it (measurements, probes)
+    // the op offload threshold is a device setting; apply the user's before anything reads it, and remember what
+    // the devices had so candidates without an explicit value can restore it
     if (params.op_offload_min_batch > 0) {
         for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
             ggml_backend_dev_set_op_offload_min_batch(ggml_backend_dev_get(i), params.op_offload_min_batch);
+        }
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            const int t = fit_advisor_offload_min_batch(ggml_backend_dev_get(i));
+            if (t > 0) {
+                fit_advisor_set_default_op_offload(t);
+                break;
+            }
         }
     }
 
@@ -611,6 +629,7 @@ int llama_fit_advisor(int argc, char ** argv) {
         w.n_ubatch = (uint32_t) params.n_ubatch;
         w.use_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
                                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        w.op_offload_min_batch = params.op_offload_min_batch;
         w.mtp_draft_n = (uint32_t) std::max(0, params.speculative.draft.n_max);
         w.mtp_accept  = params.fit_advisor_mtp_accept;
         if (w.use_mtp && inv.n_layer_nextn == 0) {

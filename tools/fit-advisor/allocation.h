@@ -25,6 +25,7 @@ struct fit_advisor_allocation {
     uint32_t n_slots  = 1;
     uint32_t n_ubatch = 0; // 0 = the base parameters' ubatch
     bool     draft_mtp = false; // MTP drafting on: the MTP layers are part of the allocation and the draft context exists
+    int32_t  op_offload_min_batch = 0; // 0 = the devices' default; FIT_ADVISOR_OFFLOAD_NEVER = keep CPU weights on the CPU
 
     // number of layers on each device in device order, the output layer counts as one layer on the last used device
     // the remaining leading layers are on the CPU

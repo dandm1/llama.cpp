@@ -20,6 +20,8 @@
 
 struct fit_advisor_search_options {
     std::vector<uint32_t> ubatch_options = { 512, 1024, 2048 };
+    // op offload thresholds to try besides the devices' default (0); FIT_ADVISOR_OFFLOAD_NEVER keeps CPU weights on the CPU
+    std::vector<int32_t> offload_options = { 0, 16, 64, 128, FIT_ADVISOR_OFFLOAD_NEVER };
     uint32_t n_ctx      = 0;     // 0 = model default
     uint32_t max_slots  = 1;     // from the workload's concurrency
     int      anneal_iters = 20000;

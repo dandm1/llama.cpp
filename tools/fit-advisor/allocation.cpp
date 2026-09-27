@@ -96,6 +96,7 @@ fit_advisor_candidate fit_advisor_allocation::to_candidate(const fit_advisor_inv
     c.n_ubatch     = n_ubatch;
     c.n_gpu_layers = n_gpu_layers();
     c.spec_mtp     = draft_mtp;
+    c.op_offload_min_batch = op_offload_min_batch;
 
     // -ts as integer layer counts reproduces the blocks exactly, see get_layer_buft_list in llama-model.cpp
     if (device_bufts.size() > 1) {
