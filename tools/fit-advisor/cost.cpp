@@ -495,6 +495,8 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
         double w, a, o, b;
         step_us(batch_gen, SEL_MTP, w, a, o, b);
         c.t_mtp_draft_us = w + a + o + b;
+        // the decode's overhead beyond its kernels depends on the device the draft layer runs on
+        const double draft_extra = wl.mtp_draft_extra_for(alloc.layer_device(inv.n_layer, n_layer_all), devices.size() - 1);
 
         constexpr uint32_t depth_guard = 32;
         double best_rate = -1;
@@ -508,7 +510,7 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             }
             const double extra = depth > 0 && depth < wl.mtp_extra_by_depth_us.size() && wl.mtp_extra_by_depth_us[depth] != 0
                 ? wl.mtp_extra_by_depth_us[depth] : depth * wl.mtp_extra_per_depth_us;
-            const double t_step = std::max(1.0, sw + sa + so + sb + depth * (c.t_mtp_draft_us + wl.mtp_draft_extra_us) + extra
+            const double t_step = std::max(1.0, sw + sa + so + sb + depth * (c.t_mtp_draft_us + draft_extra) + extra
                                 + (depth > 0 ? (1.0 - p_all) * wl.mtp_rollback_us : 0.0));
             const double rate   = t_step > 0 ? batch_gen * wl.tokens_per_step(depth) * 1e6 / t_step : 0;
             c.mtp_depth_tok_s.push_back(rate);

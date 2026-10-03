@@ -961,7 +961,11 @@ int llama_fit_advisor(int argc, char ** argv) {
                     LOG_INF("%s: drafting timed: draft decode %.2f ms vs %.2f modelled kernels, extra %.2f ms (was %.2f); verification rows growth "
                             "measured/modelled ms:%s; rollback %.2f ms\n", __func__, vr.t_draft_us * 1e-3, sr.cost.t_mtp_draft_us * 1e-3,
                             draft_extra * 1e-3, wl.mtp_draft_extra_us * 1e-3, table.c_str(), vr.t_rollback_us * 1e-3);
-                    bool differs = std::fabs(draft_extra - wl.mtp_draft_extra_us) > 0.02 * vr.t_step_plain_us ||
+                    const int    draft_dev = sr.alloc.layer_device(inv.n_layer, inv.n_layer + inv.n_layer_nextn);
+                    const size_t draft_i   = draft_dev < 0 ? device_bufts.size() : (size_t) draft_dev;
+                    const bool   dev_known = draft_i < wl.mtp_draft_extra_by_dev_us.size() && wl.mtp_draft_extra_by_dev_us[draft_i] >= 0;
+                    bool differs = !dev_known ||
+                                   std::fabs(draft_extra - wl.mtp_draft_extra_by_dev_us[draft_i]) > 0.02 * vr.t_step_plain_us ||
                                    std::fabs(vr.t_rollback_us - wl.mtp_rollback_us) > 0.02 * vr.t_step_plain_us;
                     for (size_t d = 1; d < by_depth.size(); d++) {
                         const double prev = d < wl.mtp_extra_by_depth_us.size() ? wl.mtp_extra_by_depth_us[d] : 0.0;
@@ -969,6 +973,15 @@ int llama_fit_advisor(int argc, char ** argv) {
                     }
                     if (differs) {
                         wl.mtp_draft_extra_us     = draft_extra;
+                        {
+                            // remembered for the device the draft layer ran on in this validation
+                            const int dev = sr.alloc.layer_device(inv.n_layer, inv.n_layer + inv.n_layer_nextn);
+                            const size_t i = dev < 0 ? device_bufts.size() : (size_t) dev;
+                            if (wl.mtp_draft_extra_by_dev_us.size() < device_bufts.size() + 1) {
+                                wl.mtp_draft_extra_by_dev_us.assign(device_bufts.size() + 1, -1.0);
+                            }
+                            wl.mtp_draft_extra_by_dev_us[i] = draft_extra;
+                        }
                         wl.mtp_extra_by_depth_us  = by_depth;
                         wl.mtp_extra_per_depth_us = std::max(0.0, extra);
                         wl.mtp_rollback_us        = vr.t_rollback_us;
