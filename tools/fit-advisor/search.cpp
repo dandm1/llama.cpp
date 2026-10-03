@@ -421,6 +421,18 @@ struct searcher {
         r.fits  = pj->ok && pj->fits_all();
         if (pj->ok) {
             r.cost = fit_advisor_cost_estimate(inv, a, *pj, gp, cost_devs, pairs, wl);
+            if (a.draft_mtp && r.cost.ok && r.cost.mtp_draft_n == 0) {
+                // drafting does not pay here: the MTP layers would only cost memory, so the seed starts without them
+                a.draft_mtp = false;
+                pj = &probe_alloc(a, name);
+                r.alloc = a;
+                r.proj  = *pj;
+                r.fits  = pj->ok && pj->fits_all();
+                if (pj->ok) {
+                    r.cost = fit_advisor_cost_estimate(inv, a, *pj, gp, cost_devs, pairs, workload(a));
+                }
+            }
+            r.alloc.mtp_draft_n = r.cost.mtp_draft_n;
         }
         return r;
     }
@@ -450,6 +462,13 @@ struct searcher {
         if (!c.ok) {
             return false;
         }
+        if (s.alloc.draft_mtp && c.mtp_draft_n == 0) {
+            // the MTP layers loaded but no depth pays: the same allocation without them is as fast and holds less,
+            // so this state is never entered (the drafting toggle leads there instead)
+            return false;
+        }
+        s.alloc.mtp_draft_n = c.mtp_draft_n;
+        s.wl.mtp_draft_n    = c.mtp_draft_n;
         s.cost_score = score(c, s.wl);
         s.penalty = 0;
         for (size_t d = 0; d < nd; d++) {
