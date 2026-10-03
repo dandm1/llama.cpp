@@ -867,8 +867,14 @@ int llama_fit_advisor(int argc, char ** argv) {
                 if (vr.t_verify_us[d] <= 0) {
                     continue;
                 }
+                double p_all = 1.0;
+                for (size_t k = 1; k <= d; k++) {
+                    p_all *= wl.mtp_accept_at((uint32_t) k);
+                }
+                // growth of the step with depth, without the terms a previous validation already added
                 const double measured = vr.t_verify_us[d] + d * vr.t_draft_us - vr.t_step_plain_us;
-                const double modelled = sr.cost.mtp_depth_step_us[d] - plain_model - d * wl.mtp_extra_per_depth_us;
+                const double modelled = sr.cost.mtp_depth_step_us[d] - plain_model - d * wl.mtp_extra_per_depth_us
+                                      - (1.0 - p_all) * wl.mtp_rollback_us;
                 extra_sum += (measured - modelled) / d;
                 extra_n++;
                 table += string_format(" d=%zu %.1f/%.1f", d, measured * 1e-3, modelled * 1e-3);
@@ -876,10 +882,12 @@ int llama_fit_advisor(int argc, char ** argv) {
             if (extra_n > 0) {
                 const double extra = std::max(0.0, extra_sum / extra_n);
                 LOG_INF("%s: drafting timed: plain step %.1f ms measured vs %.1f modelled; growth per depth measured/modelled ms:%s; "
-                        "extra per draft position %.2f ms (was %.2f)\n", __func__, vr.t_step_plain_us * 1e-3, plain_model * 1e-3,
-                        table.c_str(), extra * 1e-3, wl.mtp_extra_per_depth_us * 1e-3);
-                if (std::fabs(extra - wl.mtp_extra_per_depth_us) > 0.02 * vr.t_step_plain_us) {
+                        "extra per draft position %.2f ms (was %.2f), rollback %.2f ms (was %.2f)\n", __func__, vr.t_step_plain_us * 1e-3, plain_model * 1e-3,
+                        table.c_str(), extra * 1e-3, wl.mtp_extra_per_depth_us * 1e-3, vr.t_rollback_us * 1e-3, wl.mtp_rollback_us * 1e-3);
+                if (std::fabs(extra - wl.mtp_extra_per_depth_us) > 0.02 * vr.t_step_plain_us ||
+                    std::fabs(vr.t_rollback_us - wl.mtp_rollback_us) > 0.02 * vr.t_step_plain_us) {
                     wl.mtp_extra_per_depth_us = extra;
+                    wl.mtp_rollback_us        = vr.t_rollback_us;
                     changed = true;
                 }
             }

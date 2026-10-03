@@ -52,6 +52,8 @@ struct fit_advisor_validate_result {
     double              t_step_plain_us = 0;
     std::vector<double> t_verify_us;
     double              t_draft_us = 0;
+    double              t_rollback_us = 0; // removing the rejected tail of a verification step from the memory (a
+                                           // recurrent model restores a state snapshot); 0 when it could not be timed
 
     // the margin the search should use for each device: what the projection missed plus the pad, never negative
     int64_t suggested_margin(size_t device) const;

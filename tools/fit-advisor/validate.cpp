@@ -270,9 +270,12 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
     // here, at steady state, and the search is told the difference. the KV is rolled back after every step
     if (ctx_mtp && decode_ok) {
         llama_memory_t mem = llama_get_memory(ctx);
-        auto pos_of = [&](uint32_t s) -> llama_pos {
-            return s == 0 ? (llama_pos) (n_prompt_tokens + vr.n_gen_steps) : (llama_pos) vr.n_gen_steps;
-        };
+        // every timed step continues its slot's sequence; nothing is rolled back between steps, the rollback is timed
+        // on its own below. the extra positions are a few hundred at most, nothing against the prompt
+        std::vector<llama_pos> pos_next(n_slots);
+        for (uint32_t s = 0; s < n_slots; s++) {
+            pos_next[s] = s == 0 ? (llama_pos) (n_prompt_tokens + vr.n_gen_steps) : (llama_pos) vr.n_gen_steps;
+        }
         auto time_decode = [&](llama_context * c, llama_batch & b) -> double {
             const int64_t t = ggml_time_us();
             if (llama_decode(c, b) != 0) {
@@ -297,21 +300,27 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
             return ts[ts.size() / 2];
         };
         constexpr int reps = 5;
-        const uint32_t d_max = std::min<uint32_t>(8, std::max<uint32_t>(1, n_batch / n_slots) - 1);
+        uint32_t d_max = std::min<uint32_t>(8, std::max<uint32_t>(1, n_batch / n_slots) - 1);
+        uint32_t token_seed = 3000;
+        // a step of 1 + d rows on every slot, at the slots' next positions
+        auto step_rows = [&](uint32_t d) -> double {
+            common_batch_clear(batch);
+            for (uint32_t s = 0; s < n_slots; s++) {
+                for (uint32_t k = 0; k <= d; k++) {
+                    common_batch_add(batch, token_at(token_seed++), pos_next[s] + (llama_pos) k, { (llama_seq_id) s }, true);
+                }
+            }
+            const double t = time_decode(ctx, batch);
+            for (uint32_t s = 0; s < n_slots; s++) {
+                pos_next[s] += (llama_pos) (d + 1);
+            }
+            return t;
+        };
         vr.t_verify_us.assign(d_max + 1, 0.0);
         for (uint32_t d = 0; d <= d_max && decode_ok; d++) {
             std::vector<double> ts;
             for (int r = 0; r < reps; r++) {
-                common_batch_clear(batch);
-                for (uint32_t s = 0; s < n_slots; s++) {
-                    for (uint32_t k = 0; k <= d; k++) {
-                        common_batch_add(batch, token_at(3000 + (r * n_slots + s) * 16 + k), pos_of(s) + (llama_pos) k, { (llama_seq_id) s }, true);
-                    }
-                }
-                const double t = time_decode(ctx, batch);
-                for (uint32_t s = 0; s < n_slots; s++) {
-                    llama_memory_seq_rm(mem, (llama_seq_id) s, pos_of(s), -1);
-                }
+                const double t = step_rows(d);
                 if (t < 0) {
                     decode_ok = false;
                     vr.error = "timed decode failed";
@@ -325,6 +334,34 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
             } else {
                 vr.t_verify_us[d] = t_med;
             }
+        }
+        if (decode_ok) {
+            // the rollback after a verification: the rejected tail leaves the memory. a recurrent model can only go back
+            // as far as it keeps snapshots (one per draft position, as the server configures it)
+            const uint32_t n_rs = llama_n_rs_seq(ctx);
+            const uint32_t d_rb = std::min<uint32_t>(d_max, n_rs > 0 ? n_rs : 4);
+            std::vector<double> ts;
+            for (int r = 0; r < reps && d_rb > 0; r++) {
+                const std::vector<llama_pos> pos_before = pos_next;
+                if (step_rows(d_rb) < 0) {
+                    break;
+                }
+                const int64_t t = ggml_time_us();
+                bool removed = true;
+                for (uint32_t s = 0; s < n_slots; s++) {
+                    removed = llama_memory_seq_rm(mem, (llama_seq_id) s, pos_before[s] + 1, -1) && removed; // keep the first row
+                }
+                ts.push_back((double) (ggml_time_us() - t));
+                for (uint32_t s = 0; s < n_slots; s++) {
+                    pos_next[s] = pos_before[s] + 1;
+                }
+                if (!removed) {
+                    LOG_WRN("%s: the memory could not roll back %u positions, the rollback is not timed\n", __func__, d_rb);
+                    ts.clear();
+                    break;
+                }
+            }
+            vr.t_rollback_us = median_after_warmup(ts);
         }
         if (decode_ok) {
             // the draft context takes the token and the trunk's hidden row for it; the values do not matter to the kernels
@@ -352,8 +389,8 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
         for (uint32_t d = 1; d <= d_max; d++) {
             by_depth += string_format(" d=%u %.0f", d, vr.t_verify_us[d]);
         }
-        LOG_INF("%s: timed drafting: plain step %.0f us, draft decode %.0f us, verification of 1+d rows:%s us\n", __func__,
-            vr.t_step_plain_us, vr.t_draft_us, by_depth.c_str());
+        LOG_INF("%s: timed drafting: plain step %.0f us, draft decode %.0f us, rollback %.0f us, verification of 1+d rows:%s us\n", __func__,
+            vr.t_step_plain_us, vr.t_draft_us, vr.t_rollback_us, by_depth.c_str());
     }
     vr.t_run_s = (ggml_time_us() - t1) * 1e-6;
     if (probe.n_samples > 0) {
@@ -409,7 +446,8 @@ void fit_advisor_validate_print(const fit_advisor_validate_result & vr) {
     printf("\nvalidation by a real load: %u prompt tokens + %u generation steps, load %.1f s, run %.1f s\n",
         vr.n_prompt_tokens, vr.n_gen_steps, vr.t_load_s, vr.t_run_s);
     if (vr.t_draft_us > 0) {
-        printf("drafting timed: plain step %.1f ms, draft decode %.2f ms per token, verification step by draft depth:", vr.t_step_plain_us * 1e-3, vr.t_draft_us * 1e-3);
+        printf("drafting timed: plain step %.1f ms, draft decode %.2f ms per token, rollback %.2f ms, verification step by draft depth:",
+            vr.t_step_plain_us * 1e-3, vr.t_draft_us * 1e-3, vr.t_rollback_us * 1e-3);
         for (size_t d = 1; d < vr.t_verify_us.size(); d++) {
             printf(" %zu: %.1f", d, vr.t_verify_us[d] * 1e-3);
         }

@@ -44,6 +44,8 @@ struct fit_advisor_workload {
                                     // of each further position is multiplied by this factor once more
     double   mtp_extra_per_depth_us = 0; // per draft position, what a timed draft decode and verification row cost beyond
                                          // the kernels the model prices: launches, synchronisation, host work (validation)
+    double   mtp_rollback_us = 0;        // removing a rejected tail from the memory, paid by every step that rejects a
+                                         // draft token (validation; a recurrent model restores a state snapshot)
 
     // probability that the drafted token at 1-based position k is accepted given every earlier one was
     double mtp_accept_at(uint32_t k) const;
