@@ -508,8 +508,14 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             const double rate   = t_step > 0 ? batch_gen * wl.tokens_per_step(depth) * 1e6 / t_step : 0;
             c.mtp_depth_tok_s.push_back(rate);
             c.mtp_depth_step_us.push_back(t_step);
-            if (rate <= best_rate) {
+            // the rate over the depth is unimodal when the rows are priced from the kernel curves; where a validation
+            // timed the depths it need not be (CPU kernels dip at odd row counts), so every timed depth is looked at
+            const bool timed = depth + 1 < wl.mtp_extra_by_depth_us.size();
+            if (rate <= best_rate && !timed) {
                 break;
+            }
+            if (rate <= best_rate) {
+                continue;
             }
             best_rate = rate;
             c.mtp_draft_n     = depth;
