@@ -403,16 +403,22 @@ static fit_advisor_search_result search_and_report(const common_params & params,
                 fit_advisor_default_op_offload());
         }
     }
-    if (sr.wl.use_mtp) {
-        printf("  drafting ON at depth %u: verification batch of %u, MTP draft run %.0f us x %u, %.2f tokens per step\n",
-            sr.cost.mtp_draft_n, 1 + sr.cost.mtp_draft_n, sr.cost.t_mtp_draft_us, sr.cost.mtp_draft_n, sr.cost.tokens_per_step);
-        printf("    gen tok/s by depth:");
+    auto print_by_depth = [&]() {
+        printf("    gen tok/s by draft depth:");
         for (size_t d = 0; d < sr.cost.mtp_depth_tok_s.size(); d++) {
             printf(" %zu: %.2f", d, sr.cost.mtp_depth_tok_s[d]);
         }
         printf("  (the scan stops at the first depth that is worse)\n");
+    };
+    if (sr.wl.use_mtp) {
+        printf("  drafting ON at depth %u: verification batch of %u, MTP draft run %.0f us x %u, %.2f tokens per step\n",
+            sr.cost.mtp_draft_n, 1 + sr.cost.mtp_draft_n, sr.cost.t_mtp_draft_us, sr.cost.mtp_draft_n, sr.cost.tokens_per_step);
+        print_by_depth();
     } else if (inv.n_layer_nextn > 0 && params.fit_advisor_mtp) {
-        printf("  drafting OFF: the MTP layers are not loaded; drafting was priced on every allocation and never won\n");
+        printf("  drafting OFF: the MTP layers are not loaded; drafting was priced on every allocation and did not pay\n");
+        if (!sr.cost.mtp_depth_tok_s.empty()) {
+            print_by_depth();
+        }
     }
     for (size_t d = 0; d < sr.proj.devices.size(); d++) {
         const auto & pd = sr.proj.devices[d];
