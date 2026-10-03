@@ -506,11 +506,12 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             }
             const double extra = depth > 0 && depth < wl.mtp_extra_by_depth_us.size() && wl.mtp_extra_by_depth_us[depth] != 0
                 ? wl.mtp_extra_by_depth_us[depth] : depth * wl.mtp_extra_per_depth_us;
-            const double t_step = std::max(1.0, sw + sa + so + sb + depth * c.t_mtp_draft_us + extra
+            const double t_step = std::max(1.0, sw + sa + so + sb + depth * c.t_mtp_draft_us * wl.mtp_draft_scale + extra
                                 + (depth > 0 ? (1.0 - p_all) * wl.mtp_rollback_us : 0.0));
             const double rate   = t_step > 0 ? batch_gen * wl.tokens_per_step(depth) * 1e6 / t_step : 0;
             c.mtp_depth_tok_s.push_back(rate);
             c.mtp_depth_step_us.push_back(t_step);
+            c.mtp_depth_rows_us.push_back(sw + sa + so + sb);
             if (depth == 0) {
                 c.n_excursions = n_excursions_last;
             }

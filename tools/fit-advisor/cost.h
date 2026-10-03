@@ -42,8 +42,11 @@ struct fit_advisor_workload {
     double   mtp_accept    = 0.8;   // probability that one drafted token is accepted, a heuristic like the token counts
     double   mtp_decay     = 0.85;  // beyond the trained depth a single layer drafts from its own guesses: the acceptance
                                     // of each further position is multiplied by this factor once more
-    double   mtp_extra_per_depth_us = 0; // per draft position, what a timed draft decode and verification row cost beyond
-                                         // the kernels the model prices: launches, synchronisation, host work (validation)
+    double   mtp_extra_per_depth_us = 0; // per draft position, what a timed verification row costs beyond the kernels
+                                         // the model prices (validation), where no per-depth figure exists
+    double   mtp_draft_scale = 1.0;      // a timed draft decode over the kernels the model prices for it: the decode's
+                                         // launches, synchronisation and host work scale with the device like the kernels
+                                         // do, so the factor carries over to a draft layer on another device (validation)
     double   mtp_rollback_us = 0;        // removing a rejected tail from the memory, paid by every step that rejects a
                                          // draft token (validation; a recurrent model restores a state snapshot)
     double   excursion_extra_us = 0;     // per excursion of a layer's op to another device: what a timed plain step cost
@@ -99,6 +102,7 @@ struct fit_advisor_cost {
     double   tokens_per_step = 1;
     std::vector<double> mtp_depth_tok_s;   // [depth] -> aggregate gen tokens/s, depth 0 = plain steps
     std::vector<double> mtp_depth_step_us; // [depth] -> the step time behind it
+    std::vector<double> mtp_depth_rows_us; // [depth] -> the trunk's verification step alone (1 + depth rows), no draft runs
 
     // objective: lower is better
     double score() const { return t_request_us; }
