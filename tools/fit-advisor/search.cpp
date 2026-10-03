@@ -741,10 +741,37 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     int last_probe_iter = 0;
 
     // spare capacity anywhere, e.g. a smaller third card with no layers of its own, is filled with the best CPU-resident
-    // groups before the walk starts, so the annealer refines that arrangement instead of having to discover it
-    if (fill_pass(cur, proj_by_key, "before annealing") > 0 && cur.penalty == 0 && cur.objective < best_seen.objective) {
-        best_seen = cur;
-        best_seen_dirty = true;
+    // groups before the walk starts, so the annealer refines that arrangement instead of having to discover it.
+    // the fill trusts the memory model of the seed's key, and that model knows nothing about a device the seed left
+    // empty: holding expert groups costs a compute buffer and scratch there. so the packed state is probed at once; the
+    // probe corrects the model for the key and the fill is redone from the seed until the packed state fits
+    {
+        const searcher::state seed = cur;
+        for (int round = 0; round < 3; round++) {
+            searcher::state st = seed;
+            const std::string k = alloc_key(st.alloc);
+            if (!S.evaluate(st, proj_by_key[k]) || st.penalty > 0) {
+                break;
+            }
+            if (fill_pass(st, proj_by_key, "before annealing") == 0) {
+                break;
+            }
+            const fit_advisor_projection & pj = S.probe_alloc(st.alloc, alloc_name(st.alloc));
+            proj_by_key[k] = pj;
+            searcher::state checked = st;
+            if (pj.ok && pj.fits_all() && S.evaluate(checked, pj) && checked.penalty == 0) {
+                cur = checked;
+                if (cur.objective < incumbent.objective) {
+                    incumbent      = cur; // verified by the loader, so it can stand as the incumbent right away
+                    incumbent_proj = pj;
+                    best_seen      = cur;
+                }
+                break;
+            }
+            LOG_INF("%s: the filled seed does not fit on probe (round %d), refilling with the probed overheads\n", __func__, round + 1);
+            cur = seed;
+            S.evaluate(cur, proj_by_key[k]);
+        }
     }
 
     for (int it = 0; it < iters && (!movable.empty() || !singles.empty()); it++) {
@@ -924,10 +951,14 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
                 incumbent = checked;
                 incumbent_proj = pj;
             } else {
-                // the refreshed overheads say it does not fit: forget it and let the walk continue from the incumbent
+                // the refreshed overheads say it does not fit: forget it. the walk continues from its current state if
+                // that still fits under the refreshed model, else from the incumbent rather than from penalty
                 best_seen = incumbent;
                 if (cur.penalty == 0) {
                     S.evaluate(cur, proj_by_key.count(key) ? proj_by_key[key] : pj);
+                }
+                if (cur.penalty > 0) {
+                    cur = incumbent;
                 }
             }
         }
