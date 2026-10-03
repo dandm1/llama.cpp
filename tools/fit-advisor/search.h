@@ -23,6 +23,7 @@ struct fit_advisor_search_options {
     // op offload thresholds to try besides the devices' default (0); FIT_ADVISOR_OFFLOAD_NEVER keeps CPU weights on the CPU
     std::vector<int32_t> offload_options = { 0, 16, 64, 128, FIT_ADVISOR_OFFLOAD_NEVER };
     uint32_t n_ctx      = 0;     // 0 = model default
+    std::vector<std::vector<uint32_t>> extra_partitions; // layers per device to seed from besides the generated ones (the fitter's split)
     uint32_t max_slots  = 1;     // from the workload's concurrency
     int      anneal_iters = 20000;
     uint32_t seed       = 42;

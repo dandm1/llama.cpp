@@ -537,6 +537,11 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         };
         add_partition(split(w_free));
         add_partition(split(std::vector<double>(nd, 1.0)));
+        for (const auto & part : opts.extra_partitions) {
+            if (part.size() == nd && std::accumulate(part.begin(), part.end(), 0u) <= S.ngl_max) {
+                add_partition(part);
+            }
+        }
 
         // unequal devices: every layer's home on the fastest k cards only, the rest hold no layers and get expert
         // stacks from the fill pass instead; a slow card with a slow link is a store, not a place to run attention
@@ -713,7 +718,17 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
                 if (st.alloc.tensor_device[c.single] != fit_advisor_allocation::DEV_CPU) continue;
                 nxt.alloc.tensor_device[c.single] = c.dev;
             }
-            const bool feasible = S.evaluate(nxt, pbk[fkey]);
+            bool feasible = S.evaluate(nxt, pbk[fkey]);
+            if (feasible) {
+                // a packed device must keep a little below its margin: the probe of the packed state reads a few MiB
+                // differently from the linear model, and a state that only just fits would be thrown out for it
+                std::vector<int64_t> over;
+                if (S.memory_over(nxt.alloc, nxt.wl, over)) {
+                    for (size_t d = 0; d < over.size(); d++) {
+                        feasible = feasible && over[d] + (int64_t) (64 * UNIT) <= 0;
+                    }
+                }
+            }
             if (trace_tensor) {
                 const size_t i = c.group >= 0 ? movable[c.group].idx[0] : c.single;
                 if (inv.tensors[i].name.find(trace_tensor) != std::string::npos) {
@@ -968,24 +983,40 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         accepted, iters, n_single_tried, n_rehome_tried, n_mtp_tried, n_offload_tried, n_attn_tried, n_improvements);
     GGML_UNUSED(n_single_accepted);
 
-    // fill: from the incumbent, everything CPU-resident that the full model says pays for itself, on any device
+    // fill: from the incumbent, everything CPU-resident that the full model says pays for itself, on any device. the
+    // packed state is probed like the one before annealing, refilled with the probed overheads if it does not fit,
+    // and the verified incumbent stays if no packed state passes
     {
-        searcher::state st = incumbent;
-        if (fill_pass(st, proj_by_key, "after annealing") > 0) {
-            incumbent = st;
+        const searcher::state before = incumbent;
+        for (int round = 0; round < 3; round++) {
+            searcher::state st = before;
+            const std::string k = alloc_key(st.alloc);
+            if (!S.evaluate(st, proj_by_key.count(k) ? proj_by_key[k] : incumbent_proj) || st.penalty > 0) {
+                break;
+            }
+            if (fill_pass(st, proj_by_key, "after annealing") == 0) {
+                break;
+            }
+            const fit_advisor_projection & pj = S.probe_alloc(st.alloc, alloc_name(st.alloc));
+            proj_by_key[k] = pj;
+            searcher::state checked = st;
+            if (pj.ok && pj.fits_all() && S.evaluate(checked, pj) && checked.penalty == 0 && checked.objective < incumbent.objective) {
+                incumbent      = checked;
+                incumbent_proj = pj;
+                break;
+            }
+            LOG_INF("%s: the filled incumbent does not fit on probe (round %d), refilling with the probed overheads\n", __func__, round + 1);
         }
     }
 
-    // final verification of the incumbent
+    // final verification of the incumbent: every incumbent was probed when it was accepted, so this only guards against
+    // a probe that reads differently now; the seed is never returned over a verified incumbent
     {
         const fit_advisor_projection & pj = S.probe_alloc(incumbent.alloc, alloc_name(incumbent.alloc));
         if (pj.ok && pj.fits_all()) {
             incumbent_proj = pj;
         } else {
-            LOG_WRN("%s: annealed incumbent does not fit on re-probe, falling back to the seed\n", __func__);
-            incumbent.alloc = best_cell.alloc;
-            incumbent.wl    = S.workload(incumbent.alloc);
-            incumbent_proj  = best_cell.proj;
+            LOG_WRN("%s: the incumbent does not fit on its final re-probe; it was accepted on an earlier probe and is kept\n", __func__);
         }
     }
 

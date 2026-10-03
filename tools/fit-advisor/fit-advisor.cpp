@@ -593,6 +593,7 @@ int llama_fit_advisor(int argc, char ** argv) {
     }
 
     // the built-in fitter's answer for the same arguments, for comparison
+    std::vector<uint32_t> fitter_partition;
     {
         fit_advisor_candidate fit;
         const common_params_fit_status status = probe.fitter_choice(fit);
@@ -611,8 +612,10 @@ int llama_fit_advisor(int argc, char ** argv) {
         }
         cands.insert(cands.begin() + 1, fit);
         if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS && fit.n_gpu_layers >= 0) {
-            // the fitter's placement priced beside the references, so its prediction can be read against a real run
+            // the fitter's placement priced beside the references, so its prediction can be read against a real run,
+            // and its layer split seeds the search: it fills the fast card first, which the proportional seeds do not
             allocs.push_back({ "fit", allocation_from_candidate(inv, device_bufts, fit, (uint32_t) std::max(1, params.n_parallel)) });
+            fitter_partition = allocs.back().alloc.layers_per_device;
         }
     }
 
@@ -835,6 +838,9 @@ int llama_fit_advisor(int argc, char ** argv) {
     // ---- the search, then an optional real load to measure what the projection missed and search again with that margin
     fit_advisor_search_options sopts;
     sopts.n_ctx        = params.n_ctx;
+    if (!fitter_partition.empty()) {
+        sopts.extra_partitions.push_back(fitter_partition);
+    }
     if (params.n_ctx == 0) {
         // no context given: the model's default is its training context, which for large models fits nowhere. like
         // the fitter, halve from there until the experts-on-CPU (or all-on-device) reference fits, then say so
