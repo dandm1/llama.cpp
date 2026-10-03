@@ -264,6 +264,19 @@ bool fit_advisor_tensor_cost_known(const fit_advisor_inventory & inv, const fit_
     return dev.meas->op_overhead_us > 0 && device_bandwidth(dev) > 0;
 }
 
+// the op profile for a tensor at a batch: the generation graph up to 4 rows, the prompt graph above. the prompt graph was
+// recorded at n_batch_pp tokens and its activation bytes are linear in tokens, so a smaller batch gets its share
+static fit_advisor_tensor_use use_at(const fit_advisor_graph_profile & gp, size_t tensor_idx, uint32_t batch) {
+    if (batch <= 4) {
+        return tensor_idx < gp.use_tg.size() ? gp.use_tg[tensor_idx] : fit_advisor_tensor_use{};
+    }
+    fit_advisor_tensor_use u = tensor_idx < gp.use_pp.size() ? gp.use_pp[tensor_idx] : fit_advisor_tensor_use{};
+    if (gp.n_batch_pp > 0 && batch < gp.n_batch_pp) {
+        u.act_bytes = (size_t) ((double) u.act_bytes * batch / gp.n_batch_pp);
+    }
+    return u;
+}
+
 double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fit_advisor_graph_profile & gp, size_t tensor_idx, int dev_idx,
                                      const std::vector<fit_advisor_cost_device> & devices, const fit_advisor_workload & wl, uint32_t n_slots, int home_idx) {
     const uint32_t batch_gen = std::max<uint32_t>(1, std::min(wl.concurrency, n_slots));
@@ -283,8 +296,7 @@ double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fi
     const uint32_t depth = wl.use_mtp ? wl.mtp_draft_n_default() : 0;
     const double n_steps = wl.gen_tokens / wl.tokens_per_step(depth);
     const uint32_t batch_step = is_mtp ? batch_gen : batch_gen * (1 + depth);
-    const fit_advisor_tensor_use & u_gen = batch_step > 4
-        ? u_pp : (tensor_idx < gp.use_tg.size() ? gp.use_tg[tensor_idx] : fit_advisor_tensor_use{});
+    const fit_advisor_tensor_use u_gen = use_at(gp, tensor_idx, batch_step);
     const double runs_per_step = is_mtp ? (double) depth : 1.0;
     return n_steps * runs_per_step * fit_advisor_tensor_cost_us(inv, t, u_gen, dev_idx, devices, batch_step, home_idx, &wl) + pp_us;
 }
@@ -318,7 +330,10 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
     };
     auto step_us = [&](uint32_t batch, int sel, double & weights, double & attn, double & overhead, double & boundary) {
         weights = attn = overhead = boundary = 0;
-        const std::vector<fit_advisor_tensor_use> & uses = batch > 4 ? gp.use_pp : gp.use_tg;
+        std::vector<fit_advisor_tensor_use> uses(inv.tensors.size());
+        for (size_t i = 0; i < inv.tensors.size(); i++) {
+            uses[i] = use_at(gp, i, batch);
+        }
         for (size_t i = 0; i < inv.tensors.size(); i++) {
             const auto & t = inv.tensors[i];
             if (t.layer >= 0 ? !layer_selected(t.layer, sel) : sel == SEL_MTP) {
@@ -327,7 +342,7 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             if (t.kind == FIT_ADVISOR_TENSOR_TOKEN_EMBD) {
                 continue; // a row lookup, not a matmul
             }
-            const fit_advisor_tensor_use use = i < uses.size() ? uses[i] : fit_advisor_tensor_use{};
+            const fit_advisor_tensor_use & use = uses[i];
             const int home = t.layer >= 0 ? alloc.layer_device((uint32_t) t.layer, n_layer_all) : alloc.layer_device(n_layer_all, n_layer_all);
             weights += tensor_us(inv, t, use, alloc.tensor_device[i], devices, batch, c.error, home, &wl);
         }
