@@ -49,22 +49,16 @@ struct fit_advisor_workload {
                                          // draft layer on a device not in the list below
     // the same per device the draft layer was validated on (index into the allocation's devices, the CPU last): on a
     // 3090 with a 3060 the overhead was 3.7 ms on the fast card and 9.5 ms on the slow one, for the same kernels.
-    // a device without a measurement is priced at the smallest measured overhead, or a few ms when nothing was
-    // measured yet, so the search tries the move and the next validation round prices it
+    // a device without a measurement is priced at the last measured overhead. pricing it optimistically so the search
+    // would try the move was tried and sent the walk chasing a move it cannot complete in single steps (the draft
+    // layer and the head need room the fast card only has once a trunk layer leaves); that needs an exchange move
     std::vector<double> mtp_draft_extra_by_dev_us;
-    static constexpr double mtp_draft_extra_unknown_us = 3000.0;
     double mtp_draft_extra_for(int dev, size_t n_devices) const {
         const size_t i = dev < 0 ? n_devices : (size_t) dev;
         if (i < mtp_draft_extra_by_dev_us.size() && mtp_draft_extra_by_dev_us[i] >= 0) {
             return mtp_draft_extra_by_dev_us[i];
         }
-        double best = -1;
-        for (const double x : mtp_draft_extra_by_dev_us) {
-            if (x >= 0 && (best < 0 || x < best)) {
-                best = x;
-            }
-        }
-        return best >= 0 ? std::min(best, mtp_draft_extra_unknown_us) : (mtp_draft_extra_us > 0 ? mtp_draft_extra_us : mtp_draft_extra_unknown_us);
+        return mtp_draft_extra_us;
     }
     double   mtp_rollback_us = 0;        // removing a rejected tail from the memory, paid by every step that rejects a
                                          // draft token (validation; a recurrent model restores a state snapshot)
