@@ -46,6 +46,9 @@ struct fit_advisor_workload {
                                          // the kernels the model prices: launches, synchronisation, host work (validation)
     double   mtp_rollback_us = 0;        // removing a rejected tail from the memory, paid by every step that rejects a
                                          // draft token (validation; a recurrent model restores a state snapshot)
+    double   excursion_extra_us = 0;     // per excursion of a layer's op to another device: what a timed plain step cost
+                                         // beyond the kernels and transfers the model prices (validation). an op whose
+                                         // weight sits away from its layer's device pays this on top of the link time
     std::vector<double> mtp_extra_by_depth_us; // [depth] -> the extra for that depth where it was timed, in place of
                                                // depth * mtp_extra_per_depth_us (the growth is not linear in the rows:
                                                // CPU kernels take an odd row count on a slower path)
@@ -87,6 +90,7 @@ struct fit_advisor_cost {
     double step_attn_us     = 0;
     double step_overhead_us = 0;
     double step_boundary_us = 0;
+    uint32_t n_excursions   = 0; // ops away from their layer's device in the generation step, grouped as the scheduler splits them
 
     // drafting: one run of the MTP layer(s) at the generation batch, the depth the scan chose (0: drafting does not
     // pay on this allocation), the tokens a step yields per slot at that depth, and the rate at every depth tried

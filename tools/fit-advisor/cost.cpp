@@ -328,8 +328,10 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
         }
         return sel == SEL_ALL || (sel == SEL_MTP) == is_mtp;
     };
+    uint32_t n_excursions_last = 0; // of the last step_us call
     auto step_us = [&](uint32_t batch, int sel, double & weights, double & attn, double & overhead, double & boundary) {
         weights = attn = overhead = boundary = 0;
+        n_excursions_last = 0;
         std::vector<fit_advisor_tensor_use> uses(inv.tensors.size());
         for (size_t i = 0; i < inv.tensors.size(); i++) {
             uses[i] = use_at(gp, i, batch);
@@ -469,7 +471,8 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
                 j++;
             }
             // hop_us prices the round trip with the standard activation; add the op's own activation bytes over the link
-            boundary += hop_us(aways[k].home, aways[k].dev) + hop_us(aways[k].dev, aways[k].home);
+            boundary += hop_us(aways[k].home, aways[k].dev) + hop_us(aways[k].dev, aways[k].home) + wl.excursion_extra_us;
+            n_excursions_last++;
             const size_t a = aways[k].home < 0 ? devices.size() - 1 : (size_t) aways[k].home;
             const size_t b = aways[k].dev  < 0 ? devices.size() - 1 : (size_t) aways[k].dev;
             if (a < pairs.size() && b < pairs[a].size() && pairs[a][b].gb_s > 0) {
@@ -508,6 +511,9 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             const double rate   = t_step > 0 ? batch_gen * wl.tokens_per_step(depth) * 1e6 / t_step : 0;
             c.mtp_depth_tok_s.push_back(rate);
             c.mtp_depth_step_us.push_back(t_step);
+            if (depth == 0) {
+                c.n_excursions = n_excursions_last;
+            }
             // the rate over the depth is unimodal when the rows are priced from the kernel curves; where a validation
             // timed the depths it need not be (CPU kernels dip at odd row counts), so every timed depth is looked at
             const bool timed = depth + 1 < wl.mtp_extra_by_depth_us.size();
@@ -529,6 +535,7 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
     } else {
         step_us(batch_gen, SEL_ALL, c.step_weights_us, c.step_attn_us, c.step_overhead_us, c.step_boundary_us);
         c.t_gen_step_us = c.step_weights_us + c.step_attn_us + c.step_overhead_us + c.step_boundary_us;
+        c.n_excursions  = n_excursions_last;
     }
 
     // prompt: ubatches of wl.n_ubatch tokens, attention grows with the prefix, approximated at half fill

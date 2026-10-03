@@ -49,6 +49,42 @@ struct named_allocation {
     fit_advisor_allocation alloc;
 };
 
+// the allocation a whole-layer candidate (-ngl, -ts) describes, as the loader would place it: a leading block on the
+// CPU, then one block per device in the proportion of the split. the fitter's choice is such a candidate
+static fit_advisor_allocation allocation_from_candidate(const fit_advisor_inventory & inv, const std::vector<std::string> & device_bufts,
+                                                        const fit_advisor_candidate & cand, uint32_t n_slots) {
+    const uint32_t n_layer_all = inv.n_layer + inv.n_layer_nextn;
+    const uint32_t ngl_max     = n_layer_all + 1;
+    const size_t   nd          = device_bufts.size();
+    const uint32_t ngl         = cand.n_gpu_layers < 0 ? ngl_max : std::min<uint32_t>(ngl_max, (uint32_t) cand.n_gpu_layers);
+    std::vector<float> w(nd, 1.0f);
+    for (size_t d = 0; d < nd && d < cand.tensor_split.size(); d++) {
+        w[d] = cand.tensor_split[d];
+    }
+    float sum = 0;
+    for (float x : w) { sum += x; }
+    std::vector<uint32_t> per(nd, 0);
+    uint32_t assigned = 0;
+    for (size_t d = 0; d < nd; d++) {
+        per[d] = sum > 0 ? (uint32_t) std::lround(ngl * w[d] / sum) : 0;
+        assigned += per[d];
+    }
+    if (nd > 0) {
+        per[nd - 1] += ngl - std::min(ngl, assigned);
+        if (assigned > ngl) {
+            per[nd - 1] -= std::min(per[nd - 1], assigned - ngl);
+        }
+    }
+    fit_advisor_allocation a = fit_advisor_allocation::from_layer_split(inv, device_bufts, per, cand.n_ctx, n_slots);
+    a.n_ubatch      = cand.n_ubatch;
+    a.draft_mtp     = cand.spec_mtp;
+    a.mtp_draft_n   = cand.spec_draft_n;
+    a.flash_attn    = cand.flash_attn;
+    a.no_kv_offload = cand.no_kv_offload;
+    a.op_offload_min_batch_dev = cand.op_offload_min_batch_dev;
+    return a;
+}
+
 static std::vector<named_allocation> build_allocations(const common_params & params, const fit_advisor_inventory & inv,
                                                        const std::vector<std::string> & device_bufts, const fit_advisor_candidate & user) {
     std::vector<named_allocation> ret;
@@ -551,7 +587,7 @@ int llama_fit_advisor(int argc, char ** argv) {
     std::vector<fit_advisor_candidate> cands = { user_candidate(params) };
     const std::vector<std::string> device_bufts = fit_advisor_device_bufts(probe.run(cands[0]));
     const std::vector<std::string> device_names = fit_advisor_device_names(probe.run(cands[0]));
-    const std::vector<named_allocation> allocs = build_allocations(params, inv, device_bufts, cands[0]);
+    std::vector<named_allocation> allocs = build_allocations(params, inv, device_bufts, cands[0]);
     for (const auto & na : allocs) {
         cands.push_back(na.alloc.to_candidate(inv, device_bufts, na.name));
     }
@@ -574,6 +610,10 @@ int llama_fit_advisor(int argc, char ** argv) {
                 break;
         }
         cands.insert(cands.begin() + 1, fit);
+        if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS && fit.n_gpu_layers >= 0) {
+            // the fitter's placement priced beside the references, so its prediction can be read against a real run
+            allocs.push_back({ "fit", allocation_from_candidate(inv, device_bufts, fit, (uint32_t) std::max(1, params.n_parallel)) });
+        }
     }
 
     LOG_INF("%s: probing %zu candidates ...\n", __func__, cands.size());
@@ -856,6 +896,24 @@ int llama_fit_advisor(int argc, char ** argv) {
                 changed = true;
             }
         }
+        if (vr.ok && vr.t_step_plain_us > 0) {
+            // the plain step was timed; what it costs beyond the model is attributed to the ops that run away from
+            // their layer's device, each of which is a scheduler split the kernel curves and link rates do not see
+            const double plain_model = sr.cost.mtp_depth_step_us.empty() ? sr.cost.t_gen_step_us : sr.cost.mtp_depth_step_us[0];
+            const double residual    = vr.t_step_plain_us - plain_model;
+            if (sr.cost.n_excursions > 0) {
+                const double extra = std::max(0.0, wl.excursion_extra_us + residual / sr.cost.n_excursions);
+                LOG_INF("%s: plain step %.1f ms measured vs %.1f modelled with %u excursions: extra per excursion %.0f us (was %.0f)\n",
+                    __func__, vr.t_step_plain_us * 1e-3, plain_model * 1e-3, sr.cost.n_excursions, extra, wl.excursion_extra_us);
+                if (std::fabs(extra - wl.excursion_extra_us) * sr.cost.n_excursions > 0.02 * vr.t_step_plain_us) {
+                    wl.excursion_extra_us = extra;
+                    changed = true;
+                }
+            } else {
+                LOG_INF("%s: plain step %.1f ms measured vs %.1f modelled, no excursions to attribute the difference to\n",
+                    __func__, vr.t_step_plain_us * 1e-3, plain_model * 1e-3);
+            }
+        }
         if (vr.ok && vr.t_draft_us > 0 && sr.cost.mtp_depth_step_us.size() > 1) {
             // drafting was priced from kernels; the validation timed real steps. the extra per draft position is the
             // measured growth of the step over the plain step, less what the model already prices for that depth
@@ -931,7 +989,7 @@ int llama_fit_advisor(int argc, char ** argv) {
         }
         {
             if (changed) {
-                LOG_INF("%s: searching again with the validated margins, coverage and drafting cost ...\n", __func__);
+                LOG_INF("%s: searching again with the validated margins, coverage, excursion and drafting costs ...\n", __func__);
                 fit_advisor_search_result sr2 = search_and_report(params, inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts);
                 if (sr2.ok) {
                     fit_advisor_validate_result vr2 = fit_advisor_validate(params, sr2.cand, sr2.proj, n_tokens);

@@ -268,10 +268,11 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
     // drafting: time what the cost model prices from kernels alone. a verification step of 1 + d rows and a decode of
     // the draft context each carry launch, synchronisation and host work the model cannot see, so they are measured
     // here, at steady state, and the search is told the difference. the KV is rolled back after every step
-    if (ctx_mtp && decode_ok) {
+    if (decode_ok) {
         llama_memory_t mem = llama_get_memory(ctx);
         // every timed step continues its slot's sequence; nothing is rolled back between steps, the rollback is timed
-        // on its own below. the extra positions are a few hundred at most, nothing against the prompt
+        // on its own below. the extra positions are a few hundred at most, nothing against the prompt. without a draft
+        // context only the plain step is timed: its difference to the model is what the excursions cost
         std::vector<llama_pos> pos_next(n_slots);
         for (uint32_t s = 0; s < n_slots; s++) {
             pos_next[s] = s == 0 ? (llama_pos) (n_prompt_tokens + vr.n_gen_steps) : (llama_pos) vr.n_gen_steps;
@@ -300,7 +301,7 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
             return ts[ts.size() / 2];
         };
         constexpr int reps = 5;
-        uint32_t d_max = std::min<uint32_t>(8, std::max<uint32_t>(1, n_batch / n_slots) - 1);
+        uint32_t d_max = ctx_mtp ? std::min<uint32_t>(8, std::max<uint32_t>(1, n_batch / n_slots) - 1) : 0;
         uint32_t token_seed = 3000;
         // a step of 1 + d rows on every slot, at the slots' next positions
         auto step_rows = [&](uint32_t d) -> double {
@@ -335,7 +336,7 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
                 vr.t_verify_us[d] = t_med;
             }
         }
-        if (decode_ok) {
+        if (decode_ok && ctx_mtp) {
             // the rollback after a verification: the rejected tail leaves the memory. a recurrent model can only go back
             // as far as it keeps snapshots (one per draft position, as the server configures it)
             const uint32_t n_rs = llama_n_rs_seq(ctx);
@@ -363,7 +364,7 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
             }
             vr.t_rollback_us = median_after_warmup(ts);
         }
-        if (decode_ok) {
+        if (decode_ok && ctx_mtp) {
             // the draft context takes the token and the trunk's hidden row for it; the values do not matter to the kernels
             const int32_t n_embd = llama_model_n_embd(model);
             llama_batch bd = llama_batch_init((int32_t) n_slots, n_embd, (int32_t) n_slots);
@@ -385,12 +386,16 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
             bd.token = nullptr;
             llama_batch_free(bd);
         }
-        std::string by_depth;
-        for (uint32_t d = 1; d <= d_max; d++) {
-            by_depth += string_format(" d=%u %.0f", d, vr.t_verify_us[d]);
+        if (ctx_mtp) {
+            std::string by_depth;
+            for (uint32_t d = 1; d <= d_max; d++) {
+                by_depth += string_format(" d=%u %.0f", d, vr.t_verify_us[d]);
+            }
+            LOG_INF("%s: timed drafting: plain step %.0f us, draft decode %.0f us, rollback %.0f us, verification of 1+d rows:%s us\n", __func__,
+                vr.t_step_plain_us, vr.t_draft_us, vr.t_rollback_us, by_depth.c_str());
+        } else {
+            LOG_INF("%s: timed the plain generation step: %.0f us\n", __func__, vr.t_step_plain_us);
         }
-        LOG_INF("%s: timed drafting: plain step %.0f us, draft decode %.0f us, rollback %.0f us, verification of 1+d rows:%s us\n", __func__,
-            vr.t_step_plain_us, vr.t_draft_us, vr.t_rollback_us, by_depth.c_str());
     }
     vr.t_run_s = (ggml_time_us() - t1) * 1e-6;
     if (probe.n_samples > 0) {
@@ -445,6 +450,9 @@ void fit_advisor_validate_print(const fit_advisor_validate_result & vr) {
     }
     printf("\nvalidation by a real load: %u prompt tokens + %u generation steps, load %.1f s, run %.1f s\n",
         vr.n_prompt_tokens, vr.n_gen_steps, vr.t_load_s, vr.t_run_s);
+    if (vr.t_step_plain_us > 0 && vr.t_draft_us <= 0) {
+        printf("plain generation step timed: %.1f ms\n", vr.t_step_plain_us * 1e-3);
+    }
     if (vr.t_draft_us > 0) {
         printf("drafting timed: plain step %.1f ms, draft decode %.2f ms per token, rollback %.2f ms, verification step by draft depth:",
             vr.t_step_plain_us * 1e-3, vr.t_draft_us * 1e-3, vr.t_rollback_us * 1e-3);
