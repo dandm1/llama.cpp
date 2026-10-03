@@ -100,8 +100,9 @@ double fit_advisor_workload::mtp_accept_at(uint32_t k) const {
     double p = std::min(1.0, std::max(0.0, mtp_accept));
     if (k > mtp_trained_depth) {
         // the layer was trained to predict mtp_trained_depth positions from the trunk's state; beyond that it is fed
-        // its own guesses, and the error compounds once per further position
-        p *= std::pow(std::min(1.0, std::max(0.0, mtp_decay)), (double) (k - mtp_trained_depth));
+        // its own guesses. measured on Qwen3.5-27B the conditional acceptance steps down once at that point and then
+        // stays flat (prose ~0.76 then ~0.65 at every further position), so the factor is applied once, not compounded
+        p *= std::min(1.0, std::max(0.0, mtp_decay));
     }
     return p;
 }
@@ -507,7 +508,7 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             }
             const double extra = depth > 0 && depth < wl.mtp_extra_by_depth_us.size() && wl.mtp_extra_by_depth_us[depth] != 0
                 ? wl.mtp_extra_by_depth_us[depth] : depth * wl.mtp_extra_per_depth_us;
-            const double t_step = std::max(1.0, sw + sa + so + sb + depth * c.t_mtp_draft_us * wl.mtp_draft_scale + extra
+            const double t_step = std::max(1.0, sw + sa + so + sb + depth * (c.t_mtp_draft_us + wl.mtp_draft_extra_us) + extra
                                 + (depth > 0 ? (1.0 - p_all) * wl.mtp_rollback_us : 0.0));
             const double rate   = t_step > 0 ? batch_gen * wl.tokens_per_step(depth) * 1e6 / t_step : 0;
             c.mtp_depth_tok_s.push_back(rate);

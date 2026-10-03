@@ -912,7 +912,9 @@ int llama_fit_advisor(int argc, char ** argv) {
                 // their layer's device, each of which is a scheduler split the kernel curves and link rates do not see
                 const double plain_model = sr.cost.mtp_depth_step_us.empty() ? sr.cost.t_gen_step_us : sr.cost.mtp_depth_step_us[0];
                 const double residual    = vr.t_step_plain_us - plain_model;
-                if (sr.cost.n_splits > 0) {
+                if (sr.cost.n_splits >= 4) {
+                    // a plan with a handful of splits measures their cost; one with a single crossing only measures noise
+                    // and must not overwrite what a split-heavy plan taught
                     const double extra = std::max(0.0, wl.split_extra_us + residual / sr.cost.n_splits);
                     LOG_INF("%s: plain step %.1f ms measured vs %.1f modelled with %u splits (boundary crossings and excursions): extra per split %.0f us (was %.0f)\n",
                         __func__, vr.t_step_plain_us * 1e-3, plain_model * 1e-3, sr.cost.n_splits, extra, wl.split_extra_us);
@@ -921,15 +923,15 @@ int llama_fit_advisor(int argc, char ** argv) {
                         changed = true;
                     }
                 } else {
-                    LOG_INF("%s: plain step %.1f ms measured vs %.1f modelled, no splits to attribute the difference to\n",
-                        __func__, vr.t_step_plain_us * 1e-3, plain_model * 1e-3);
+                    LOG_INF("%s: plain step %.1f ms measured vs %.1f modelled with %u splits, too few to price a split from\n",
+                        __func__, vr.t_step_plain_us * 1e-3, plain_model * 1e-3, sr.cost.n_splits);
                 }
             }
             if (vr.ok && vr.t_draft_us > 0 && sr.cost.mtp_depth_rows_us.size() > 1 && sr.cost.t_mtp_draft_us > 0) {
                 // drafting was priced from kernels; the validation timed real steps. the draft decode is corrected by a
                 // factor over its kernel price, which carries over to the draft layer on another device; the verification
                 // rows by the measured growth over the plain step at every timed depth, since CPU kernels dip at odd rows
-                const double scale = vr.t_draft_us / sr.cost.t_mtp_draft_us;
+                const double draft_extra = std::max(0.0, vr.t_draft_us - sr.cost.t_mtp_draft_us);
                 const double rows0 = sr.cost.mtp_depth_rows_us[0];
                 std::vector<double> by_depth(vr.t_verify_us.size(), 0.0);
                 std::string table;
@@ -956,17 +958,17 @@ int llama_fit_advisor(int argc, char ** argv) {
                 }
                 if (extra_n > 0) {
                     const double extra = extra_sum / extra_n;
-                    LOG_INF("%s: drafting timed: draft decode %.2f ms vs %.2f modelled (factor %.2f, was %.2f); verification rows growth "
+                    LOG_INF("%s: drafting timed: draft decode %.2f ms vs %.2f modelled kernels, extra %.2f ms (was %.2f); verification rows growth "
                             "measured/modelled ms:%s; rollback %.2f ms\n", __func__, vr.t_draft_us * 1e-3, sr.cost.t_mtp_draft_us * 1e-3,
-                            scale, wl.mtp_draft_scale, table.c_str(), vr.t_rollback_us * 1e-3);
-                    bool differs = std::fabs(scale - wl.mtp_draft_scale) > 0.1 * wl.mtp_draft_scale ||
+                            draft_extra * 1e-3, wl.mtp_draft_extra_us * 1e-3, table.c_str(), vr.t_rollback_us * 1e-3);
+                    bool differs = std::fabs(draft_extra - wl.mtp_draft_extra_us) > 0.02 * vr.t_step_plain_us ||
                                    std::fabs(vr.t_rollback_us - wl.mtp_rollback_us) > 0.02 * vr.t_step_plain_us;
                     for (size_t d = 1; d < by_depth.size(); d++) {
                         const double prev = d < wl.mtp_extra_by_depth_us.size() ? wl.mtp_extra_by_depth_us[d] : 0.0;
                         differs = differs || std::fabs(by_depth[d] - prev) > 0.02 * vr.t_step_plain_us;
                     }
                     if (differs) {
-                        wl.mtp_draft_scale        = scale;
+                        wl.mtp_draft_extra_us     = draft_extra;
                         wl.mtp_extra_by_depth_us  = by_depth;
                         wl.mtp_extra_per_depth_us = std::max(0.0, extra);
                         wl.mtp_rollback_us        = vr.t_rollback_us;
@@ -991,7 +993,12 @@ int llama_fit_advisor(int argc, char ** argv) {
                 break;
             }
             LOG_INF("%s: searching again with the validated margins, coverage, split and drafting costs (round %d) ...\n", __func__, round);
-            fit_advisor_search_result sr2 = search_and_report(params, inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts);
+            // the costs changed, the starting point is known good: walk on from the validated allocation with fewer moves
+            fit_advisor_search_options sopts_again = sopts;
+            sopts_again.warm_start     = sr.alloc;
+            sopts_again.has_warm_start = true;
+            sopts_again.anneal_iters   = std::max(1000, sopts.anneal_iters / 4);
+            fit_advisor_search_result sr2 = search_and_report(params, inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts_again);
             if (!sr2.ok) {
                 LOG_WRN("%s: no feasible allocation with the validated costs, keeping the previous one\n", __func__);
                 break;

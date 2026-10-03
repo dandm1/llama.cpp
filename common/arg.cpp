@@ -3012,7 +3012,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
     add_opt(common_arg(
         {"--mtp-decay"}, "D",
-        string_format("factor the acceptance probability decays by for every draft position beyond the trained MTP depth: "
+        string_format("factor on the acceptance probability for every draft position beyond the trained MTP depth, applied once: "
                       "a single MTP layer drafts deeper positions from its own guesses (default: %.2f)", params.fit_advisor_mtp_decay),
         [](common_params & params, const std::string & value) {
             params.fit_advisor_mtp_decay = std::stod(value);

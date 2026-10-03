@@ -569,7 +569,30 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     searcher::cell best_cell;
     std::vector<uint32_t> best_part;
     uint32_t best_ub = 0;
+    if (opts.has_warm_start) {
+        // the previous result as the only seed: probed and priced under the current costs
+        searcher::cell r;
+        r.alloc = opts.warm_start;
+        r.proj  = S.probe_alloc(r.alloc, alloc_name(r.alloc));
+        r.fits  = r.proj.ok && r.proj.fits_all();
+        if (r.proj.ok) {
+            r.cost = fit_advisor_cost_estimate(inv, r.alloc, r.proj, gp, cost_devs, pairs, S.workload(r.alloc));
+        }
+        if (r.fits && r.cost.ok) {
+            LOG_INF("%s: warm start from %s: gen %6.2f tok/s, pp %6.0f tok/s, request %7.2f s\n", __func__, alloc_name(r.alloc).c_str(),
+                r.cost.gen_tokens_per_s, r.cost.prompt_tokens_per_s, r.cost.t_request_us * 1e-6);
+            best_cell = r;
+            best_part = r.alloc.layers_per_device;
+            best_ub   = r.alloc.n_ubatch;
+            best.n_cells++;
+        } else {
+            LOG_WRN("%s: the warm start does not fit under the current costs, seeding from the grid\n", __func__);
+        }
+    }
     for (const auto & part : partitions) {
+        if (best_cell.fits && opts.has_warm_start) {
+            break;
+        }
         for (const uint32_t ub : opts.ubatch_options) {
             for (const uint32_t slots : slot_options) {
                 const std::string name = cell_name(part, ub, slots);
@@ -951,7 +974,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             }
         }
         // verify the best state with the real loader at most every 200 iterations, or when the walk is nearly done
-        if (best_seen_dirty && (it - last_probe_iter >= 200 || it == iters - 1)) {
+        if (best_seen_dirty && (it - last_probe_iter >= 500 || it == iters - 1)) {
             const std::string bkey = alloc_key(best_seen.alloc);
             const fit_advisor_projection & pj = S.probe_alloc(best_seen.alloc, alloc_name(best_seen.alloc));
             last_probe_iter = it;

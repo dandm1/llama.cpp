@@ -41,12 +41,12 @@ struct fit_advisor_workload {
     uint32_t mtp_trained_depth = 1; // MTP layers in the model: positions up to this depth are drafted as trained
     double   mtp_accept    = 0.8;   // probability that one drafted token is accepted, a heuristic like the token counts
     double   mtp_decay     = 0.85;  // beyond the trained depth a single layer drafts from its own guesses: the acceptance
-                                    // of each further position is multiplied by this factor once more
+                                    // of every further position is the base one times this factor (a step, not compounded)
     double   mtp_extra_per_depth_us = 0; // per draft position, what a timed verification row costs beyond the kernels
                                          // the model prices (validation), where no per-depth figure exists
-    double   mtp_draft_scale = 1.0;      // a timed draft decode over the kernels the model prices for it: the decode's
-                                         // launches, synchronisation and host work scale with the device like the kernels
-                                         // do, so the factor carries over to a draft layer on another device (validation)
+    double   mtp_draft_extra_us = 0;     // a timed draft decode beyond the kernels the model prices for it: the decode's
+                                         // launches, synchronisation, embedding and logits transfers (validation). on one
+                                         // machine it hardly moves with the draft layer's placement, so it is additive
     double   mtp_rollback_us = 0;        // removing a rejected tail from the memory, paid by every step that rejects a
                                          // draft token (validation; a recurrent model restores a state snapshot)
     double   split_extra_us = 0;         // per scheduler split in the generation step, a device change along the layer

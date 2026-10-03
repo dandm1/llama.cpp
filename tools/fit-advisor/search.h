@@ -24,6 +24,10 @@ struct fit_advisor_search_options {
     std::vector<int32_t> offload_options = { 0, 16, 64, 128, FIT_ADVISOR_OFFLOAD_NEVER };
     uint32_t n_ctx      = 0;     // 0 = model default
     std::vector<std::vector<uint32_t>> extra_partitions; // layers per device to seed from besides the generated ones (the fitter's split)
+    // warm start: the walk begins from this allocation instead of the seed grid (a re-search after validation, where
+    // the costs changed but the starting point is known good); empty = the seed grid
+    fit_advisor_allocation warm_start;
+    bool has_warm_start = false;
     uint32_t max_slots  = 1;     // from the workload's concurrency
     int      anneal_iters = 20000;
     uint32_t seed       = 42;

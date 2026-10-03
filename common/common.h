@@ -490,7 +490,7 @@ struct common_params {
     bool    fit_advisor_pin_cpu_weights = false; // llama-fit-advisor: place CPU-resident weights in the pinned host buffer type
     bool    fit_advisor_mtp        = true;     // llama-fit-advisor: MTP drafting may be chosen when the model has MTP layers (--no-mtp)
     double  fit_advisor_mtp_accept = 0.75;     // llama-fit-advisor: assumed acceptance probability per drafted MTP token (GLM-5.3 measured ~0.72)
-    double  fit_advisor_mtp_decay  = 0.85;     // llama-fit-advisor: the acceptance decays by this factor per draft position beyond the trained depth
+    double  fit_advisor_mtp_decay  = 0.85;     // llama-fit-advisor: acceptance beyond the trained MTP depth is the base one times this factor
     bool    fit_advisor_validate = false;      // llama-fit-advisor: load the chosen allocation for real and measure what the projection missed
     int32_t fit_advisor_validate_tokens = 0;   // llama-fit-advisor: prompt tokens for the validation run, 0 = two ubatches
     std::string fit_advisor_validate_prompt;   // llama-fit-advisor: text file the validation prompt is built from, default: a built-in paragraph
