@@ -892,117 +892,122 @@ int llama_fit_advisor(int argc, char ** argv) {
         const uint32_t n_tokens = (uint32_t) std::max(0, params.fit_advisor_validate_tokens);
         fit_advisor_validate_result vr = fit_advisor_validate(params, sr.cand, sr.proj, n_tokens);
         fit_advisor_validate_print(vr);
-        bool changed = false;
-        if (vr.ok && vr.coverage_samples > 0 && params.fit_advisor_expert_coverage <= 0) {
-            // the copies were priced on an assumed share; the validation measured it on real text
-            const double assumed = wl.expert_coverage > 0 ? wl.expert_coverage : 0.6;
-            LOG_INF("%s: expert coverage measured at %.2f (assumed %.2f)\n", __func__, vr.expert_coverage, assumed);
-            if (std::fabs(vr.expert_coverage - assumed) > 0.1) {
-                wl.expert_coverage = vr.expert_coverage;
-                changed = true;
-            }
-        }
-        if (vr.ok && vr.t_step_plain_us > 0) {
-            // the plain step was timed; what it costs beyond the model is attributed to the ops that run away from
-            // their layer's device, each of which is a scheduler split the kernel curves and link rates do not see
-            const double plain_model = sr.cost.mtp_depth_step_us.empty() ? sr.cost.t_gen_step_us : sr.cost.mtp_depth_step_us[0];
-            const double residual    = vr.t_step_plain_us - plain_model;
-            if (sr.cost.n_excursions > 0) {
-                const double extra = std::max(0.0, wl.excursion_extra_us + residual / sr.cost.n_excursions);
-                LOG_INF("%s: plain step %.1f ms measured vs %.1f modelled with %u excursions: extra per excursion %.0f us (was %.0f)\n",
-                    __func__, vr.t_step_plain_us * 1e-3, plain_model * 1e-3, sr.cost.n_excursions, extra, wl.excursion_extra_us);
-                if (std::fabs(extra - wl.excursion_extra_us) * sr.cost.n_excursions > 0.02 * vr.t_step_plain_us) {
-                    wl.excursion_extra_us = extra;
-                    changed = true;
-                }
-            } else {
-                LOG_INF("%s: plain step %.1f ms measured vs %.1f modelled, no excursions to attribute the difference to\n",
-                    __func__, vr.t_step_plain_us * 1e-3, plain_model * 1e-3);
-            }
-        }
-        if (vr.ok && vr.t_draft_us > 0 && sr.cost.mtp_depth_rows_us.size() > 1 && sr.cost.t_mtp_draft_us > 0) {
-            // drafting was priced from kernels; the validation timed real steps. the draft decode is corrected by a
-            // factor over its kernel price, which carries over to the draft layer on another device; the verification
-            // rows by the measured growth over the plain step at every timed depth, since CPU kernels dip at odd rows
-            const double scale = vr.t_draft_us / sr.cost.t_mtp_draft_us;
-            const double rows0 = sr.cost.mtp_depth_rows_us[0];
-            std::vector<double> by_depth(vr.t_verify_us.size(), 0.0);
-            std::string table;
-            double extra_sum = 0;
-            int    extra_n   = 0;
-            for (size_t d = 1; d < vr.t_verify_us.size(); d++) {
-                if (vr.t_verify_us[d] <= 0) {
-                    continue;
-                }
-                double rows_model;
-                if (d < sr.cost.mtp_depth_rows_us.size()) {
-                    rows_model = sr.cost.mtp_depth_rows_us[d];
-                } else {
-                    // beyond the scan: the kernels' growth is near linear in the rows, extrapolate the last two depths
-                    const size_t n = sr.cost.mtp_depth_rows_us.size();
-                    rows_model = sr.cost.mtp_depth_rows_us[n - 1] + (d - (n - 1)) * (sr.cost.mtp_depth_rows_us[n - 1] - sr.cost.mtp_depth_rows_us[n - 2]);
-                }
-                const double measured = vr.t_verify_us[d] - vr.t_step_plain_us;
-                const double modelled = rows_model - rows0;
-                by_depth[d] = measured - modelled;
-                extra_sum += by_depth[d] / d;
-                extra_n++;
-                table += string_format(" d=%zu %.1f/%.1f", d, measured * 1e-3, modelled * 1e-3);
-            }
-            if (extra_n > 0) {
-                const double extra = extra_sum / extra_n;
-                LOG_INF("%s: drafting timed: draft decode %.2f ms vs %.2f modelled (factor %.2f, was %.2f); verification rows growth "
-                        "measured/modelled ms:%s; rollback %.2f ms\n", __func__, vr.t_draft_us * 1e-3, sr.cost.t_mtp_draft_us * 1e-3,
-                        scale, wl.mtp_draft_scale, table.c_str(), vr.t_rollback_us * 1e-3);
-                bool differs = std::fabs(scale - wl.mtp_draft_scale) > 0.1 * wl.mtp_draft_scale ||
-                               std::fabs(vr.t_rollback_us - wl.mtp_rollback_us) > 0.02 * vr.t_step_plain_us;
-                for (size_t d = 1; d < by_depth.size(); d++) {
-                    const double prev = d < wl.mtp_extra_by_depth_us.size() ? wl.mtp_extra_by_depth_us[d] : 0.0;
-                    differs = differs || std::fabs(by_depth[d] - prev) > 0.02 * vr.t_step_plain_us;
-                }
-                if (differs) {
-                    wl.mtp_draft_scale        = scale;
-                    wl.mtp_extra_by_depth_us  = by_depth;
-                    wl.mtp_extra_per_depth_us = std::max(0.0, extra);
-                    wl.mtp_rollback_us        = vr.t_rollback_us;
+        // the validation measures what the model missed on the allocation it validated; the search runs again with
+        // that and the new allocation is validated in turn, for a few rounds, since a different allocation can
+        // expose a cost the first one did not have (boundary crossings, a draft layer on another device)
+        for (int round = 1; round <= 3; round++) {
+            bool changed = false;
+                GGML_UNUSED(round);
+            if (vr.ok && vr.coverage_samples > 0 && params.fit_advisor_expert_coverage <= 0) {
+                // the copies were priced on an assumed share; the validation measured it on real text
+                const double assumed = wl.expert_coverage > 0 ? wl.expert_coverage : 0.6;
+                LOG_INF("%s: expert coverage measured at %.2f (assumed %.2f)\n", __func__, vr.expert_coverage, assumed);
+                if (std::fabs(vr.expert_coverage - assumed) > 0.1) {
+                    wl.expert_coverage = vr.expert_coverage;
                     changed = true;
                 }
             }
-        }
-        if (vr.ok && !params.fit_params_target_set) {
-            for (size_t d = 0; d < vr.devices.size() && d < sr.proj.devices.size(); d++) {
-                const int64_t suggested = vr.suggested_margin(d);
-                const int64_t current   = sr.proj.devices[d].margin;
-                if (!sr.proj.devices[d].scratch_unknown && std::llabs(suggested - current) > 64ll * 1024 * 1024) {
-                    LOG_INF("%s: %s margin %.0f -> %.0f MiB from the validation run\n", __func__, sr.proj.devices[d].name.c_str(),
-                        current / (1024.0 * 1024), suggested / (1024.0 * 1024));
-                    probe.set_margin(d, suggested);
-                    changed = true;
-                }
-            }
-        }
-        {
-            if (changed) {
-                LOG_INF("%s: searching again with the validated margins, coverage, excursion and drafting costs ...\n", __func__);
-                fit_advisor_search_result sr2 = search_and_report(params, inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts);
-                if (sr2.ok) {
-                    fit_advisor_validate_result vr2 = fit_advisor_validate(params, sr2.cand, sr2.proj, n_tokens);
-                    fit_advisor_validate_print(vr2);
-                    bool within = vr2.ok;
-                    for (size_t d = 0; d < vr2.devices.size() && within; d++) {
-                        within = vr2.devices[d].unmodelled() <= vr2.devices[d].margin;
+            if (vr.ok && vr.t_step_plain_us > 0) {
+                // the plain step was timed; what it costs beyond the model is attributed to the ops that run away from
+                // their layer's device, each of which is a scheduler split the kernel curves and link rates do not see
+                const double plain_model = sr.cost.mtp_depth_step_us.empty() ? sr.cost.t_gen_step_us : sr.cost.mtp_depth_step_us[0];
+                const double residual    = vr.t_step_plain_us - plain_model;
+                if (sr.cost.n_splits > 0) {
+                    const double extra = std::max(0.0, wl.split_extra_us + residual / sr.cost.n_splits);
+                    LOG_INF("%s: plain step %.1f ms measured vs %.1f modelled with %u splits (boundary crossings and excursions): extra per split %.0f us (was %.0f)\n",
+                        __func__, vr.t_step_plain_us * 1e-3, plain_model * 1e-3, sr.cost.n_splits, extra, wl.split_extra_us);
+                    if (std::fabs(extra - wl.split_extra_us) * sr.cost.n_splits > 0.02 * vr.t_step_plain_us) {
+                        wl.split_extra_us = extra;
+                        changed = true;
                     }
-                    if (within) {
-                        sr = sr2;
+                } else {
+                    LOG_INF("%s: plain step %.1f ms measured vs %.1f modelled, no splits to attribute the difference to\n",
+                        __func__, vr.t_step_plain_us * 1e-3, plain_model * 1e-3);
+                }
+            }
+            if (vr.ok && vr.t_draft_us > 0 && sr.cost.mtp_depth_rows_us.size() > 1 && sr.cost.t_mtp_draft_us > 0) {
+                // drafting was priced from kernels; the validation timed real steps. the draft decode is corrected by a
+                // factor over its kernel price, which carries over to the draft layer on another device; the verification
+                // rows by the measured growth over the plain step at every timed depth, since CPU kernels dip at odd rows
+                const double scale = vr.t_draft_us / sr.cost.t_mtp_draft_us;
+                const double rows0 = sr.cost.mtp_depth_rows_us[0];
+                std::vector<double> by_depth(vr.t_verify_us.size(), 0.0);
+                std::string table;
+                double extra_sum = 0;
+                int    extra_n   = 0;
+                for (size_t d = 1; d < vr.t_verify_us.size(); d++) {
+                    if (vr.t_verify_us[d] <= 0) {
+                        continue;
+                    }
+                    double rows_model;
+                    if (d < sr.cost.mtp_depth_rows_us.size()) {
+                        rows_model = sr.cost.mtp_depth_rows_us[d];
                     } else {
-                        LOG_WRN("%s: the allocation found with the validated margins did not validate, keeping the first one\n", __func__);
+                        // beyond the scan: the kernels' growth is near linear in the rows, extrapolate the last two depths
+                        const size_t n = sr.cost.mtp_depth_rows_us.size();
+                        rows_model = sr.cost.mtp_depth_rows_us[n - 1] + (d - (n - 1)) * (sr.cost.mtp_depth_rows_us[n - 1] - sr.cost.mtp_depth_rows_us[n - 2]);
                     }
-                } else {
-                    LOG_WRN("%s: no feasible allocation with the validated margins, keeping the first one\n", __func__);
+                    const double measured = vr.t_verify_us[d] - vr.t_step_plain_us;
+                    const double modelled = rows_model - rows0;
+                    by_depth[d] = measured - modelled;
+                    extra_sum += by_depth[d] / d;
+                    extra_n++;
+                    table += string_format(" d=%zu %.1f/%.1f", d, measured * 1e-3, modelled * 1e-3);
                 }
-            } else {
-                LOG_INF("%s: validated margins match the ones used, the allocation stands\n", __func__);
+                if (extra_n > 0) {
+                    const double extra = extra_sum / extra_n;
+                    LOG_INF("%s: drafting timed: draft decode %.2f ms vs %.2f modelled (factor %.2f, was %.2f); verification rows growth "
+                            "measured/modelled ms:%s; rollback %.2f ms\n", __func__, vr.t_draft_us * 1e-3, sr.cost.t_mtp_draft_us * 1e-3,
+                            scale, wl.mtp_draft_scale, table.c_str(), vr.t_rollback_us * 1e-3);
+                    bool differs = std::fabs(scale - wl.mtp_draft_scale) > 0.1 * wl.mtp_draft_scale ||
+                                   std::fabs(vr.t_rollback_us - wl.mtp_rollback_us) > 0.02 * vr.t_step_plain_us;
+                    for (size_t d = 1; d < by_depth.size(); d++) {
+                        const double prev = d < wl.mtp_extra_by_depth_us.size() ? wl.mtp_extra_by_depth_us[d] : 0.0;
+                        differs = differs || std::fabs(by_depth[d] - prev) > 0.02 * vr.t_step_plain_us;
+                    }
+                    if (differs) {
+                        wl.mtp_draft_scale        = scale;
+                        wl.mtp_extra_by_depth_us  = by_depth;
+                        wl.mtp_extra_per_depth_us = std::max(0.0, extra);
+                        wl.mtp_rollback_us        = vr.t_rollback_us;
+                        changed = true;
+                    }
+                }
             }
+            if (vr.ok && !params.fit_params_target_set) {
+                for (size_t d = 0; d < vr.devices.size() && d < sr.proj.devices.size(); d++) {
+                    const int64_t suggested = vr.suggested_margin(d);
+                    const int64_t current   = sr.proj.devices[d].margin;
+                    if (!sr.proj.devices[d].scratch_unknown && std::llabs(suggested - current) > 64ll * 1024 * 1024) {
+                        LOG_INF("%s: %s margin %.0f -> %.0f MiB from the validation run\n", __func__, sr.proj.devices[d].name.c_str(),
+                            current / (1024.0 * 1024), suggested / (1024.0 * 1024));
+                        probe.set_margin(d, suggested);
+                        changed = true;
+                    }
+                }
+            }
+            if (!changed) {
+                LOG_INF("%s: the validation matches the model, the allocation stands\n", __func__);
+                break;
+            }
+            LOG_INF("%s: searching again with the validated margins, coverage, split and drafting costs (round %d) ...\n", __func__, round);
+            fit_advisor_search_result sr2 = search_and_report(params, inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts);
+            if (!sr2.ok) {
+                LOG_WRN("%s: no feasible allocation with the validated costs, keeping the previous one\n", __func__);
+                break;
+            }
+            fit_advisor_validate_result vr2 = fit_advisor_validate(params, sr2.cand, sr2.proj, n_tokens);
+            fit_advisor_validate_print(vr2);
+            bool within = vr2.ok;
+            for (size_t d = 0; d < vr2.devices.size() && within; d++) {
+                within = vr2.devices[d].unmodelled() <= vr2.devices[d].margin;
+            }
+            if (!within) {
+                LOG_WRN("%s: the allocation found with the validated costs did not validate, keeping the previous one\n", __func__);
+                break;
+            }
+            sr = sr2;
+            vr = vr2;
         }
     }
 
