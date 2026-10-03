@@ -154,6 +154,12 @@ struct searcher {
         const fit_advisor_projection & pj = probe.run(a.to_candidate(inv, device_bufts, name));
         n_probes++;
         if (pj.ok) {
+            for (size_t d = 0; d < nd && d < pj.devices.size(); d++) {
+                const auto & pd = pj.devices[d];
+                LOG_DBG("%s: probe %s %s: model %.0f ctx %.0f cmp %.0f scratch %.0f margin %.0f -> left %.0f MiB%s\n", __func__,
+                    name.c_str(), pd.name.c_str(), pd.model / (1024.0 * 1024), pd.context / (1024.0 * 1024), pd.compute / (1024.0 * 1024),
+                    pd.scratch / (1024.0 * 1024), pd.margin / (1024.0 * 1024), pd.projected_free() / (1024.0 * 1024), pd.fits() ? "" : " OVER");
+            }
             memory_model::entry e;
             e.ok = true;
             for (size_t d = 0; d < nd && d < pj.devices.size(); d++) {
