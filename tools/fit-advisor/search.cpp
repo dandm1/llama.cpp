@@ -968,6 +968,18 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         best.cost = fit_advisor_cost_estimate(inv, best.alloc, best.proj, gp, cost_devs, pairs, best.wl);
         best.cost.mtp_depth_tok_s = by_depth;
     }
+    if (!best.alloc.draft_mtp && wl_base.use_mtp && inv.n_layer_nextn > 0 && best.cost.mtp_depth_tok_s.empty()) {
+        // drafting lost before the walk started: price it on the final allocation anyway so the report can show
+        // the rate at each depth (the KV figures of the no-MTP projection stand in for the draft context's)
+        fit_advisor_allocation a_mtp = best.alloc;
+        a_mtp.draft_mtp = true;
+        fit_advisor_workload wl_mtp = best.wl;
+        wl_mtp.use_mtp = true;
+        const fit_advisor_cost c_mtp = fit_advisor_cost_estimate(inv, a_mtp, best.proj, gp, cost_devs, pairs, wl_mtp);
+        if (c_mtp.ok) {
+            best.cost.mtp_depth_tok_s = c_mtp.mtp_depth_tok_s;
+        }
+    }
     best.name  = alloc_name(best.alloc);
     best.cand  = best.alloc.to_candidate(inv, device_bufts, best.name);
     best.n_probes = S.n_probes;
