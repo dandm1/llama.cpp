@@ -863,7 +863,10 @@ int llama_fit_advisor(int argc, char ** argv) {
             double extra_sum = 0;
             int    extra_n   = 0;
             std::string table;
-            for (size_t d = 1; d < vr.t_verify_us.size() && d < sr.cost.mtp_depth_step_us.size(); d++) {
+            std::vector<double> by_depth(vr.t_verify_us.size(), 0.0);
+            // the model's growth with depth at every timed depth: the scan only went as deep as it paid, so the deeper
+            // depths are priced here with the same workload at that depth
+            for (size_t d = 1; d < vr.t_verify_us.size(); d++) {
                 if (vr.t_verify_us[d] <= 0) {
                     continue;
                 }
@@ -871,16 +874,34 @@ int llama_fit_advisor(int argc, char ** argv) {
                 for (size_t k = 1; k <= d; k++) {
                     p_all *= wl.mtp_accept_at((uint32_t) k);
                 }
+                double prev_extra = d < wl.mtp_extra_by_depth_us.size() && wl.mtp_extra_by_depth_us[d] > 0
+                    ? wl.mtp_extra_by_depth_us[d] : d * wl.mtp_extra_per_depth_us;
+                double model_step;
+                if (d < sr.cost.mtp_depth_step_us.size()) {
+                    model_step = sr.cost.mtp_depth_step_us[d];
+                } else {
+                    // beyond the scan: the kernels' growth is near linear in the rows, extrapolate the last two depths
+                    const size_t n = sr.cost.mtp_depth_step_us.size();
+                    const double last = sr.cost.mtp_depth_step_us[n - 1], prev = sr.cost.mtp_depth_step_us[n - 2];
+                    const double prev_extra_last = (n - 1) < wl.mtp_extra_by_depth_us.size() && wl.mtp_extra_by_depth_us[n - 1] > 0
+                        ? wl.mtp_extra_by_depth_us[n - 1] : (n - 1) * wl.mtp_extra_per_depth_us;
+                    const double prev_extra_prev = (n - 2) < wl.mtp_extra_by_depth_us.size() && wl.mtp_extra_by_depth_us[n - 2] > 0
+                        ? wl.mtp_extra_by_depth_us[n - 2] : (n - 2) * wl.mtp_extra_per_depth_us;
+                    const double slope = (last - prev_extra_last) - (prev - prev_extra_prev);
+                    model_step = last - prev_extra_last + (d - (n - 1)) * slope;
+                    prev_extra = 0;
+                }
                 // growth of the step with depth, without the terms a previous validation already added
                 const double measured = vr.t_verify_us[d] + d * vr.t_draft_us - vr.t_step_plain_us;
-                const double modelled = sr.cost.mtp_depth_step_us[d] - plain_model - d * wl.mtp_extra_per_depth_us
-                                      - (1.0 - p_all) * wl.mtp_rollback_us;
+                const double modelled = model_step - plain_model - prev_extra - (1.0 - p_all) * wl.mtp_rollback_us;
+                by_depth[d] = std::max(0.0, measured - modelled);
                 extra_sum += (measured - modelled) / d;
                 extra_n++;
                 table += string_format(" d=%zu %.1f/%.1f", d, measured * 1e-3, modelled * 1e-3);
             }
             if (extra_n > 0) {
                 const double extra = std::max(0.0, extra_sum / extra_n);
+                wl.mtp_extra_by_depth_us = by_depth;
                 LOG_INF("%s: drafting timed: plain step %.1f ms measured vs %.1f modelled; growth per depth measured/modelled ms:%s; "
                         "extra per draft position %.2f ms (was %.2f), rollback %.2f ms (was %.2f)\n", __func__, vr.t_step_plain_us * 1e-3, plain_model * 1e-3,
                         table.c_str(), extra * 1e-3, wl.mtp_extra_per_depth_us * 1e-3, vr.t_rollback_us * 1e-3, wl.mtp_rollback_us * 1e-3);
