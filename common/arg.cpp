@@ -2992,12 +2992,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
     add_opt(common_arg(
+        {"--no-mtp"},
+        "never choose MTP drafting (default: the search decides per allocation when the model has MTP layers, "
+        "including the draft length)",
+        [](common_params & params) {
+            params.fit_advisor_mtp = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
+    add_opt(common_arg(
         {"--mtp-accept"}, "P",
-        string_format("assumed probability that one drafted MTP token is accepted, used with --spec-type draft-mtp and --spec-draft-n-max (default: %.2f)", params.fit_advisor_mtp_accept),
+        string_format("assumed probability that a drafted MTP token is accepted, per draft position up to the model's trained "
+                      "MTP depth (default: %.2f)", params.fit_advisor_mtp_accept),
         [](common_params & params, const std::string & value) {
             params.fit_advisor_mtp_accept = std::stod(value);
             if (params.fit_advisor_mtp_accept < 0.0 || params.fit_advisor_mtp_accept > 1.0) {
                 throw std::invalid_argument("--mtp-accept must be between 0 and 1");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
+    add_opt(common_arg(
+        {"--mtp-decay"}, "D",
+        string_format("factor the acceptance probability decays by for every draft position beyond the trained MTP depth: "
+                      "a single MTP layer drafts deeper positions from its own guesses (default: %.2f)", params.fit_advisor_mtp_decay),
+        [](common_params & params, const std::string & value) {
+            params.fit_advisor_mtp_decay = std::stod(value);
+            if (params.fit_advisor_mtp_decay <= 0.0 || params.fit_advisor_mtp_decay > 1.0) {
+                throw std::invalid_argument("--mtp-decay must be in (0, 1]");
             }
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));

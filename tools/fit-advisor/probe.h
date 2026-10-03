@@ -27,6 +27,7 @@ struct fit_advisor_candidate {
     std::vector<fit_advisor_override> overrides;
     std::string layer_devices;              // -old spec with buffer type names ("47=CUDA0,output=CUDA0"), empty for none
     bool        spec_mtp = false;           // MTP drafting on: the MTP layers are loaded and a draft context is created
+    uint32_t    spec_draft_n = 0;           // draft tokens per step with drafting on (0: the server default)
     int8_t      flash_attn = -1;            // -1 auto, 0 off, 1 on
     bool        no_kv_offload = false;      // KV cache in host memory
     std::vector<int32_t> op_offload_min_batch_dev; // per device, 0 = the device's default (see fit_advisor_set_default_op_offload)

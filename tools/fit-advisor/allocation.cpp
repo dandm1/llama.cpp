@@ -99,6 +99,7 @@ fit_advisor_candidate fit_advisor_allocation::to_candidate(const fit_advisor_inv
     c.n_ubatch     = n_ubatch;
     c.n_gpu_layers = n_gpu_layers();
     c.spec_mtp     = draft_mtp;
+    c.spec_draft_n = draft_mtp ? mtp_draft_n : 0;
     c.flash_attn   = flash_attn;
     c.no_kv_offload = no_kv_offload;
     c.op_offload_min_batch_dev = op_offload_min_batch_dev;

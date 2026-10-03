@@ -939,6 +939,15 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     best.wl    = incumbent.wl;
     best.proj  = incumbent_proj;
     best.cost  = fit_advisor_cost_estimate(inv, best.alloc, best.proj, gp, cost_devs, pairs, best.wl);
+    // the depth the cost model chose is part of what the candidate reproduces; a depth of 0 means drafting never
+    // paid on this allocation, which the emitted command then leaves off
+    best.alloc.mtp_draft_n = best.cost.mtp_draft_n;
+    best.wl.mtp_draft_n    = best.cost.mtp_draft_n;
+    if (best.alloc.draft_mtp && best.cost.mtp_draft_n == 0) {
+        best.alloc.draft_mtp = false;
+        best.wl.use_mtp      = false;
+        best.cost = fit_advisor_cost_estimate(inv, best.alloc, best.proj, gp, cost_devs, pairs, best.wl);
+    }
     best.cand  = best.alloc.to_candidate(inv, device_bufts, best.name);
     best.n_probes = S.n_probes;
     best.n_anneal_accepted = accepted;

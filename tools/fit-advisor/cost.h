@@ -36,11 +36,19 @@ struct fit_advisor_workload {
     double   expert_coverage = 0;
     bool     pinned_cpu_weights = false; // CPU-resident weights live in the devices' pinned host buffer, copies run at the pinned rate
     bool     use_mtp       = false; // MTP layers are executed (speculative MTP drafting on), otherwise they are not even loaded
-    uint32_t mtp_draft_n   = 3;     // draft tokens per step when drafting (--draft-max)
+    uint32_t mtp_draft_n   = 0;     // draft tokens per step for the per-tensor costs; 0 = a default near the trained depth.
+                                    // the cost estimate itself scans the depth and reports its choice in fit_advisor_cost
+    uint32_t mtp_trained_depth = 1; // MTP layers in the model: positions up to this depth are drafted as trained
     double   mtp_accept    = 0.8;   // probability that one drafted token is accepted, a heuristic like the token counts
+    double   mtp_decay     = 0.85;  // beyond the trained depth a single layer drafts from its own guesses: the acceptance
+                                    // of each further position is multiplied by this factor once more
 
-    // tokens produced per generation step and slot: 1 verified token plus the expected accepted drafts
-    double tokens_per_step() const;
+    // probability that the drafted token at 1-based position k is accepted given every earlier one was
+    double mtp_accept_at(uint32_t k) const;
+    // tokens produced per generation step and slot at a draft depth: 1 verified token plus the expected accepted drafts
+    double tokens_per_step(uint32_t depth) const;
+    // the depth the per-tensor costs assume when none was chosen yet
+    uint32_t mtp_draft_n_default() const { return mtp_draft_n > 0 ? mtp_draft_n : mtp_trained_depth + 2; }
 
     static fit_advisor_workload preset(const std::string & name); // "chat", "rag", "batch", "agent"
 };
@@ -73,9 +81,12 @@ struct fit_advisor_cost {
     double step_overhead_us = 0;
     double step_boundary_us = 0;
 
-    // drafting: one run of the MTP layer(s) at the generation batch, and the tokens a step yields per slot
-    double t_mtp_draft_us   = 0;
-    double tokens_per_step  = 1;
+    // drafting: one run of the MTP layer(s) at the generation batch, the depth the scan chose (0: drafting does not
+    // pay on this allocation), the tokens a step yields per slot at that depth, and the rate at every depth tried
+    double   t_mtp_draft_us  = 0;
+    uint32_t mtp_draft_n     = 0;
+    double   tokens_per_step = 1;
+    std::vector<double> mtp_depth_tok_s; // [depth] -> aggregate gen tokens/s, depth 0 = plain steps
 
     // objective: lower is better
     double score() const { return t_request_us; }

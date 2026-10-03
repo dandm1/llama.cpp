@@ -290,6 +290,9 @@ bool fit_advisor_apply_candidate(common_params & p, const fit_advisor_candidate 
                               p.speculative.types.end());
     if (cand.spec_mtp) {
         p.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+        if (cand.spec_draft_n > 0) {
+            p.speculative.draft.n_max = (int32_t) cand.spec_draft_n;
+        }
     }
 
     // whole-layer homes: the candidate names buffer types, the loader wants devices

@@ -404,10 +404,15 @@ static fit_advisor_search_result search_and_report(const common_params & params,
         }
     }
     if (sr.wl.use_mtp) {
-        printf("  drafting ON: verification batch of %u, MTP draft run %.0f us x %u, %.2f tokens per step\n",
-            1 + sr.wl.mtp_draft_n, sr.cost.t_mtp_draft_us, sr.wl.mtp_draft_n, sr.cost.tokens_per_step);
-    } else if (inv.n_layer_nextn > 0) {
-        printf("  drafting OFF: the MTP layers are not loaded\n");
+        printf("  drafting ON at depth %u: verification batch of %u, MTP draft run %.0f us x %u, %.2f tokens per step\n",
+            sr.cost.mtp_draft_n, 1 + sr.cost.mtp_draft_n, sr.cost.t_mtp_draft_us, sr.cost.mtp_draft_n, sr.cost.tokens_per_step);
+        printf("    gen tok/s by depth:");
+        for (size_t d = 0; d < sr.cost.mtp_depth_tok_s.size(); d++) {
+            printf(" %zu: %.2f", d, sr.cost.mtp_depth_tok_s[d]);
+        }
+        printf("  (the scan stops at the first depth that is worse)\n");
+    } else if (inv.n_layer_nextn > 0 && params.fit_advisor_mtp) {
+        printf("  drafting OFF: the MTP layers are not loaded; drafting was priced on every allocation and never won\n");
     }
     for (size_t d = 0; d < sr.proj.devices.size(); d++) {
         const auto & pd = sr.proj.devices[d];
@@ -521,6 +526,18 @@ int llama_fit_advisor(int argc, char ** argv) {
         return 1;
     }
     fit_advisor_inventory_print(inv);
+
+    // MTP drafting: considered whenever the model has MTP layers and --no-mtp was not given. downstream (probe, cost,
+    // search, emit) the presence of draft-mtp in the speculative types means "drafting may be chosen"
+    params.speculative.types.erase(std::remove(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP),
+                                   params.speculative.types.end());
+    if (inv.n_layer_nextn == 0) {
+        LOG_INF("%s: the model has no MTP layers, drafting is not considered\n", __func__);
+    } else if (!params.fit_advisor_mtp) {
+        LOG_INF("%s: --no-mtp: the model's %u MTP layer(s) are not loaded and drafting is not considered\n", __func__, inv.n_layer_nextn);
+    } else {
+        params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    }
 
     fit_advisor_probe probe(params);
 
@@ -668,12 +685,9 @@ int llama_fit_advisor(int argc, char ** argv) {
         w.pinned_cpu_weights = params.fit_advisor_pin_cpu_weights;
         w.op_offload_min_batch     = params.op_offload_min_batch;
         w.op_offload_min_batch_dev = params.op_offload_min_batch_dev;
-        w.mtp_draft_n = (uint32_t) std::max(0, params.speculative.draft.n_max);
+        w.mtp_trained_depth = std::max<uint32_t>(1, inv.n_layer_nextn);
         w.mtp_accept  = params.fit_advisor_mtp_accept;
-        if (w.use_mtp && inv.n_layer_nextn == 0) {
-            LOG_WRN("%s: --spec-type draft-mtp given but the model has no MTP layers, pricing without drafting\n", __func__);
-            w.use_mtp = false;
-        }
+        w.mtp_decay   = params.fit_advisor_mtp_decay;
         return w;
     }();
 
@@ -745,8 +759,9 @@ int llama_fit_advisor(int argc, char ** argv) {
     printf("\nestimated cost per request, workload '%s': %u prompt + %u generated tokens, %u concurrent, ubatch %u\n",
         params.fit_advisor_workload.c_str(), wl.prompt_tokens, wl.gen_tokens, wl.concurrency, wl.n_ubatch);
     if (wl.use_mtp) {
-        printf("  MTP drafting allowed: %u draft tokens per step at %.0f%% acceptance each -> %.2f tokens per step (--mtp-accept); the search decides per allocation\n",
-            wl.mtp_draft_n, 100.0 * wl.mtp_accept, wl.tokens_per_step());
+        printf("  MTP drafting allowed: %.0f%% acceptance per draft position up to the trained depth %u (--mtp-accept), decaying by %.2f "
+               "per position beyond it (--mtp-decay); the search chooses drafting and its depth per allocation (--no-mtp disables)\n",
+            100.0 * wl.mtp_accept, wl.mtp_trained_depth, wl.mtp_decay);
     }
     for (const auto & cd : cost_devs) {
         if (!cd.is_cpu) {

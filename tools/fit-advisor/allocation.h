@@ -25,6 +25,7 @@ struct fit_advisor_allocation {
     uint32_t n_slots  = 1;
     uint32_t n_ubatch = 0; // 0 = the base parameters' ubatch
     bool     draft_mtp = false; // MTP drafting on: the MTP layers are part of the allocation and the draft context exists
+    uint32_t mtp_draft_n = 0;   // draft depth the cost model chose for this allocation when drafting (0: not chosen yet)
     int8_t   flash_attn = -1;   // -1 auto (llama.cpp decides), 0 off, 1 on; changes the attention path and the compute buffer
     bool     no_kv_offload = false; // the whole KV cache in host memory, attention on the CPU
     std::string cpu_buft = "CPU";   // buffer type CPU-resident weights are placed in: "CPU", or a pinned host type like "CUDA_Host"

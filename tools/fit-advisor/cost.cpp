@@ -37,9 +37,8 @@ fit_advisor_workload fit_advisor_workload::preset(const std::string & name) {
     return w;
 }
 
-// the matmul curve has three points: batch 1 and 4 on the large weight, batch n_pp on the small one
-// interpolate per-token seconds per byte log-linearly in the batch size, extrapolating the last segment
-// per-token seconds at a batch from measured (batch -> seconds for the whole batch) points: log-linear between
+// the matmul curve: batch 1, 4 and the measurement's intermediate batches (16, 64) on the large weight, batch n_pp on
+// the small one. per-token seconds at a batch from measured (batch -> seconds for the whole batch) points: log-linear between
 // bracketing points, the first point below its batch, flat per token beyond the last (compute bound)
 static double interp_per_token(const std::map<int, double> & points, uint32_t batch) {
     if (points.empty()) {
@@ -97,14 +96,24 @@ double fit_advisor_s_per_byte(const fit_advisor_matmul_rate & r, uint32_t batch)
     return cp;
 }
 
-double fit_advisor_workload::tokens_per_step() const {
-    if (!use_mtp || mtp_draft_n == 0) {
+double fit_advisor_workload::mtp_accept_at(uint32_t k) const {
+    double p = std::min(1.0, std::max(0.0, mtp_accept));
+    if (k > mtp_trained_depth) {
+        // the layer was trained to predict mtp_trained_depth positions from the trunk's state; beyond that it is fed
+        // its own guesses, and the error compounds once per further position
+        p *= std::pow(std::min(1.0, std::max(0.0, mtp_decay)), (double) (k - mtp_trained_depth));
+    }
+    return p;
+}
+
+double fit_advisor_workload::tokens_per_step(uint32_t depth) const {
+    if (!use_mtp || depth == 0) {
         return 1.0;
     }
-    // acceptances treated as independent: the k-th draft token counts only if every earlier one was accepted
+    // the k-th draft token counts only if every earlier one was accepted
     double ret = 1.0, pk = 1.0;
-    for (uint32_t k = 0; k < mtp_draft_n; k++) {
-        pk  *= std::min(1.0, std::max(0.0, mtp_accept));
+    for (uint32_t k = 1; k <= depth; k++) {
+        pk  *= mtp_accept_at(k);
         ret += pk;
     }
     return ret;
@@ -269,12 +278,14 @@ double fit_advisor_tensor_request_us(const fit_advisor_inventory & inv, const fi
         return pp_us;
     }
     // generation: without drafting one step per token; with drafting a step verifies 1 + draft tokens in one batch
-    // through the trunk and runs the MTP layer once per draft token, yielding tokens_per_step() tokens
-    const double n_steps = wl.gen_tokens / wl.tokens_per_step();
-    const uint32_t batch_step = is_mtp ? batch_gen : batch_gen * (wl.use_mtp ? 1 + wl.mtp_draft_n : 1);
+    // through the trunk and runs the MTP layer once per draft token, yielding tokens_per_step() tokens. the depth is
+    // the one the last cost estimate chose for this allocation, or a default near the trained depth
+    const uint32_t depth = wl.use_mtp ? wl.mtp_draft_n_default() : 0;
+    const double n_steps = wl.gen_tokens / wl.tokens_per_step(depth);
+    const uint32_t batch_step = is_mtp ? batch_gen : batch_gen * (1 + depth);
     const fit_advisor_tensor_use & u_gen = batch_step > 4
         ? u_pp : (tensor_idx < gp.use_tg.size() ? gp.use_tg[tensor_idx] : fit_advisor_tensor_use{});
-    const double runs_per_step = is_mtp ? (double) wl.mtp_draft_n : 1.0;
+    const double runs_per_step = is_mtp ? (double) depth : 1.0;
     return n_steps * runs_per_step * fit_advisor_tensor_cost_us(inv, t, u_gen, dev_idx, devices, batch_step, home_idx, &wl) + pp_us;
 }
 
@@ -453,16 +464,38 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
         }
     };
 
-    c.tokens_per_step = wl.tokens_per_step();
-    if (wl.use_mtp && inv.n_layer_nextn > 0 && wl.mtp_draft_n > 0) {
-        // drafting: the trunk verifies 1 + draft tokens per slot in one batch, then the MTP layer runs once per
-        // draft token at the generation batch; the step yields tokens_per_step tokens per slot
-        step_us(batch_gen * (1 + wl.mtp_draft_n), SEL_TRUNK, c.step_weights_us, c.step_attn_us, c.step_overhead_us, c.step_boundary_us);
+    c.tokens_per_step = 1;
+    c.mtp_draft_n     = 0;
+    if (wl.use_mtp && inv.n_layer_nextn > 0) {
+        // drafting: the trunk verifies 1 + depth tokens per slot in one batch, then the MTP layer runs once per draft
+        // token at the generation batch; the step yields tokens_per_step(depth) tokens per slot. the depth is chosen
+        // here: every further position adds a draft run and a verification row for a geometrically smaller expected
+        // yield, so the rate over the depth rises and then falls; the scan stops at the first depth that is worse.
+        // the loop bound is a guard, the decaying acceptance ends the scan long before it
         double w, a, o, b;
         step_us(batch_gen, SEL_MTP, w, a, o, b);
         c.t_mtp_draft_us = w + a + o + b;
-        c.t_gen_step_us  = c.step_weights_us + c.step_attn_us + c.step_overhead_us + c.step_boundary_us
-                         + wl.mtp_draft_n * c.t_mtp_draft_us;
+
+        constexpr uint32_t depth_guard = 32;
+        double best_rate = -1;
+        for (uint32_t depth = 0; depth <= depth_guard; depth++) {
+            double sw, sa, so, sb;
+            step_us(batch_gen * (1 + depth), SEL_TRUNK, sw, sa, so, sb);
+            const double t_step = sw + sa + so + sb + depth * c.t_mtp_draft_us;
+            const double rate   = t_step > 0 ? batch_gen * wl.tokens_per_step(depth) * 1e6 / t_step : 0;
+            c.mtp_depth_tok_s.push_back(rate);
+            if (rate <= best_rate) {
+                break;
+            }
+            best_rate = rate;
+            c.mtp_draft_n     = depth;
+            c.tokens_per_step = wl.tokens_per_step(depth);
+            c.step_weights_us  = sw;
+            c.step_attn_us     = sa;
+            c.step_overhead_us = so;
+            c.step_boundary_us = sb;
+            c.t_gen_step_us    = t_step;
+        }
     } else {
         step_us(batch_gen, SEL_ALL, c.step_weights_us, c.step_attn_us, c.step_overhead_us, c.step_boundary_us);
         c.t_gen_step_us = c.step_weights_us + c.step_attn_us + c.step_overhead_us + c.step_boundary_us;

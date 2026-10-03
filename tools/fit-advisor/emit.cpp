@@ -106,8 +106,10 @@ std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common
             v += (v.empty() ? "" : ",") + common_speculative_type_to_str(t);
         }
         ret.push_back({ "LLAMA_ARG_SPEC_TYPE", v, "--spec-type " + v });
-        if (params.speculative.draft.n_max != defaults.speculative.draft.n_max) {
-            const std::string n = std::to_string(params.speculative.draft.n_max);
+        // the draft depth the cost model chose for this allocation, else whatever the user passed through
+        const int32_t n_max = cand.spec_mtp && cand.spec_draft_n > 0 ? (int32_t) cand.spec_draft_n : params.speculative.draft.n_max;
+        if (n_max != defaults.speculative.draft.n_max) {
+            const std::string n = std::to_string(n_max);
             ret.push_back({ "LLAMA_ARG_SPEC_DRAFT_N_MAX", n, "--spec-draft-n-max " + n });
         }
     }
