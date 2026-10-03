@@ -496,9 +496,10 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
         for (uint32_t depth = 0; depth <= depth_guard; depth++) {
             double sw, sa, so, sb;
             step_us(batch_gen * (1 + depth), SEL_TRUNK, sw, sa, so, sb);
-            const double t_step = sw + sa + so + sb + depth * c.t_mtp_draft_us;
+            const double t_step = sw + sa + so + sb + depth * (c.t_mtp_draft_us + wl.mtp_extra_per_depth_us);
             const double rate   = t_step > 0 ? batch_gen * wl.tokens_per_step(depth) * 1e6 / t_step : 0;
             c.mtp_depth_tok_s.push_back(rate);
+            c.mtp_depth_step_us.push_back(t_step);
             if (rate <= best_rate) {
                 break;
             }

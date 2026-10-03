@@ -46,6 +46,13 @@ struct fit_advisor_validate_result {
     double   t_load_s = 0;
     double   t_run_s  = 0;
 
+    // drafting (when the candidate drafts): measured decode times at the generation batch, microseconds, each the
+    // median of a few repetitions after a warm-up. t_verify_us[d] is a step of 1 + d tokens per slot with logits for
+    // every row (index 0 unused); t_draft_us one decode of the MTP draft context, one token per slot, logits read back
+    double              t_step_plain_us = 0;
+    std::vector<double> t_verify_us;
+    double              t_draft_us = 0;
+
     // the margin the search should use for each device: what the projection missed plus the pad, never negative
     int64_t suggested_margin(size_t device) const;
 };

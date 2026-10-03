@@ -42,6 +42,8 @@ struct fit_advisor_workload {
     double   mtp_accept    = 0.8;   // probability that one drafted token is accepted, a heuristic like the token counts
     double   mtp_decay     = 0.85;  // beyond the trained depth a single layer drafts from its own guesses: the acceptance
                                     // of each further position is multiplied by this factor once more
+    double   mtp_extra_per_depth_us = 0; // per draft position, what a timed draft decode and verification row cost beyond
+                                         // the kernels the model prices: launches, synchronisation, host work (validation)
 
     // probability that the drafted token at 1-based position k is accepted given every earlier one was
     double mtp_accept_at(uint32_t k) const;
@@ -86,7 +88,8 @@ struct fit_advisor_cost {
     double   t_mtp_draft_us  = 0;
     uint32_t mtp_draft_n     = 0;
     double   tokens_per_step = 1;
-    std::vector<double> mtp_depth_tok_s; // [depth] -> aggregate gen tokens/s, depth 0 = plain steps
+    std::vector<double> mtp_depth_tok_s;   // [depth] -> aggregate gen tokens/s, depth 0 = plain steps
+    std::vector<double> mtp_depth_step_us; // [depth] -> the step time behind it
 
     // objective: lower is better
     double score() const { return t_request_us; }

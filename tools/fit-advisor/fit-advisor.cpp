@@ -795,6 +795,29 @@ int llama_fit_advisor(int argc, char ** argv) {
     // ---- the search, then an optional real load to measure what the projection missed and search again with that margin
     fit_advisor_search_options sopts;
     sopts.n_ctx        = params.n_ctx;
+    if (params.n_ctx == 0) {
+        // no context given: the model's default is its training context, which for large models fits nowhere. like
+        // the fitter, halve from there until the experts-on-CPU (or all-on-device) reference fits, then say so
+        const fit_advisor_projection & p_default = probe.run(cands[0]);
+        uint32_t ctx = p_default.n_ctx_train;
+        const uint32_t ctx_min = params.fit_params_min_ctx == UINT32_MAX ? 4096 : std::max<uint32_t>(256, (uint32_t) params.fit_params_min_ctx);
+        const named_allocation & ref = allocs.back(); // the last reference allocation keeps the most on the CPU
+        while (ctx > ctx_min) {
+            fit_advisor_allocation a = ref.alloc;
+            a.n_ctx = ctx;
+            if (probe.run(a.to_candidate(inv, device_bufts, "ctx-" + std::to_string(ctx))).fits_all()) {
+                break;
+            }
+            ctx = std::max(ctx_min, ctx / 2);
+        }
+        if (ctx != p_default.n_ctx_train) {
+            LOG_WRN("%s: no -c given and the model's default context of %u does not fit; searching at %u (pass -c to choose)\n",
+                __func__, p_default.n_ctx_train, ctx);
+        } else {
+            LOG_INF("%s: no -c given, searching at the model's default context of %u\n", __func__, ctx);
+        }
+        sopts.n_ctx = ctx;
+    }
     sopts.max_slots    = wl.concurrency;
     sopts.anneal_iters = params.fit_advisor_search_iters;
     sopts.base_flash_attn    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO ? -1 : params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ? 1 : 0;
@@ -833,6 +856,34 @@ int llama_fit_advisor(int argc, char ** argv) {
                 changed = true;
             }
         }
+        if (vr.ok && vr.t_draft_us > 0 && sr.cost.mtp_depth_step_us.size() > 1) {
+            // drafting was priced from kernels; the validation timed real steps. the extra per draft position is the
+            // measured growth of the step over the plain step, less what the model already prices for that depth
+            const double plain_model = sr.cost.mtp_depth_step_us[0];
+            double extra_sum = 0;
+            int    extra_n   = 0;
+            std::string table;
+            for (size_t d = 1; d < vr.t_verify_us.size() && d < sr.cost.mtp_depth_step_us.size(); d++) {
+                if (vr.t_verify_us[d] <= 0) {
+                    continue;
+                }
+                const double measured = vr.t_verify_us[d] + d * vr.t_draft_us - vr.t_step_plain_us;
+                const double modelled = sr.cost.mtp_depth_step_us[d] - plain_model - d * wl.mtp_extra_per_depth_us;
+                extra_sum += (measured - modelled) / d;
+                extra_n++;
+                table += string_format(" d=%zu %.1f/%.1f", d, measured * 1e-3, modelled * 1e-3);
+            }
+            if (extra_n > 0) {
+                const double extra = std::max(0.0, extra_sum / extra_n);
+                LOG_INF("%s: drafting timed: plain step %.1f ms measured vs %.1f modelled; growth per depth measured/modelled ms:%s; "
+                        "extra per draft position %.2f ms (was %.2f)\n", __func__, vr.t_step_plain_us * 1e-3, plain_model * 1e-3,
+                        table.c_str(), extra * 1e-3, wl.mtp_extra_per_depth_us * 1e-3);
+                if (std::fabs(extra - wl.mtp_extra_per_depth_us) > 0.02 * vr.t_step_plain_us) {
+                    wl.mtp_extra_per_depth_us = extra;
+                    changed = true;
+                }
+            }
+        }
         if (vr.ok && !params.fit_params_target_set) {
             for (size_t d = 0; d < vr.devices.size() && d < sr.proj.devices.size(); d++) {
                 const int64_t suggested = vr.suggested_margin(d);
@@ -847,7 +898,7 @@ int llama_fit_advisor(int argc, char ** argv) {
         }
         {
             if (changed) {
-                LOG_INF("%s: searching again with the validated margins and coverage ...\n", __func__);
+                LOG_INF("%s: searching again with the validated margins, coverage and drafting cost ...\n", __func__);
                 fit_advisor_search_result sr2 = search_and_report(params, inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts);
                 if (sr2.ok) {
                     fit_advisor_validate_result vr2 = fit_advisor_validate(params, sr2.cand, sr2.proj, n_tokens);

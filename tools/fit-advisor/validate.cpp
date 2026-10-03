@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -263,6 +264,97 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
         }
     }
     llama_synchronize(ctx);
+
+    // drafting: time what the cost model prices from kernels alone. a verification step of 1 + d rows and a decode of
+    // the draft context each carry launch, synchronisation and host work the model cannot see, so they are measured
+    // here, at steady state, and the search is told the difference. the KV is rolled back after every step
+    if (ctx_mtp && decode_ok) {
+        llama_memory_t mem = llama_get_memory(ctx);
+        auto pos_of = [&](uint32_t s) -> llama_pos {
+            return s == 0 ? (llama_pos) (n_prompt_tokens + vr.n_gen_steps) : (llama_pos) vr.n_gen_steps;
+        };
+        auto time_decode = [&](llama_context * c, llama_batch & b) -> double {
+            const int64_t t = ggml_time_us();
+            if (llama_decode(c, b) != 0) {
+                return -1;
+            }
+            for (int32_t i = 0; i < b.n_tokens; i++) {
+                if (b.logits[i]) {
+                    llama_get_logits_ith(c, i); // the sampler reads every output row, which waits for the graph
+                }
+            }
+            llama_synchronize(c);
+            return (double) (ggml_time_us() - t);
+        };
+        auto median_after_warmup = [](std::vector<double> ts) -> double {
+            if (ts.size() > 1) {
+                ts.erase(ts.begin());
+            }
+            if (ts.empty()) {
+                return 0;
+            }
+            std::sort(ts.begin(), ts.end());
+            return ts[ts.size() / 2];
+        };
+        constexpr int reps = 5;
+        const uint32_t d_max = std::min<uint32_t>(8, std::max<uint32_t>(1, n_batch / n_slots) - 1);
+        vr.t_verify_us.assign(d_max + 1, 0.0);
+        for (uint32_t d = 0; d <= d_max && decode_ok; d++) {
+            std::vector<double> ts;
+            for (int r = 0; r < reps; r++) {
+                common_batch_clear(batch);
+                for (uint32_t s = 0; s < n_slots; s++) {
+                    for (uint32_t k = 0; k <= d; k++) {
+                        common_batch_add(batch, token_at(3000 + (r * n_slots + s) * 16 + k), pos_of(s) + (llama_pos) k, { (llama_seq_id) s }, true);
+                    }
+                }
+                const double t = time_decode(ctx, batch);
+                for (uint32_t s = 0; s < n_slots; s++) {
+                    llama_memory_seq_rm(mem, (llama_seq_id) s, pos_of(s), -1);
+                }
+                if (t < 0) {
+                    decode_ok = false;
+                    vr.error = "timed decode failed";
+                    break;
+                }
+                ts.push_back(t);
+            }
+            const double t_med = median_after_warmup(ts);
+            if (d == 0) {
+                vr.t_step_plain_us = t_med;
+            } else {
+                vr.t_verify_us[d] = t_med;
+            }
+        }
+        if (decode_ok) {
+            // the draft context takes the token and the trunk's hidden row for it; the values do not matter to the kernels
+            const int32_t n_embd = llama_model_n_embd(model);
+            llama_batch bd = llama_batch_init((int32_t) n_slots, n_embd, (int32_t) n_slots);
+            bd.token = (llama_token *) malloc(sizeof(llama_token) * n_slots);
+            std::fill(bd.embd, bd.embd + (size_t) n_slots * n_embd, 0.01f);
+            std::vector<double> ts;
+            for (int r = 0; r < reps + 1; r++) {
+                common_batch_clear(bd);
+                for (uint32_t s = 0; s < n_slots; s++) {
+                    common_batch_add(bd, token_at(4000 + r * n_slots + s), (llama_pos) r, { (llama_seq_id) s }, true);
+                }
+                const double t = time_decode(ctx_mtp, bd);
+                if (t >= 0) {
+                    ts.push_back(t);
+                }
+            }
+            vr.t_draft_us = median_after_warmup(ts);
+            free(bd.token);
+            bd.token = nullptr;
+            llama_batch_free(bd);
+        }
+        std::string by_depth;
+        for (uint32_t d = 1; d <= d_max; d++) {
+            by_depth += string_format(" d=%u %.0f", d, vr.t_verify_us[d]);
+        }
+        LOG_INF("%s: timed drafting: plain step %.0f us, draft decode %.0f us, verification of 1+d rows:%s us\n", __func__,
+            vr.t_step_plain_us, vr.t_draft_us, by_depth.c_str());
+    }
     vr.t_run_s = (ggml_time_us() - t1) * 1e-6;
     if (probe.n_samples > 0) {
         vr.expert_coverage  = probe.sum_share / probe.n_samples;
@@ -316,6 +408,13 @@ void fit_advisor_validate_print(const fit_advisor_validate_result & vr) {
     }
     printf("\nvalidation by a real load: %u prompt tokens + %u generation steps, load %.1f s, run %.1f s\n",
         vr.n_prompt_tokens, vr.n_gen_steps, vr.t_load_s, vr.t_run_s);
+    if (vr.t_draft_us > 0) {
+        printf("drafting timed: plain step %.1f ms, draft decode %.2f ms per token, verification step by draft depth:", vr.t_step_plain_us * 1e-3, vr.t_draft_us * 1e-3);
+        for (size_t d = 1; d < vr.t_verify_us.size(); d++) {
+            printf(" %zu: %.1f", d, vr.t_verify_us[d] * 1e-3);
+        }
+        printf(" ms\n");
+    }
     if (vr.coverage_samples > 0) {
         printf("expert coverage: a %u-token ubatch routes to %.0f%% of a layer's experts on average (%u layer samples); "
                "that share of each CPU-resident expert stack is copied per ubatch\n",
