@@ -771,7 +771,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     };
 
     int n_improvements = 0;
-    int n_single_tried = 0, n_single_accepted = 0, n_rehome_tried = 0, n_mtp_tried = 0, n_offload_tried = 0, n_attn_tried = 0;
+    int n_single_tried = 0, n_single_accepted = 0, n_rehome_tried = 0, n_mtp_tried = 0, n_offload_tried = 0, n_attn_tried = 0, n_exchange_tried = 0;
     const double T0 = std::max(1.0, 0.005 * std::fabs(cur.cost_score));
     const double T1 = std::max(0.01, 0.00002 * std::fabs(cur.cost_score));
     const int iters = std::max(0, opts.anneal_iters);
@@ -868,6 +868,54 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
                 nxt.alloc.tensor_device[i] = on_home ? new_home.tensor_device[i] : fit_advisor_allocation::DEV_CPU;
             }
             nxt.alloc.layers_per_device = part;
+        } else if (mv < 0.9525 && nd > 1 && nxt.alloc.draft_mtp && inv.n_layer_nextn > 0) {
+            // the draft layers and the output head to another device, with the partition boundary of that device
+            // shifted so that as many trunk layers leave it as their bytes need: the head's verification rows and the
+            // draft decodes on a fast card pay for a layer or two on a slower one, and the move cannot be made one
+            // layer at a time because the first half does not fit
+            const uint32_t n_layer_all = S.n_layer_all;
+            const int h = nxt.alloc.layer_device(inv.n_layer, n_layer_all);
+            if (h == fit_advisor_allocation::DEV_CPU) continue;
+            const int d = (int) ((h + 1 + (size_t) (uni(rng) * (nd - 1)) % (nd - 1)) % nd);
+            std::vector<int64_t> over;
+            const bool known = S.memory_over(nxt.alloc, nxt.wl, over);
+            size_t moving = 0; // bytes the draft layers and the head bring to d
+            for (size_t i = 0; i < inv.tensors.size(); i++) {
+                const auto & t = inv.tensors[i];
+                const bool of_draft = t.layer >= (int32_t) inv.n_layer || t.kind == FIT_ADVISOR_TENSOR_OUTPUT || t.kind == FIT_ADVISOR_TENSOR_GLOBAL;
+                if (of_draft && nxt.alloc.tensor_device[i] != d && nxt.alloc.tensor_device[i] == nxt.alloc.layer_device(t.layer >= 0 ? (uint32_t) t.layer : n_layer_all, n_layer_all)) {
+                    moving += t.nbytes;
+                }
+            }
+            for (uint32_t il = inv.n_layer; il <= n_layer_all; il++) {
+                nxt.alloc = nxt.alloc.with_layer_home(inv, il, d);
+            }
+            // shift the boundary of d towards its neighbour until the bytes fit, at most a few layers
+            int64_t slack = known && (size_t) d < over.size() ? -over[d] - (int64_t) (64 * UNIT) : 0;
+            for (int k = 0; k < 4 && slack < (int64_t) moving; k++) {
+                std::vector<uint32_t> part = nxt.alloc.layers_per_device;
+                const bool to_right = (size_t) d + 1 < nd;
+                const size_t nb = to_right ? (size_t) d + 1 : (size_t) d - 1;
+                if (part[d] <= 1) break;
+                // the layer at d's edge next to the neighbour leaves: its tensors on d are the bytes freed
+                uint32_t first = (uint32_t) n_layer_all + 1 - nxt.alloc.n_gpu_layers();
+                for (size_t e = 0; e < (size_t) d; e++) first += part[e];
+                const uint32_t il_edge = to_right ? first + part[d] - 1 : first;
+                int64_t freed = 0;
+                for (size_t i = 0; i < inv.tensors.size(); i++) {
+                    if (inv.tensors[i].layer == (int32_t) il_edge && nxt.alloc.tensor_device[i] == d) freed += inv.tensors[i].nbytes;
+                }
+                part[d]--; part[nb]++;
+                fit_advisor_allocation old_home = fit_advisor_allocation::from_layer_split(inv, device_bufts, nxt.alloc.layers_per_device, opts.n_ctx, nxt.alloc.n_slots, nxt.alloc.layer_home);
+                fit_advisor_allocation new_home = fit_advisor_allocation::from_layer_split(inv, device_bufts, part, opts.n_ctx, nxt.alloc.n_slots, nxt.alloc.layer_home);
+                for (size_t i = 0; i < inv.tensors.size(); i++) {
+                    const bool on_home = nxt.alloc.tensor_device[i] == old_home.tensor_device[i];
+                    nxt.alloc.tensor_device[i] = on_home ? new_home.tensor_device[i] : fit_advisor_allocation::DEV_CPU;
+                }
+                nxt.alloc.layers_per_device = part;
+                slack += freed;
+            }
+            n_exchange_tried++;
         } else if (mv < 0.955 && nd > 1) {
             // re-home one whole layer on another device: its KV cache, state and pinned ops go with it (-old).
             // MTP layers and the output layer sit at the end of the numbering, so they get half the draws
@@ -1002,8 +1050,8 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         }
     }
 
-    LOG_INF("%s: annealing: %d accepted of %d, %d single-tensor moves, %d layer re-homes, %d drafting toggles, %d offload threshold steps and %d attention toggles proposed, %d model improvements over the seed\n", __func__,
-        accepted, iters, n_single_tried, n_rehome_tried, n_mtp_tried, n_offload_tried, n_attn_tried, n_improvements);
+    LOG_INF("%s: annealing: %d accepted of %d, %d single-tensor moves, %d layer re-homes, %d draft-layer exchanges, %d drafting toggles, %d offload threshold steps and %d attention toggles proposed, %d model improvements over the seed\n", __func__,
+        accepted, iters, n_single_tried, n_rehome_tried, n_exchange_tried, n_mtp_tried, n_offload_tried, n_attn_tried, n_improvements);
     GGML_UNUSED(n_single_accepted);
 
     // fill: from the incumbent, everything CPU-resident that the full model says pays for itself, on any device. the
