@@ -848,6 +848,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    bool op_offload_local; // prefer the backend holding the op's activations as the offload target
 
     int debug;
 
@@ -986,12 +987,11 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
-                    // prefer the backend that already holds the op's activations: the weights are copied there once per
-                    // batch either way, and the activations then need no copies at all. with several devices this keeps
-                    // the offloaded work of a layer on the layer's own device instead of piling it on the first one
-                    // (with everything on the first device, a four-card placement with CPU-resident experts could
-                    // not even allocate its compute buffers there)
-                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    // optionally prefer the backend that already holds the op's activations: the weights are copied
+                    // there once per batch either way, and the activations then need no copies at all. with several
+                    // devices this keeps the offloaded work of a layer on the layer's own device instead of piling it
+                    // on the first one (see ggml_backend_sched_set_op_offload_local for when that pays)
+                    for (int j = 0; j < GGML_MAX_SRC && sched->op_offload_local; j++) {
                         struct ggml_tensor * act = tensor->src[j];
                         if (act == NULL || act == src || (act->buffer != NULL && act->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
                             continue;
@@ -1951,6 +1951,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+    sched->op_offload_local = false;
 
     ggml_backend_sched_reset(sched);
 
@@ -2010,6 +2011,11 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_backend_sched_split_graph(sched, measure_graph);
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+}
+
+void ggml_backend_sched_set_op_offload_local(ggml_backend_sched_t sched, bool local) {
+    GGML_ASSERT(sched);
+    sched->op_offload_local = local;
 }
 
 void ggml_backend_sched_get_scratch_sizes(ggml_backend_sched_t sched, size_t * sizes, bool * unknown) {

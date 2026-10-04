@@ -56,6 +56,17 @@ std::vector<fit_advisor_passthrough_option> fit_advisor_passthrough(const common
         const char * v = cand.flash_attn ? "on" : "off";
         ret.push_back({ "LLAMA_ARG_FLASH_ATTN", v, std::string("-fa ") + v });
     }
+    if (cand.tensor_split.size() > 1) {
+        // the per-device offload thresholds, always spelled out with several devices: the plan was priced with an
+        // offloaded op running on its layer's own device, which the server only does when given per-device values
+        std::string v;
+        for (size_t d = 0; d < cand.tensor_split.size(); d++) {
+            const int32_t t = d < cand.op_offload_min_batch_dev.size() && cand.op_offload_min_batch_dev[d] > 0
+                ? cand.op_offload_min_batch_dev[d] : fit_advisor_default_op_offload();
+            v += (d ? "," : "") + (t >= LLAMA_OP_OFFLOAD_NEVER ? std::string("never") : t <= 0 ? std::string("default") : std::to_string(t));
+        }
+        ret.push_back({ "LLAMA_ARG_OP_OFFLOAD_MIN_BATCH", v, "--op-offload-min-batch " + v });
+    }
     if (params.cpuparams.n_threads != defaults.cpuparams.n_threads && params.cpuparams.n_threads > 0) {
         const std::string v = std::to_string(params.cpuparams.n_threads);
         ret.push_back({ "LLAMA_ARG_THREADS", v, "-t " + v });

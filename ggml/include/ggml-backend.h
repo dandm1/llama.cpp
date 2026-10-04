@@ -331,6 +331,13 @@ extern "C" {
     // split graph, the maximum over its nodes since scratch is released after every op; unknown[i] is set when some node
     // on backend i had no estimate. sizes and unknown need one entry per backend
     GGML_API void                 ggml_backend_sched_get_scratch_sizes(ggml_backend_sched_t sched, size_t * sizes, bool * unknown);
+
+    // offload target for an op on a host-resident weight: by default the first backend that wants it. with local = true
+    // the backend that already holds the op's activations is preferred when it wants the op, which keeps a layer's
+    // offloaded work on the layer's own device. that pays when every device with layers is fast (two equal cards: +14%
+    // prompt rate measured) and costs when layers sit on a slow device (a 3060 behind a slow link: -59%), so it is for
+    // callers that set per-device offload thresholds and can make a slow device decline
+    GGML_API void                 ggml_backend_sched_set_op_offload_local(ggml_backend_sched_t sched, bool local);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
