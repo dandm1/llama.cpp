@@ -314,6 +314,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             bool ok = false;
             std::vector<std::string> names;
             std::vector<int64_t> free, margin, scratch, compute_layers, compute_copies, compute_store;
+            std::vector<int64_t> copies_ref_bytes; // per card: the largest weight copied to it in the all-on-CPU probe
             int64_t ctx_per_layer = 0;
             int64_t host_ctx_per_layer = 0;
             uint32_t n_ctx_train = 0;
@@ -350,6 +351,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             if (!p1.ok) return m;
             m.names.resize(nd); m.free.assign(nd, 0); m.margin.assign(nd, 0); m.scratch.assign(nd, 0);
             m.compute_layers.assign(nd, 0); m.compute_copies.assign(nd, 0); m.compute_store.assign(nd, -1);
+            m.copies_ref_bytes.assign(nd, 0);
             m.n_ctx_train = p1.n_ctx_train;
             std::vector<uint32_t> per; uint32_t on_cpu;
             layers_on(a1, per, on_cpu);
@@ -366,7 +368,12 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             // every movable group on the CPU: the copies the cards hold for them
             fit_advisor_allocation b1 = a1;
             for (const auto & g : S.build_groups(a1, wl1)) {
-                for (const size_t i : g.idx) b1.tensor_device[i] = fit_advisor_allocation::DEV_CPU;
+                for (const size_t i : g.idx) {
+                    b1.tensor_device[i] = fit_advisor_allocation::DEV_CPU;
+                    if (g.home >= 0 && (size_t) g.home < nd) {
+                        m.copies_ref_bytes[g.home] = std::max<int64_t>(m.copies_ref_bytes[g.home], (int64_t) inv.tensors[i].nbytes);
+                    }
+                }
             }
             const fit_advisor_projection & pb = S.probe_alloc(b1, cell_name(part, ub, slots) + (draft ? "-mtp" : "") + "-cpu");
             if (pb.ok) {
@@ -421,14 +428,18 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             pj.n_ctx_train = m.n_ctx_train;
             std::vector<uint32_t> per; uint32_t on_cpu;
             layers_on(a, per, on_cpu);
-            std::vector<size_t> weights(nd, 0);
-            bool cpu_offload = false;
+            std::vector<size_t>  weights(nd, 0);
+            std::vector<int64_t> copied(nd, 0); // per card: the largest CPU-resident weight of a layer it runs
             for (size_t i = 0; i < inv.tensors.size() && i < a.tensor_device.size(); i++) {
                 const auto & t = inv.tensors[i];
                 if (t.layer >= (int32_t) inv.n_layer && !a.draft_mtp) continue;
                 const int d = a.tensor_device[i];
-                if (d >= 0 && (size_t) d < nd) weights[d] += t.nbytes;
-                else if (t.layer >= 0 && a.layer_device((uint32_t) t.layer, n_layer_all) >= 0) cpu_offload = true;
+                if (d >= 0 && (size_t) d < nd) {
+                    weights[d] += t.nbytes;
+                } else if (t.layer >= 0) {
+                    const int home = a.layer_device((uint32_t) t.layer, n_layer_all);
+                    if (home >= 0 && (size_t) home < nd) copied[home] = std::max<int64_t>(copied[home], (int64_t) t.nbytes);
+                }
             }
             pj.devices.resize(nd);
             for (size_t d = 0; d < nd; d++) {
@@ -438,7 +449,10 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
                 pd.margin  = m.margin[d];
                 pd.model   = weights[d];
                 pd.context = (size_t) (m.ctx_per_layer * per[d]);
-                pd.compute = per[d] > 0 ? (size_t) (m.compute_layers[d] + (cpu_offload ? m.compute_copies[d] : 0))
+                // the copies a card holds for weights it pulls from the CPU at the prompt batch grow with the largest
+                // such weight, not with their number: the compute buffer reuses the slot. scaled from the all-on-CPU probe
+                const double copy_share = copied[d] > 0 && m.copies_ref_bytes[d] > 0 ? std::min(1.0, (double) copied[d] / (double) m.copies_ref_bytes[d]) : 0.0;
+                pd.compute = per[d] > 0 ? (size_t) (m.compute_layers[d] + copy_share * m.compute_copies[d])
                                         : (weights[d] > 0 ? (size_t) m.compute_store[d] : 0);
                 pd.scratch = (size_t) m.scratch[d];
             }
