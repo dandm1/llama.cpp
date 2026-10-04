@@ -250,8 +250,30 @@ double fit_advisor_hop_us(const fit_advisor_inventory & inv, const std::vector<f
     }
     const fit_advisor_pair_rate & r = pairs[a][b];
     const double bytes = (double) batch * inv.n_embd * sizeof(float);
-    const double launch = devices[b].meas ? devices[b].meas->launch_us : 0;
-    return r.latency_us + (r.gb_s > 0 ? bytes / (r.gb_s * 1e9) * 1e6 : 0) + launch;
+    if (r.split_n_batch_pp > 0) {
+        // measured through the scheduler: one crossing per hop, plus bandwidth for the larger activation
+        const bool pp = batch > 4;
+        const double split = pp ? r.split_us_bpp : r.split_us_b1;
+        const double extra = pp ? std::max(0.0, bytes - (double) r.split_bytes_bpp) : 0;
+        return split + (r.gb_s > 0 ? extra / (r.gb_s * 1e9) * 1e6 : 0);
+    }
+    // no measurement for the pair: the copy's latency and bandwidth. a launch term was tried here and overpriced
+    // CPU excursions twentyfold against what the scheduler measured; the pipeline hides the launch
+    return r.latency_us + (r.gb_s > 0 ? bytes / (r.gb_s * 1e9) * 1e6 : 0);
+}
+
+double fit_advisor_excursion_us(const fit_advisor_inventory & inv, const std::vector<fit_advisor_cost_device> & devices,
+                                const fit_advisor_pair_table & pairs, int home, int dev, uint32_t batch) {
+    const size_t a = home < 0 ? devices.size() - 1 : (size_t) home;
+    const size_t b = dev  < 0 ? devices.size() - 1 : (size_t) dev;
+    if (a == b) {
+        return 0;
+    }
+    if (a < pairs.size() && b < pairs[a].size() && pairs[a][b].excursion_us_b1 > 0) {
+        const fit_advisor_pair_rate & r = pairs[a][b];
+        return batch > 4 && r.excursion_us_bpp > 0 ? r.excursion_us_bpp : r.excursion_us_b1;
+    }
+    return fit_advisor_hop_us(inv, devices, pairs, home, dev, batch) + fit_advisor_hop_us(inv, devices, pairs, dev, home, batch);
 }
 
 double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
@@ -470,8 +492,8 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             while (j + 1 < aways.size() && aways[j + 1].dev == aways[k].dev && aways[j + 1].node_idx <= aways[j].node_idx + 2) {
                 j++;
             }
-            // the activation there and back, plus the measured per-split extra and the op's own bytes over the link
-            boundary += hop_us(aways[k].home, aways[k].dev) + hop_us(aways[k].dev, aways[k].home) + wl.split_extra_us;
+            // the excursion as measured for the pair (or two hops), plus the per-split extra and the op's own bytes
+            boundary += fit_advisor_excursion_us(inv, devices, pairs, aways[k].home, aways[k].dev, batch) + wl.split_extra_us;
             n_splits_last++;
             const size_t a = aways[k].home < 0 ? devices.size() - 1 : (size_t) aways[k].home;
             const size_t b = aways[k].dev  < 0 ? devices.size() - 1 : (size_t) aways[k].dev;

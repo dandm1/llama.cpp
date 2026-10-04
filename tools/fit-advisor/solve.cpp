@@ -84,13 +84,10 @@ fit_advisor_solve_result fit_advisor_solve_placement(const fit_advisor_solve_inp
         if (dev == home) {
             return 0;
         }
-        auto round_trip = [&](uint32_t batch) {
-            return fit_advisor_hop_us(inv, devices, *in.pairs, home, dev, batch) + fit_advisor_hop_us(inv, devices, *in.pairs, dev, home, batch);
-        };
-        const double gen = round_trip(batch_ver) + wl.split_extra_us;
+        const double gen = fit_advisor_excursion_us(inv, devices, *in.pairs, home, dev, batch_ver) + wl.split_extra_us;
         double pp = 0;
         if (dev >= 0) {
-            pp = round_trip(n_ub) + wl.split_extra_us;
+            pp = fit_advisor_excursion_us(inv, devices, *in.pairs, home, dev, n_ub) + wl.split_extra_us;
         }
         return n_gen * gen + n_pp * pp;
     };
