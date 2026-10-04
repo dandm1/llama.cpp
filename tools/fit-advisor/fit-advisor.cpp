@@ -11,6 +11,7 @@
 #include "probe.h"
 #include "search.h"
 #include "validate.h"
+#include "options.h"
 
 #include "arg.h"
 #include "common.h"
@@ -32,6 +33,8 @@
 
 // satisfies -Wmissing-declarations
 int llama_fit_advisor(int argc, char ** argv);
+
+static fit_advisor_options g_opts; // the advisor's own options, parsed before the common ones
 
 // the user's op offload thresholds as a per-device list (empty when everything is at the default)
 static std::vector<int32_t> user_offload_dev(const common_params & params) {
@@ -376,11 +379,11 @@ static void print_layer_costs(const fit_advisor_inventory & inv, const std::vect
 }
 
 static void emit_if_requested(const common_params & params, const fit_advisor_candidate & cand, const char * what) {
-    if (params.fit_advisor_emit_ini.empty()) {
+    if (g_opts.emit_ini.empty()) {
         return;
     }
-    std::string name = params.fit_advisor_emit_name;
-    if (name.empty()) {
+    std::string name;
+    {
         name = params.model.path;
         const size_t slash = name.find_last_of("/\\");
         if (slash != std::string::npos) {
@@ -391,7 +394,7 @@ static void emit_if_requested(const common_params & params, const fit_advisor_ca
             name = name.substr(0, dot);
         }
     }
-    const fit_advisor_emit_result er = fit_advisor_emit_ini(params.fit_advisor_emit_ini, name, params.model.path, cand, params.n_batch,
+    const fit_advisor_emit_result er = fit_advisor_emit_ini(g_opts.emit_ini, name, params.model.path, cand, params.n_batch,
                                                             fit_advisor_passthrough(params, cand));
     if (er.ok) {
         LOG_INF("%s: wrote the %s allocation as section [%s] to %s and verified it reloads unchanged\n", __func__, what, er.section.c_str(), er.path.c_str());
@@ -409,7 +412,7 @@ static fit_advisor_search_result search_and_report(const common_params & params,
                                                    const std::vector<std::string> & device_bufts, const fit_advisor_graph_profile & gp,
                                                    const std::vector<fit_advisor_cost_device> & cost_devs, const fit_advisor_pair_table & pair_table,
                                                    const fit_advisor_workload & wl, const fit_advisor_search_options & sopts) {
-    LOG_INF("%s: searching allocations (%d annealing iterations) ...\n", __func__, sopts.anneal_iters);
+    LOG_INF("%s: searching allocations ...\n", __func__);
     const int64_t t_search0 = ggml_time_us();
     const fit_advisor_search_result sr = fit_advisor_search(inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts);
     const double t_search = (ggml_time_us() - t_search0) * 1e-6;
@@ -417,8 +420,8 @@ static fit_advisor_search_result search_and_report(const common_params & params,
         LOG_WRN("%s: search found no feasible allocation\n", __func__);
         return sr;
     }
-    LOG_INF("%s: search done in %.1f s: %d seed cells, %d probes, %d annealing moves accepted\n", __func__,
-        t_search, sr.n_cells, sr.n_probes, sr.n_anneal_accepted);
+    LOG_INF("%s: search done in %.1f s: %d keys, %d solves, %d probes\n", __func__,
+        t_search, sr.n_cells, sr.n_solves, sr.n_probes);
     common_log_flush(common_log_main());
 
     printf("\nbest allocation: %s\n", sr.name.c_str());
@@ -450,7 +453,7 @@ static fit_advisor_search_result search_and_report(const common_params & params,
         printf("  drafting ON at depth %u: verification batch of %u, MTP draft run %.0f us x %u, %.2f tokens per step\n",
             sr.cost.mtp_draft_n, 1 + sr.cost.mtp_draft_n, sr.cost.t_mtp_draft_us, sr.cost.mtp_draft_n, sr.cost.tokens_per_step);
         print_by_depth();
-    } else if (inv.n_layer_nextn > 0 && params.fit_advisor_mtp) {
+    } else if (inv.n_layer_nextn > 0 && g_opts.mtp) {
         printf("  drafting OFF: the MTP layers are not loaded; drafting was priced on every allocation and did not pay\n");
         if (!sr.cost.mtp_depth_tok_s.empty()) {
             print_by_depth();
@@ -524,7 +527,14 @@ int llama_fit_advisor(int argc, char ** argv) {
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_FIT_ADVISOR)) {
+    {
+        std::string error;
+        if (!fit_advisor_parse_options(argc, argv, g_opts, error)) {
+            fprintf(stderr, "error: %s\n", error.c_str());
+            return 1;
+        }
+    }
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_FIT_ADVISOR, fit_advisor_print_usage)) {
         return 1;
     }
 
@@ -545,7 +555,7 @@ int llama_fit_advisor(int argc, char ** argv) {
 
     // CPU-resident weights go to a pinned host buffer type when asked; the name comes from the first device that has one
     std::string cpu_buft = "CPU";
-    if (params.fit_advisor_pin_cpu_weights) {
+    if (g_opts.pin_cpu_weights) {
         for (size_t i = 0; i < ggml_backend_dev_count() && cpu_buft == "CPU"; i++) {
             if (ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(ggml_backend_dev_get(i))) {
                 cpu_buft = ggml_backend_buft_name(hb);
@@ -558,7 +568,6 @@ int llama_fit_advisor(int argc, char ** argv) {
         }
     }
     fit_advisor_allocation::default_cpu_buft = cpu_buft;
-
 
     fit_advisor_inventory inv;
     try {
@@ -575,7 +584,7 @@ int llama_fit_advisor(int argc, char ** argv) {
                                    params.speculative.types.end());
     if (inv.n_layer_nextn == 0) {
         LOG_INF("%s: the model has no MTP layers, drafting is not considered\n", __func__);
-    } else if (!params.fit_advisor_mtp) {
+    } else if (!g_opts.mtp) {
         LOG_INF("%s: --no-mtp: the model's %u MTP layer(s) are not loaded and drafting is not considered\n", __func__, inv.n_layer_nextn);
     } else {
         params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
@@ -625,17 +634,7 @@ int llama_fit_advisor(int argc, char ** argv) {
     print_table(cands, probe, params.n_batch, params);
     LOG_INF("%s: %zu probes executed\n", __func__, probe.n_probes);
 
-    if (params.fit_advisor_verify) {
-        LOG_INF("%s: verifying that the loader honours each allocation ...\n", __func__);
-        int n_bad_total = 0;
-        for (const auto & na : allocs) {
-            const int n_bad = fit_advisor_verify_allocation(params, inv, na.alloc, device_bufts, na.alloc.to_candidate(inv, device_bufts, na.name));
-            n_bad_total += std::max(0, n_bad);
-        }
-        LOG_INF("%s: verification done, %d misplaced tensors in total\n", __func__, n_bad_total);
-    }
-
-    if (params.fit_advisor_no_measure) {
+    if (g_opts.no_measure) {
         emit_if_requested(params, cands[1], "built-in fitter's");
         return 0;
     }
@@ -643,21 +642,6 @@ int llama_fit_advisor(int argc, char ** argv) {
     // measure the devices for the types this model actually uses
     fit_advisor_measure_options mopts;
     mopts.weight_types = inv.matmul_types(0); // every type present, so no op is ever priced from nothing
-    for (const auto & name : string_split<std::string>(params.fit_advisor_measure_types, ',')) {
-        bool found = false;
-        for (int t = 0; t < GGML_TYPE_COUNT && !found; t++) {
-            const char * tn = ggml_type_name((ggml_type) t);
-            if (tn && name == tn) {
-                if (std::find(mopts.weight_types.begin(), mopts.weight_types.end(), (ggml_type) t) == mopts.weight_types.end()) {
-                    mopts.weight_types.push_back((ggml_type) t);
-                }
-                found = true;
-            }
-        }
-        if (!found) {
-            LOG_WRN("%s: --measure-types: unknown type '%s' ignored\n", __func__, name.c_str());
-        }
-    }
     mopts.kv_types     = { params.cache_type_k };
     if (params.cache_type_v != params.cache_type_k) {
         mopts.kv_types.push_back(params.cache_type_v);
@@ -700,7 +684,7 @@ int llama_fit_advisor(int argc, char ** argv) {
     const std::vector<ggml_backend_dev_t> devs = devices_to_measure(proj0);
     std::vector<const fit_advisor_device_measurements *> meas;
     for (const auto & dev : devs) {
-        meas.push_back(&cache.ensure(dev, mopts, params.fit_advisor_remeasure));
+        meas.push_back(&cache.ensure(dev, mopts, g_opts.remeasure));
     }
     for (const auto * m : meas) {
         fit_advisor_measurements_print(*m);
@@ -726,22 +710,22 @@ int llama_fit_advisor(int argc, char ** argv) {
 
     // cost of every allocation under the workload
     fit_advisor_workload wl = [&]() {
-        fit_advisor_workload w = fit_advisor_workload::preset(params.fit_advisor_workload);
+        fit_advisor_workload w = fit_advisor_workload::preset(g_opts.workload);
         w.n_ubatch = (uint32_t) params.n_ubatch;
         w.use_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
                                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-        w.expert_coverage    = params.fit_advisor_expert_coverage;
-        w.pinned_cpu_weights = params.fit_advisor_pin_cpu_weights;
+        w.expert_coverage    = g_opts.expert_coverage;
+        w.pinned_cpu_weights = g_opts.pin_cpu_weights;
         w.op_offload_min_batch     = params.op_offload_min_batch;
         w.op_offload_min_batch_dev = params.op_offload_min_batch_dev;
         w.mtp_trained_depth = std::max<uint32_t>(1, inv.n_layer_nextn);
-        w.mtp_accept  = params.fit_advisor_mtp_accept;
-        w.mtp_decay   = params.fit_advisor_mtp_decay;
+        w.mtp_accept  = g_opts.mtp_accept;
+        w.mtp_decay   = g_opts.mtp_decay;
         return w;
     }();
 
     // transfers between every pair of devices, and the model's op counts per layer
-    cache.ensure_pairs(devs, mopts.n_threads, params.fit_advisor_remeasure);
+    cache.ensure_pairs(devs, mopts.n_threads, g_opts.remeasure);
 
     std::vector<std::string> tensor_names;
     for (const auto & t : inv.tensors) {
@@ -806,7 +790,7 @@ int llama_fit_advisor(int argc, char ** argv) {
     }
 
     printf("\nestimated cost per request, workload '%s': %u prompt + %u generated tokens, %u concurrent, ubatch %u\n",
-        params.fit_advisor_workload.c_str(), wl.prompt_tokens, wl.gen_tokens, wl.concurrency, wl.n_ubatch);
+        g_opts.workload.c_str(), wl.prompt_tokens, wl.gen_tokens, wl.concurrency, wl.n_ubatch);
     if (wl.use_mtp) {
         printf("  MTP drafting allowed: %.0f%% acceptance per draft position up to the trained depth %u (--mtp-accept), decaying by %.2f "
                "per position beyond it (--mtp-decay); the search chooses drafting and its depth per allocation (--no-mtp disables)\n",
@@ -865,14 +849,10 @@ int llama_fit_advisor(int argc, char ** argv) {
         sopts.n_ctx = ctx;
     }
     sopts.max_slots    = wl.concurrency;
-    sopts.anneal       = params.fit_advisor_anneal;
-    sopts.anneal_iters = params.fit_advisor_search_iters;
     sopts.base_flash_attn    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO ? -1 : params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ? 1 : 0;
     sopts.base_no_kv_offload = params.no_kv_offload;
-    sopts.search_flash_attn  = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO; // an explicit -fa is obeyed
-    sopts.search_kv_offload  = !params.no_kv_offload;                                 // an explicit -nkvo is obeyed
     sopts.ubatch_options.clear();
-    for (const auto & v : string_split<std::string>(params.fit_advisor_search_ubatch, ',')) {
+    for (const auto & v : string_split<std::string>(g_opts.search_ubatch, ',')) {
         const int ub = std::atoi(v.c_str());
         if (ub <= 0) {
             LOG_ERR("%s: --search-ubatch: '%s' is not a positive integer\n", __func__, v.c_str());
@@ -889,9 +869,9 @@ int llama_fit_advisor(int argc, char ** argv) {
         return 0;
     }
 
-    if (params.fit_advisor_validate) {
-        const uint32_t n_tokens = (uint32_t) std::max(0, params.fit_advisor_validate_tokens);
-        fit_advisor_validate_result vr = fit_advisor_validate(params, sr.cand, sr.proj, n_tokens);
+    if (g_opts.validate) {
+        const uint32_t n_tokens = 0; // two ubatches
+        fit_advisor_validate_result vr = fit_advisor_validate(params, sr.cand, sr.proj, n_tokens, g_opts.validate_prompt);
         fit_advisor_validate_print(vr);
         // the validation measures what the model missed on the allocation it validated; the search runs again with
         // that and the new allocation is validated in turn, for a few rounds, since a different allocation can
@@ -899,7 +879,7 @@ int llama_fit_advisor(int argc, char ** argv) {
         for (int round = 1; round <= 3; round++) {
             bool changed = false;
                 GGML_UNUSED(round);
-            if (vr.ok && vr.coverage_samples > 0 && params.fit_advisor_expert_coverage <= 0) {
+            if (vr.ok && vr.coverage_samples > 0 && g_opts.expert_coverage <= 0) {
                 // the copies were priced on an assumed share; the validation measured it on real text
                 const double assumed = wl.expert_coverage > 0 ? wl.expert_coverage : 0.6;
                 LOG_INF("%s: expert coverage measured at %.2f (assumed %.2f)\n", __func__, vr.expert_coverage, assumed);
@@ -1014,17 +994,12 @@ int llama_fit_advisor(int argc, char ** argv) {
                 break;
             }
             LOG_INF("%s: searching again with the validated margins, coverage, split and drafting costs (round %d) ...\n", __func__, round);
-            // the costs changed, the starting point is known good: walk on from the validated allocation with fewer moves
-            fit_advisor_search_options sopts_again = sopts;
-            sopts_again.warm_start     = sr.alloc;
-            sopts_again.has_warm_start = true;
-            sopts_again.anneal_iters   = std::max(1000, sopts.anneal_iters / 4);
-            fit_advisor_search_result sr2 = search_and_report(params, inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts_again);
+            fit_advisor_search_result sr2 = search_and_report(params, inv, probe, device_bufts, gp, cost_devs, pair_table, wl, sopts);
             if (!sr2.ok) {
                 LOG_WRN("%s: no feasible allocation with the validated costs, keeping the previous one\n", __func__);
                 break;
             }
-            fit_advisor_validate_result vr2 = fit_advisor_validate(params, sr2.cand, sr2.proj, n_tokens);
+            fit_advisor_validate_result vr2 = fit_advisor_validate(params, sr2.cand, sr2.proj, n_tokens, g_opts.validate_prompt);
             fit_advisor_validate_print(vr2);
             bool within = vr2.ok;
             for (size_t d = 0; d < vr2.devices.size() && within; d++) {
@@ -1037,10 +1012,6 @@ int llama_fit_advisor(int argc, char ** argv) {
             sr = sr2;
             vr = vr2;
         }
-    }
-
-    if (params.fit_advisor_verify) {
-        fit_advisor_verify_allocation(params, inv, sr.alloc, device_bufts, sr.cand);
     }
 
     emit_if_requested(params, sr.cand, "searched");

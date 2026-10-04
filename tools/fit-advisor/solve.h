@@ -17,6 +17,13 @@
 #include <string>
 #include <vector>
 
+// a movable unit: the expert tensors of a layer together, or one large measured tensor; home is its layer's device
+struct fit_advisor_group {
+    std::vector<size_t> idx;
+    size_t bytes = 0;
+    int    home  = 0;
+};
+
 struct fit_advisor_solve_input {
     const fit_advisor_inventory              * inv       = nullptr;
     const fit_advisor_graph_profile          * gp        = nullptr;
@@ -26,9 +33,11 @@ struct fit_advisor_solve_input {
     const std::vector<std::string>           * device_bufts = nullptr;
 
     fit_advisor_allocation base;        // the key: homes as the partition gives them, every tensor at its home
+    std::vector<fit_advisor_group> groups; // what may move, built by the search for this base
     std::vector<int64_t>   capacity;    // per allocation device: bytes the weights may take (free - overheads - margin - pad)
     bool   move_draft_block = false;    // the MTP layers and the output head may change home
-    double time_limit_s     = 20;
+    double time_limit_s     = 10;
+    const std::vector<double> * seed = nullptr; // a previous solution with the same groups and devices, as a start
 };
 
 struct fit_advisor_solve_result {
@@ -40,8 +49,7 @@ struct fit_advisor_solve_result {
     int    n_vars       = 0;
     double t_solve_s    = 0;
     bool   optimal      = false; // false: a feasible solution within the time limit, not proven optimal
+    std::vector<double> solution; // the variables at the solution, to seed the next solve of the same layout
 };
 
-// available when the tool was built with HiGHS (FIT_ADVISOR_HIGHS); otherwise ok = false with an error
-bool fit_advisor_solver_available();
 fit_advisor_solve_result fit_advisor_solve_placement(const fit_advisor_solve_input & in);

@@ -2,13 +2,12 @@
 
 // search over allocations
 //
-//   1. seed: for each grid cell (layer partition, ubatch, slots) an exact 0/1 knapsack per device by dynamic
-//      programming places each tensor on its layer's device or the CPU, maximising the request time saved under the
-//      device's capacity; the capacity comes from the memory probe of the resulting allocation and is refined by
-//      re-probing until stable
-//   2. simulated annealing from the best seed over the full state (tensor placement, partition, ubatch, slots), scored
-//      by the complete cost model plus a memory penalty from a probe-calibrated linear model; every improved incumbent
-//      is re-probed so the final answer is verified by the real loader
+// a memory model is built from a few probes up front (context per layer, the compute of a card that runs layers or
+// only holds stores, the copies a card holds for offloaded weights, scratch). then for every key (layer partition,
+// ubatch, slots, drafting) the placement of every movable group and the draft block is solved exactly as a
+// mixed-integer program for the modelled request time, the full cost model prices the solution, and the best key
+// wins. the partition is refined around it, the solution polished under the full cost model, and the chosen
+// allocation is the one probed through the real loader, re-solved if the probe finds a card over its margin.
 
 #include "allocation.h"
 #include "cost.h"
@@ -20,22 +19,11 @@
 
 struct fit_advisor_search_options {
     std::vector<uint32_t> ubatch_options = { 512, 1024, 2048 };
-    // op offload thresholds to try besides the devices' default (0); FIT_ADVISOR_OFFLOAD_NEVER keeps CPU weights on the CPU
-    std::vector<int32_t> offload_options = { 0, 16, 64, 128, FIT_ADVISOR_OFFLOAD_NEVER };
     uint32_t n_ctx      = 0;     // 0 = model default
-    std::vector<std::vector<uint32_t>> extra_partitions; // layers per device to seed from besides the generated ones (the fitter's split)
-    // warm start: the walk begins from this allocation instead of the seed grid (a re-search after validation, where
-    // the costs changed but the starting point is known good); empty = the seed grid
-    fit_advisor_allocation warm_start;
-    bool has_warm_start = false;
-    bool anneal = false; // use the simulated-annealing search even when the exact solver was built in
     uint32_t max_slots  = 1;     // from the workload's concurrency
-    int      anneal_iters = 20000;
-    uint32_t seed       = 42;
-    bool search_flash_attn    = true; // false when the user pinned -fa
-    bool search_kv_offload    = true; // false when the user pinned -nkvo
     int8_t base_flash_attn    = -1;   // the user's -fa
     bool   base_no_kv_offload = false;
+    std::vector<std::vector<uint32_t>> extra_partitions; // layers per device to seed from besides the generated ones (the fitter's split)
 };
 
 struct fit_advisor_search_result {
@@ -48,7 +36,7 @@ struct fit_advisor_search_result {
     fit_advisor_workload   wl;      // the workload with the chosen ubatch
     int n_probes = 0;
     int n_cells  = 0;
-    int n_anneal_accepted = 0;
+    int n_solves = 0;
     double seed_request_us = 0;    // the best DP seed, for reporting what annealing added
 };
 

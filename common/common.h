@@ -477,24 +477,6 @@ struct common_params {
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
-    bool    fit_advisor_remeasure  = false; // llama-fit-advisor: discard cached device measurements and measure again
-    bool    fit_advisor_no_measure = false; // llama-fit-advisor: skip device measurements, only project memory
-    std::string fit_advisor_measure_types;  // llama-fit-advisor: extra weight types to measure, comma-separated
-    bool    fit_advisor_verify     = false; // llama-fit-advisor: verify each candidate's placement through a no_alloc load
-    std::string fit_advisor_workload = "chat"; // llama-fit-advisor: workload preset to optimise for
-    int32_t fit_advisor_search_iters = 20000;  // llama-fit-advisor: simulated annealing iterations, 0 = seeds only
-    std::string fit_advisor_emit_ini;          // llama-fit-advisor: write the chosen allocation as a preset section to this INI file
-    std::string fit_advisor_emit_name;         // llama-fit-advisor: section name for the preset, default: the model file name
-    std::string fit_advisor_search_ubatch = "512,1024,2048"; // llama-fit-advisor: ubatch sizes the search may choose from
-    double  fit_advisor_expert_coverage = 0;   // llama-fit-advisor: share of experts a prompt ubatch touches, 0 = estimate
-    bool    fit_advisor_pin_cpu_weights = false; // llama-fit-advisor: place CPU-resident weights in the pinned host buffer type
-    bool    fit_advisor_mtp        = true;     // llama-fit-advisor: MTP drafting may be chosen when the model has MTP layers (--no-mtp)
-    bool    fit_advisor_anneal     = false;    // llama-fit-advisor: the simulated-annealing search instead of the exact solver
-    double  fit_advisor_mtp_accept = 0.75;     // llama-fit-advisor: assumed acceptance probability per drafted MTP token (GLM-5.3 measured ~0.72)
-    double  fit_advisor_mtp_decay  = 0.85;     // llama-fit-advisor: acceptance beyond the trained MTP depth is the base one times this factor
-    bool    fit_advisor_validate = false;      // llama-fit-advisor: load the chosen allocation for real and measure what the projection missed
-    int32_t fit_advisor_validate_tokens = 0;   // llama-fit-advisor: prompt tokens for the validation run, 0 = two ubatches
-    std::string fit_advisor_validate_prompt;   // llama-fit-advisor: text file the validation prompt is built from, default: a built-in paragraph
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);

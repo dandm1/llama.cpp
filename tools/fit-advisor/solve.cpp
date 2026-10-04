@@ -6,36 +6,11 @@
 #include <cmath>
 #include <map>
 
-#ifdef FIT_ADVISOR_HIGHS
 #include "Highs.h"
-#endif
-
-bool fit_advisor_solver_available() {
-#ifdef FIT_ADVISOR_HIGHS
-    return true;
-#else
-    return false;
-#endif
-}
-
-#ifndef FIT_ADVISOR_HIGHS
-fit_advisor_solve_result fit_advisor_solve_placement(const fit_advisor_solve_input & in) {
-    GGML_UNUSED(in);
-    fit_advisor_solve_result r;
-    r.error = "built without HiGHS";
-    return r;
-}
-#else
 
 namespace {
 
 constexpr int64_t UNIT = 1024 * 1024;
-
-struct group {
-    std::vector<size_t> idx;
-    size_t bytes = 0;
-    int    home  = 0; // allocation device of the group's layer
-};
 
 } // namespace
 
@@ -61,65 +36,38 @@ fit_advisor_solve_result fit_advisor_solve_placement(const fit_advisor_solve_inp
 
     const int64_t t0 = ggml_time_us();
 
-    // ---- what moves: the expert stacks of a layer as one group, every other large measured tensor on its own;
-    // the draft block (MTP layers and the output head) as a unit with its own home; everything else stays put
+    // ---- the groups come from the search; here the draft block (MTP layers and the output head) is gathered as a
+    // unit with its own home, and everything else that stays where the base puts it is counted per card
     auto counts = [&](size_t i) {
         return !(inv.tensors[i].layer >= (int32_t) inv.n_layer && !wl.use_mtp);
-    };
-    auto used = [&](size_t i) {
-        return i < gp.use_tg.size() && gp.use_tg[i].op != 0;
-    };
-    auto decidable = [&](size_t i, int home) {
-        if (i >= gp.use_tg.size() || i >= gp.use_pp.size()) {
-            return false;
-        }
-        const auto & t = inv.tensors[i];
-        return fit_advisor_tensor_cost_known(inv, t, gp.use_tg[i], home, devices)
-            && fit_advisor_tensor_cost_known(inv, t, gp.use_tg[i], fit_advisor_allocation::DEV_CPU, devices)
-            && fit_advisor_tensor_cost_known(inv, t, gp.use_pp[i], home, devices)
-            && fit_advisor_tensor_cost_known(inv, t, gp.use_pp[i], fit_advisor_allocation::DEV_CPU, devices);
     };
     auto of_draft_block = [&](size_t i) {
         const auto & t = inv.tensors[i];
         return t.layer >= (int32_t) inv.n_layer || t.kind == FIT_ADVISOR_TENSOR_OUTPUT || t.kind == FIT_ADVISOR_TENSOR_GLOBAL;
     };
-
-    std::vector<group> groups;
-    std::map<int32_t, group> exps_by_layer;
+    const std::vector<fit_advisor_group> & groups = in.groups;
+    std::vector<bool> in_group(inv.tensors.size(), false);
+    for (const auto & g : groups) {
+        for (const size_t i : g.idx) in_group[i] = true;
+    }
     std::vector<int64_t> fixed_bytes(nd, 0); // bytes of tensors that stay where the base puts them, per card
     std::vector<size_t>  block_idx;          // the draft block's tensors
     int64_t block_bytes = 0;
     const bool move_block = in.move_draft_block && wl.use_mtp && inv.n_layer_nextn > 0;
     for (size_t i = 0; i < inv.tensors.size(); i++) {
         const auto & t = inv.tensors[i];
-        if (!counts(i)) {
-            continue; // not loaded
+        if (!counts(i) || in_group[i]) {
+            continue;
         }
         if (move_block && of_draft_block(i)) {
             block_idx.push_back(i);
             block_bytes += (int64_t) t.nbytes;
             continue;
         }
-        const int home = t.layer >= 0 ? in.base.layer_device((uint32_t) t.layer, n_layer_all) : in.base.layer_device(n_layer_all, n_layer_all);
-        const bool movable = t.layer >= 0 && used(i) && t.nbytes >= (size_t) UNIT && home >= 0 && decidable(i, home);
-        if (!movable) {
-            const int d = in.base.tensor_device[i];
-            if (d >= 0 && (size_t) d < nd) {
-                fixed_bytes[d] += (int64_t) t.nbytes;
-            }
-            continue;
+        const int d = in.base.tensor_device[i];
+        if (d >= 0 && (size_t) d < nd) {
+            fixed_bytes[d] += (int64_t) t.nbytes;
         }
-        if (t.kind == FIT_ADVISOR_TENSOR_FFN_EXPS) {
-            auto & g = exps_by_layer[t.layer];
-            g.idx.push_back(i);
-            g.bytes += t.nbytes;
-            g.home = home;
-        } else {
-            groups.push_back({ { i }, t.nbytes, home });
-        }
-    }
-    for (auto & [il, g] : exps_by_layer) {
-        groups.push_back(g);
     }
     r.n_groups = (int) groups.size();
 
@@ -136,10 +84,13 @@ fit_advisor_solve_result fit_advisor_solve_placement(const fit_advisor_solve_inp
         if (dev == home) {
             return 0;
         }
-        const double gen = fit_advisor_excursion_us(inv, devices, *in.pairs, home, dev, batch_ver) + wl.split_extra_us;
+        auto round_trip = [&](uint32_t batch) {
+            return fit_advisor_hop_us(inv, devices, *in.pairs, home, dev, batch) + fit_advisor_hop_us(inv, devices, *in.pairs, dev, home, batch);
+        };
+        const double gen = round_trip(batch_ver) + wl.split_extra_us;
         double pp = 0;
         if (dev >= 0) {
-            pp = fit_advisor_excursion_us(inv, devices, *in.pairs, home, dev, n_ub) + wl.split_extra_us;
+            pp = round_trip(n_ub) + wl.split_extra_us;
         }
         return n_gen * gen + n_pp * pp;
     };
@@ -237,10 +188,19 @@ fit_advisor_solve_result fit_advisor_solve_placement(const fit_advisor_solve_inp
     Highs highs;
     highs.setOptionValue("output_flag", false);
     highs.setOptionValue("time_limit", in.time_limit_s);
-    highs.setOptionValue("mip_rel_gap", 1e-4);
+    // half a percent of the modelled request time is inside the model's own accuracy; proving the last tenth of a
+    // percent is what took tens of seconds per key on a large mixture of experts across four cards
+    highs.setOptionValue("mip_rel_gap", 5e-3);
     if (highs.passModel(model) != HighsStatus::kOk) {
         r.error = "HiGHS rejected the model";
         return r;
+    }
+    if (in.seed && (int) in.seed->size() == n_cols) {
+        // the previous key's solution as a starting point: neighbouring keys differ by a few layers
+        HighsSolution start;
+        start.col_value = *in.seed;
+        start.value_valid = true;
+        highs.setSolution(start);
     }
     const HighsStatus st = highs.run();
     const HighsModelStatus ms = highs.getModelStatus();
@@ -256,6 +216,7 @@ fit_advisor_solve_result fit_advisor_solve_placement(const fit_advisor_solve_inp
     }
     r.optimal      = ms == HighsModelStatus::kOptimal;
     r.objective_us = highs.getInfo().objective_function_value;
+    r.solution     = sol.col_value;
 
     // ---- the allocation
     r.alloc = in.base;
@@ -284,4 +245,3 @@ fit_advisor_solve_result fit_advisor_solve_placement(const fit_advisor_solve_inp
     r.ok = true;
     return r;
 }
-#endif

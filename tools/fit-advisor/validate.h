@@ -63,6 +63,6 @@ struct fit_advisor_validate_result {
 // n_prompt_tokens = 0 chooses two ubatches (or the whole per-slot context if smaller); the prompt is run in n_batch
 // pieces through the same decode path as the server, then n_gen_steps single-token steps on every slot
 fit_advisor_validate_result fit_advisor_validate(const common_params & params, const fit_advisor_candidate & cand,
-                                                 const fit_advisor_projection & proj, uint32_t n_prompt_tokens);
+                                                 const fit_advisor_projection & proj, uint32_t n_prompt_tokens, const std::string & prompt_file);
 
 void fit_advisor_validate_print(const fit_advisor_validate_result & vr);

@@ -3,7 +3,7 @@
 #include "common.h"
 #include "ggml-backend.h"
 #include "llama.h"
-#include "../../src/llama-ext.h"
+#include "../../src/llama-ext.h" // staging API: llama_model_n_expert, llama_get_memory_breakdown
 #include "log.h"
 #include "speculative.h"
 
@@ -140,7 +140,7 @@ static void read_free(std::vector<fit_advisor_validate_device> & devs, int64_t f
 }
 
 fit_advisor_validate_result fit_advisor_validate(const common_params & params, const fit_advisor_candidate & cand,
-                                                 const fit_advisor_projection & proj, uint32_t n_prompt_tokens) {
+                                                 const fit_advisor_projection & proj, uint32_t n_prompt_tokens, const std::string & prompt_file) {
     fit_advisor_validate_result vr;
     if (!proj.ok) {
         vr.error = "projection failed: " + proj.error;
@@ -222,7 +222,7 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     std::string prompt_source;
-    const std::vector<llama_token> prompt = validation_tokens(vocab, params.fit_advisor_validate_prompt, n_prompt_tokens + vr.n_gen_steps * n_slots + 16, prompt_source);
+    const std::vector<llama_token> prompt = validation_tokens(vocab, prompt_file, n_prompt_tokens + vr.n_gen_steps * n_slots + 16, prompt_source);
     probe.n_ubatch = n_ubatch;
     auto token_at = [&](uint32_t i) -> llama_token {
         return i < prompt.size() ? prompt[i] : (llama_token) ((i * 7919u + 17u) % (uint32_t) n_vocab);
