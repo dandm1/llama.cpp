@@ -81,9 +81,9 @@ struct fit_advisor_pair_rate {
     double latency_us = 0; // a small tensor, including synchronization
     double gb_s       = 0; // a large tensor
 
-    // cost of a scheduler split: a chain of ops on the source device with an excursion to the destination and back,
-    // measured through ggml_backend_sched so it includes the copies, the destination's graph compute and whatever the
-    // source loses around the split; microseconds per round trip, for a batch-1 and a prompt-sized activation
+    // cost of a scheduler split: one crossing of a chain of layer-sized ops from the source device to the destination,
+    // measured through ggml_backend_sched so it includes the copies, the destination's graph launch and the wait;
+    // microseconds per crossing, for a batch-1 and a prompt-sized activation
     double split_us_b1    = 0;
     double split_us_bpp   = 0;
     size_t split_bytes_bpp = 0; // activation bytes moved in the prompt-sized measurement

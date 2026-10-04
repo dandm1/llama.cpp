@@ -251,11 +251,11 @@ double fit_advisor_hop_us(const fit_advisor_inventory & inv, const std::vector<f
     const fit_advisor_pair_rate & r = pairs[a][b];
     const double bytes = (double) batch * inv.n_embd * sizeof(float);
     if (r.split_n_batch_pp > 0) {
-        // measured through the scheduler: half a round trip per hop, plus bandwidth for the larger activation
+        // measured through the scheduler: one crossing per hop, plus bandwidth for the larger activation
         const bool pp = batch > 4;
         const double split = pp ? r.split_us_bpp : r.split_us_b1;
         const double extra = pp ? std::max(0.0, bytes - (double) r.split_bytes_bpp) : 0;
-        return 0.5 * split + (r.gb_s > 0 ? extra / (r.gb_s * 1e9) * 1e6 : 0);
+        return split + (r.gb_s > 0 ? extra / (r.gb_s * 1e9) * 1e6 : 0);
     }
     const double launch = devices[b].meas ? devices[b].meas->launch_us : 0;
     return r.latency_us + (r.gb_s > 0 ? bytes / (r.gb_s * 1e9) * 1e6 : 0) + launch;

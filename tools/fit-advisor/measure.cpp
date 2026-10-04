@@ -797,7 +797,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
     }
     try {
         const json j = json::parse(f);
-        if (j.value("version", 0) != 6) {
+        if (j.value("version", 0) != 7) {
             LOG_WRN("%s: ignoring %s, unknown version\n", __func__, path.c_str());
             return false;
         }
@@ -825,7 +825,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
 
 std::string fit_advisor_measurements::to_json() const {
     json j;
-    j["version"] = 6;
+    j["version"] = 7;
     j["devices"] = json::object();
     for (const auto & [key, m] : devices) {
         j["devices"][key] = device_to_json(m);
@@ -979,7 +979,9 @@ void fit_advisor_measurements_print(const fit_advisor_device_measurements & m) {
 // time one scheduler round: a chain of n_ops tiny matmuls whose weights live on backend a, except every 4th which lives
 // on backend b; with n_b = 0 the whole chain is on a, with n_b = n_ops on b. returns microseconds per graph compute
 static double bench_sched_chain(ggml_backend_t ba, ggml_backend_t bb, int n_ops, int every, int batch, bool all_on_b) {
-    constexpr int64_t k = 256;
+    // layer-sized weights: a split in a real graph launches a captured graph of real kernels, waits on an event and
+    // copies its inputs; a chain of tiny ops measured a tenth of what a validated plan paid per split
+    constexpr int64_t k = 2048;
     ggml_init_params ip = { ggml_tensor_overhead() * (size_t) (n_ops + 8), nullptr, true };
     ggml_context * ctx_a = ggml_init(ip);
     ggml_context * ctx_b = ggml_init(ip);
@@ -988,7 +990,7 @@ static double bench_sched_chain(ggml_backend_t ba, ggml_backend_t bb, int n_ops,
 
     std::vector<ggml_tensor *> w(n_ops);
     for (int i = 0; i < n_ops; i++) {
-        const bool on_b = all_on_b || (every > 0 && i % every == every - 1);
+        const bool on_b = all_on_b || (every > 0 && (i / every) % 2 == 1); // blocks of `every` ops alternate devices
         w[i] = ggml_new_tensor_2d(on_b ? ctx_b : ctx_a, GGML_TYPE_F16, k, k);
         ggml_format_name(w[i], "w%d", i);
     }
@@ -1065,18 +1067,20 @@ static double bench_sched_chain(ggml_backend_t ba, ggml_backend_t bb, int n_ops,
 }
 
 // per-split round trip a -> b -> a at a batch size: the mixed chain minus what its ops cost on their own devices
+// microseconds one crossing of the layer sequence between the two devices costs: blocks of 8 layer-sized ops
+// alternate between them (5 crossings in 48 ops), against the same ops run on each device alone
 static double measure_split(ggml_backend_t ba, ggml_backend_t bb, int batch) {
-    constexpr int n_ops = 40;
-    constexpr int every = 4; // 10 excursions
+    constexpr int n_ops = 48;
+    constexpr int every = 8;
     const double t_a     = bench_sched_chain(ba, bb, n_ops, 0, batch, false);
     const double t_b     = bench_sched_chain(ba, bb, n_ops, 0, batch, true);
     const double t_mixed = bench_sched_chain(ba, bb, n_ops, every, batch, false);
     if (t_a < 0 || t_b < 0 || t_mixed < 0) {
         return 0;
     }
-    const int n_b = n_ops / every;
-    const double own = (n_ops - n_b) * (t_a / n_ops) + n_b * (t_b / n_ops);
-    return std::max(0.0, (t_mixed - own) / n_b);
+    const int n_cross = n_ops / every - 1;
+    const double own  = (n_ops / 2) * (t_a / n_ops) + (n_ops / 2) * (t_b / n_ops);
+    return std::max(0.0, (t_mixed - own) / n_cross);
 }
 
 static std::string pair_key(ggml_backend_dev_t src, ggml_backend_dev_t dst, int n_threads) {
