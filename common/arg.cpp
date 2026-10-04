@@ -2992,6 +2992,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
     add_opt(common_arg(
+        {"--anneal"},
+        "search placements by simulated annealing instead of solving them exactly (the solver needs the HiGHS build)",
+        [](common_params & params) {
+            params.fit_advisor_anneal = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_ADVISOR}));
+    add_opt(common_arg(
         {"--no-mtp"},
         "never choose MTP drafting (default: the search decides per allocation when the model has MTP layers, "
         "including the draft length)",

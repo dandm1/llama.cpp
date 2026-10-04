@@ -28,6 +28,7 @@ struct fit_advisor_search_options {
     // the costs changed but the starting point is known good); empty = the seed grid
     fit_advisor_allocation warm_start;
     bool has_warm_start = false;
+    bool anneal = false; // use the simulated-annealing search even when the exact solver was built in
     uint32_t max_slots  = 1;     // from the workload's concurrency
     int      anneal_iters = 20000;
     uint32_t seed       = 42;

@@ -144,6 +144,11 @@ double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_a
                                   int dev_idx, const std::vector<fit_advisor_cost_device> & devices, uint32_t batch, int home_idx = -1,
                                   const fit_advisor_workload * wl = nullptr);
 
+// microseconds to move the activation of a batch from one allocation device to another (DEV_CPU = -1), through the
+// scheduler: half a measured split round trip plus bandwidth for a larger activation
+double fit_advisor_hop_us(const fit_advisor_inventory & inv, const std::vector<fit_advisor_cost_device> & devices,
+                          const fit_advisor_pair_table & pairs, int from, int to, uint32_t batch);
+
 // the allocation device that takes an offloaded op of a layer whose home is home_idx at this batch: the home when it
 // wants it, else the first willing one; -1 when none does (the op runs on the CPU)
 int fit_advisor_offload_taker(const std::vector<fit_advisor_cost_device> & devices, uint32_t batch, int home_idx, const fit_advisor_workload * wl);

@@ -1,4 +1,5 @@
 #include "search.h"
+#include "solve.h"
 
 #include "ggml.h"
 
@@ -490,6 +491,47 @@ struct searcher {
 
 } // namespace
 
+// the result from a chosen allocation: the cost with the depth the scan picked, the drafting flag dropped when no
+// depth pays, the rate by depth kept for the report, the candidate that reproduces it
+static void finish_result(fit_advisor_search_result & best, const fit_advisor_allocation & alloc_in, const fit_advisor_workload & wl,
+                          const fit_advisor_projection & proj, const fit_advisor_inventory & inv, const fit_advisor_graph_profile & gp,
+                          const std::vector<fit_advisor_cost_device> & cost_devs, const fit_advisor_pair_table & pairs,
+                          const std::vector<std::string> & device_bufts, const fit_advisor_workload & wl_base, int n_probes, int accepted) {
+    const fit_advisor_allocation alloc = alloc_in;
+    best.ok    = true;
+    best.alloc = alloc;
+    best.wl    = wl;
+    best.proj  = proj;
+    best.cost  = fit_advisor_cost_estimate(inv, best.alloc, best.proj, gp, cost_devs, pairs, best.wl);
+    // the depth the cost model chose is part of what the candidate reproduces; a depth of 0 means drafting never
+    // paid on this allocation, which the emitted command then leaves off. the rates by depth stay for the report
+    best.alloc.mtp_draft_n = best.cost.mtp_draft_n;
+    best.wl.mtp_draft_n    = best.cost.mtp_draft_n;
+    if (best.alloc.draft_mtp && best.cost.mtp_draft_n == 0) {
+        const std::vector<double> by_depth = best.cost.mtp_depth_tok_s;
+        best.alloc.draft_mtp = false;
+        best.wl.use_mtp      = false;
+        best.cost = fit_advisor_cost_estimate(inv, best.alloc, best.proj, gp, cost_devs, pairs, best.wl);
+        best.cost.mtp_depth_tok_s = by_depth;
+    }
+    if (!best.alloc.draft_mtp && wl_base.use_mtp && inv.n_layer_nextn > 0 && best.cost.mtp_depth_tok_s.empty()) {
+        // drafting lost before the walk started: price it on the final allocation anyway so the report can show
+        // the rate at each depth (the KV figures of the no-MTP projection stand in for the draft context's)
+        fit_advisor_allocation a_mtp = best.alloc;
+        a_mtp.draft_mtp = true;
+        fit_advisor_workload wl_mtp = best.wl;
+        wl_mtp.use_mtp = true;
+        const fit_advisor_cost c_mtp = fit_advisor_cost_estimate(inv, a_mtp, best.proj, gp, cost_devs, pairs, wl_mtp);
+        if (c_mtp.ok) {
+            best.cost.mtp_depth_tok_s = c_mtp.mtp_depth_tok_s;
+        }
+    }
+    best.name  = alloc_name(best.alloc);
+    best.cand  = best.alloc.to_candidate(inv, device_bufts, best.name);
+    best.n_probes = n_probes;
+    best.n_anneal_accepted = accepted;
+}
+
 fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, fit_advisor_probe & probe,
                                              const std::vector<std::string> & device_bufts,
                                              const fit_advisor_graph_profile & gp,
@@ -565,6 +607,123 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
     for (uint32_t s = 1; s <= std::max<uint32_t>(1, opts.max_slots); s *= 2) {
         slot_options.push_back(s);
     }
+
+#ifdef FIT_ADVISOR_HIGHS
+    if (fit_advisor_solver_available() && !opts.anneal) {
+        // ---- exact placement: for every key (partition, ubatch, slots, drafting) one probe gives the memory the
+        // weights may take, one solve places every movable group and the draft block optimally for the modelled
+        // cost, the full cost model prices the solution, the best key wins. a solution that moved the draft block
+        // has a new key and is probed again; if the probe finds it over, the capacity comes down and it is re-solved
+        fit_advisor_allocation best_alloc;
+        fit_advisor_projection best_proj;
+        fit_advisor_workload   best_wl;
+        fit_advisor_cost       best_cost;
+        double best_score = 0;
+        bool   have_best  = false;
+        std::vector<bool> draft_options = { false };
+        if (S.mtp_searchable()) {
+            draft_options = { true, false };
+        }
+        int n_solves = 0;
+        for (const auto & part : partitions) {
+            for (const uint32_t ub : opts.ubatch_options) {
+                for (const uint32_t slots : slot_options) {
+                    for (const bool draft : draft_options) {
+                        fit_advisor_allocation base = fit_advisor_allocation::from_layer_split(inv, device_bufts, part, opts.n_ctx, slots);
+                        base.n_ubatch      = ub;
+                        base.draft_mtp     = draft;
+                        base.flash_attn    = opts.base_flash_attn;
+                        base.no_kv_offload = opts.base_no_kv_offload;
+                        base.op_offload_min_batch_dev = wl_base.op_offload_min_batch_dev;
+                        if (base.op_offload_min_batch_dev.empty() && wl_base.op_offload_min_batch > 0) {
+                            base.op_offload_min_batch_dev.assign(nd, wl_base.op_offload_min_batch);
+                        }
+                        const std::string name = cell_name(part, ub, slots) + (draft ? "-mtp" : "");
+                        const fit_advisor_projection * pj = &S.probe_alloc(base, name);
+                        best.n_cells++;
+                        if (!pj->ok) {
+                            LOG_INF("%s: key %-28s probe failed\n", __func__, name.c_str());
+                            continue;
+                        }
+                        fit_advisor_solve_input in;
+                        in.inv = &inv; in.gp = &gp; in.devices = &cost_devs; in.pairs = &pairs; in.device_bufts = &device_bufts;
+                        const fit_advisor_workload wl = S.workload(base);
+                        in.wl   = &wl;
+                        in.base = base;
+                        in.move_draft_block = draft;
+                        in.capacity.assign(nd, 0);
+                        for (size_t d = 0; d < nd && d < pj->devices.size(); d++) {
+                            const auto & pd = pj->devices[d];
+                            in.capacity[d] = pd.free - (int64_t) (pd.context + pd.compute + pd.scratch) - pd.margin - (int64_t) (64 * UNIT);
+                        }
+                        fit_advisor_solve_result sol;
+                        for (int round = 0; round < 3; round++) {
+                            sol = fit_advisor_solve_placement(in);
+                            n_solves++;
+                            if (!sol.ok) {
+                                break;
+                            }
+                            // every solution is checked by the loader's own projection; the draft block's move
+                            // changes the key, and a packed card can read a few MiB differently
+                            const fit_advisor_projection & pj2 = S.probe_alloc(sol.alloc, name);
+                            if (!pj2.ok) {
+                                sol.ok = false;
+                                sol.error = "probe of the solution failed";
+                                break;
+                            }
+                            bool over = false;
+                            for (size_t d = 0; d < nd && d < pj2.devices.size(); d++) {
+                                const int64_t deficit = pj2.devices[d].margin - pj2.devices[d].projected_free();
+                                if (deficit > 0) {
+                                    in.capacity[d] -= deficit + (int64_t) (32 * UNIT);
+                                    over = true;
+                                }
+                            }
+                            pj = &pj2;
+                            if (!over) {
+                                break;
+                            }
+                            if (round == 2) {
+                                sol.ok = false;
+                                sol.error = "the solution did not fit on probe after three rounds";
+                            }
+                        }
+                        if (!sol.ok) {
+                            LOG_INF("%s: key %-28s %s\n", __func__, name.c_str(), sol.error.c_str());
+                            continue;
+                        }
+                        const fit_advisor_workload wl_sol = S.workload(sol.alloc);
+                        const fit_advisor_cost cost = fit_advisor_cost_estimate(inv, sol.alloc, *pj, gp, cost_devs, pairs, wl_sol);
+                        if (!cost.ok) {
+                            continue;
+                        }
+                        const double score = S.score(cost, wl_sol);
+                        const bool better = !have_best || score < best_score;
+                        LOG_INF("%s: key %-28s gen %6.2f tok/s, pp %6.0f tok/s, request %7.2f s, %d groups, %s in %.1f s%s\n", __func__, name.c_str(),
+                            cost.gen_tokens_per_s, cost.prompt_tokens_per_s, cost.t_request_us * 1e-6, sol.n_groups,
+                            sol.optimal ? "optimal" : "feasible", sol.t_solve_s, better ? "  <- best" : "");
+                        if (better) {
+                            have_best  = true;
+                            best_score = score;
+                            best_alloc = sol.alloc;
+                            best_proj  = *pj;
+                            best_wl    = wl_sol;
+                            best_cost  = cost;
+                        }
+                    }
+                }
+            }
+        }
+        if (!have_best) {
+            LOG_WRN("%s: no key has a feasible placement\n", __func__);
+            best.n_probes = S.n_probes;
+            return best;
+        }
+        best.seed_request_us = best_cost.t_request_us;
+        finish_result(best, best_alloc, best_wl, best_proj, inv, gp, cost_devs, pairs, device_bufts, wl_base, S.n_probes, n_solves);
+        return best;
+    }
+#endif
 
     searcher::cell best_cell;
     std::vector<uint32_t> best_part;
@@ -1091,37 +1250,6 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         }
     }
 
-    best.ok    = true;
-    best.alloc = incumbent.alloc;
-    best.wl    = incumbent.wl;
-    best.proj  = incumbent_proj;
-    best.cost  = fit_advisor_cost_estimate(inv, best.alloc, best.proj, gp, cost_devs, pairs, best.wl);
-    // the depth the cost model chose is part of what the candidate reproduces; a depth of 0 means drafting never
-    // paid on this allocation, which the emitted command then leaves off. the rates by depth stay for the report
-    best.alloc.mtp_draft_n = best.cost.mtp_draft_n;
-    best.wl.mtp_draft_n    = best.cost.mtp_draft_n;
-    if (best.alloc.draft_mtp && best.cost.mtp_draft_n == 0) {
-        const std::vector<double> by_depth = best.cost.mtp_depth_tok_s;
-        best.alloc.draft_mtp = false;
-        best.wl.use_mtp      = false;
-        best.cost = fit_advisor_cost_estimate(inv, best.alloc, best.proj, gp, cost_devs, pairs, best.wl);
-        best.cost.mtp_depth_tok_s = by_depth;
-    }
-    if (!best.alloc.draft_mtp && wl_base.use_mtp && inv.n_layer_nextn > 0 && best.cost.mtp_depth_tok_s.empty()) {
-        // drafting lost before the walk started: price it on the final allocation anyway so the report can show
-        // the rate at each depth (the KV figures of the no-MTP projection stand in for the draft context's)
-        fit_advisor_allocation a_mtp = best.alloc;
-        a_mtp.draft_mtp = true;
-        fit_advisor_workload wl_mtp = best.wl;
-        wl_mtp.use_mtp = true;
-        const fit_advisor_cost c_mtp = fit_advisor_cost_estimate(inv, a_mtp, best.proj, gp, cost_devs, pairs, wl_mtp);
-        if (c_mtp.ok) {
-            best.cost.mtp_depth_tok_s = c_mtp.mtp_depth_tok_s;
-        }
-    }
-    best.name  = alloc_name(best.alloc);
-    best.cand  = best.alloc.to_candidate(inv, device_bufts, best.name);
-    best.n_probes = S.n_probes;
-    best.n_anneal_accepted = accepted;
+    finish_result(best, incumbent.alloc, incumbent.wl, incumbent_proj, inv, gp, cost_devs, pairs, device_bufts, wl_base, S.n_probes, accepted);
     return best;
 }

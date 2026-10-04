@@ -235,6 +235,7 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
     // every prompt token asks for logits: the reserve sizes the compute buffer and the scratch estimate for an
     // output matmul over the whole ubatch, so the validation has to exercise that path too
     LOG_INF("%s: prompt of %u tokens (%s) in batches of %u, logits for every token ...\n", __func__, n_prompt_tokens, prompt_source.c_str(), n_batch);
+    const int64_t t_prompt0 = ggml_time_us();
     for (uint32_t pos = 0; pos < n_prompt_tokens && decode_ok; pos += n_batch) {
         const uint32_t n = std::min(n_batch, n_prompt_tokens - pos);
         common_batch_clear(batch);
@@ -249,6 +250,11 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
         if (decode_ok && ((pos / n_batch) % 8 == 7 || pos + n >= n_prompt_tokens)) {
             LOG_INF("%s:   %u / %u tokens, %.1f s\n", __func__, pos + n, n_prompt_tokens, (ggml_time_us() - t1) * 1e-6);
         }
+    }
+
+    if (decode_ok) {
+        llama_synchronize(ctx);
+        vr.t_prompt_us = (double) (ggml_time_us() - t_prompt0);
     }
 
     for (uint32_t step = 0; step < vr.n_gen_steps && decode_ok; step++) {
@@ -290,6 +296,8 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
             llama_synchronize(c);
             return (double) (ggml_time_us() - t);
         };
+        // the best repetition after a warm-up: CPU-bound steps vary by up to a tenth between runs, and the choice
+        // between near-equal depths flipped with the median; the minimum is what the kernels cost without the noise
         auto median_after_warmup = [](std::vector<double> ts) -> double {
             if (ts.size() > 1) {
                 ts.erase(ts.begin());
@@ -297,8 +305,7 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
             if (ts.empty()) {
                 return 0;
             }
-            std::sort(ts.begin(), ts.end());
-            return ts[ts.size() / 2];
+            return *std::min_element(ts.begin(), ts.end());
         };
         constexpr int reps = 5;
         uint32_t d_max = ctx_mtp ? std::min<uint32_t>(8, std::max<uint32_t>(1, n_batch / n_slots) - 1) : 0;
@@ -450,6 +457,10 @@ void fit_advisor_validate_print(const fit_advisor_validate_result & vr) {
     }
     printf("\nvalidation by a real load: %u prompt tokens + %u generation steps, load %.1f s, run %.1f s\n",
         vr.n_prompt_tokens, vr.n_gen_steps, vr.t_load_s, vr.t_run_s);
+    if (vr.t_prompt_us > 0 && vr.n_prompt_tokens > 0) {
+        printf("prompt timed: %u tokens in %.2f s, %.0f tok/s (first pass, includes graph capture)\n",
+            vr.n_prompt_tokens, vr.t_prompt_us * 1e-6, vr.n_prompt_tokens / (vr.t_prompt_us * 1e-6));
+    }
     if (vr.t_step_plain_us > 0 && vr.t_draft_us <= 0) {
         printf("plain generation step timed: %.1f ms\n", vr.t_step_plain_us * 1e-3);
     }

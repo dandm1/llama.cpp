@@ -489,6 +489,7 @@ struct common_params {
     double  fit_advisor_expert_coverage = 0;   // llama-fit-advisor: share of experts a prompt ubatch touches, 0 = estimate
     bool    fit_advisor_pin_cpu_weights = false; // llama-fit-advisor: place CPU-resident weights in the pinned host buffer type
     bool    fit_advisor_mtp        = true;     // llama-fit-advisor: MTP drafting may be chosen when the model has MTP layers (--no-mtp)
+    bool    fit_advisor_anneal     = false;    // llama-fit-advisor: the simulated-annealing search instead of the exact solver
     double  fit_advisor_mtp_accept = 0.75;     // llama-fit-advisor: assumed acceptance probability per drafted MTP token (GLM-5.3 measured ~0.72)
     double  fit_advisor_mtp_decay  = 0.85;     // llama-fit-advisor: acceptance beyond the trained MTP depth is the base one times this factor
     bool    fit_advisor_validate = false;      // llama-fit-advisor: load the chosen allocation for real and measure what the projection missed

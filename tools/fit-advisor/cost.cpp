@@ -241,6 +241,26 @@ double tensor_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t
 
 } // namespace
 
+double fit_advisor_hop_us(const fit_advisor_inventory & inv, const std::vector<fit_advisor_cost_device> & devices,
+                          const fit_advisor_pair_table & pairs, int from, int to, uint32_t batch) {
+    const size_t a = from < 0 ? devices.size() - 1 : (size_t) from;
+    const size_t b = to   < 0 ? devices.size() - 1 : (size_t) to;
+    if (a == b || a >= pairs.size() || b >= pairs[a].size()) {
+        return 0;
+    }
+    const fit_advisor_pair_rate & r = pairs[a][b];
+    const double bytes = (double) batch * inv.n_embd * sizeof(float);
+    if (r.split_n_batch_pp > 0) {
+        // measured through the scheduler: half a round trip per hop, plus bandwidth for the larger activation
+        const bool pp = batch > 4;
+        const double split = pp ? r.split_us_bpp : r.split_us_b1;
+        const double extra = pp ? std::max(0.0, bytes - (double) r.split_bytes_bpp) : 0;
+        return 0.5 * split + (r.gb_s > 0 ? extra / (r.gb_s * 1e9) * 1e6 : 0);
+    }
+    const double launch = devices[b].meas ? devices[b].meas->launch_us : 0;
+    return r.latency_us + (r.gb_s > 0 ? bytes / (r.gb_s * 1e9) * 1e6 : 0) + launch;
+}
+
 double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
                                   int dev_idx, const std::vector<fit_advisor_cost_device> & devices, uint32_t batch, int home_idx,
                                   const fit_advisor_workload * wl) {
@@ -413,22 +433,7 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
         // boundaries: each device change along the layer sequence moves the activation (batch x n_embd f32),
         // and each group of tensors away from their layer moves it there and back
         auto hop_us = [&](int from, int to) -> double {
-            const size_t a = from < 0 ? devices.size() - 1 : (size_t) from;
-            const size_t b = to   < 0 ? devices.size() - 1 : (size_t) to;
-            if (a == b || a >= pairs.size() || b >= pairs[a].size()) {
-                return 0;
-            }
-            const fit_advisor_pair_rate & r = pairs[a][b];
-            const double bytes = (double) batch * inv.n_embd * sizeof(float);
-            if (r.split_n_batch_pp > 0) {
-                // measured through the scheduler: half a round trip per hop, plus bandwidth for the larger activation
-                const bool pp = batch > 4;
-                const double split = pp ? r.split_us_bpp : r.split_us_b1;
-                const double extra = pp ? std::max(0.0, bytes - (double) r.split_bytes_bpp) : 0;
-                return 0.5 * split + (r.gb_s > 0 ? extra / (r.gb_s * 1e9) * 1e6 : 0);
-            }
-            const double launch = devices[b].meas ? devices[b].meas->launch_us : 0;
-            return r.latency_us + (r.gb_s > 0 ? bytes / (r.gb_s * 1e9) * 1e6 : 0) + launch;
+            return fit_advisor_hop_us(inv, devices, pairs, from, to, batch);
         };
         int prev = alloc.layer_device(0, n_layer_all);
         for (uint32_t il = 1; il <= n_layer_all; il++) {

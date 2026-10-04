@@ -865,6 +865,7 @@ int llama_fit_advisor(int argc, char ** argv) {
         sopts.n_ctx = ctx;
     }
     sopts.max_slots    = wl.concurrency;
+    sopts.anneal       = params.fit_advisor_anneal;
     sopts.anneal_iters = params.fit_advisor_search_iters;
     sopts.base_flash_attn    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO ? -1 : params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ? 1 : 0;
     sopts.base_no_kv_offload = params.no_kv_offload;
@@ -906,6 +907,13 @@ int llama_fit_advisor(int argc, char ** argv) {
                     wl.expert_coverage = vr.expert_coverage;
                     changed = true;
                 }
+            }
+            if (vr.ok && vr.t_prompt_us > 0 && vr.n_prompt_tokens > 0 && sr.cost.prompt_tokens_per_s > 0) {
+                // the prompt pass was timed: reported against the model's prompt rate at the workload's ubatch. the
+                // validation prompt is a first pass with graph capture in it, so a modest shortfall is expected
+                const double measured = vr.n_prompt_tokens / (vr.t_prompt_us * 1e-6);
+                LOG_INF("%s: prompt timed at %.0f tok/s over %u tokens vs %.0f tok/s modelled (%+.0f%%)\n", __func__,
+                    measured, vr.n_prompt_tokens, sr.cost.prompt_tokens_per_s, 100.0 * (measured / sr.cost.prompt_tokens_per_s - 1.0));
             }
             if (vr.ok && vr.t_step_plain_us > 0) {
                 // the plain step was timed; what it costs beyond the model is attributed to the ops that run away from
