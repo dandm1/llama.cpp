@@ -528,8 +528,12 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             for (uint32_t k = 1; k <= depth; k++) {
                 p_all *= wl.mtp_accept_at(k);
             }
+            // the timed verification extras describe the validated partition's rows (how much of them streams from the
+            // CPU, where the odd-row dip bites); another partition is priced on the kernel curves alone and, if it
+            // wins, is validated in its own right by the next round
             const bool same_partition = wl.mtp_extra_partition.empty() || wl.mtp_extra_partition == alloc.layers_per_device;
-            const double extra = same_partition && depth > 0 && depth < wl.mtp_extra_by_depth_us.size() && wl.mtp_extra_by_depth_us[depth] != 0
+            const double extra = !same_partition ? 0.0
+                : depth > 0 && depth < wl.mtp_extra_by_depth_us.size() && wl.mtp_extra_by_depth_us[depth] != 0
                 ? wl.mtp_extra_by_depth_us[depth] : depth * wl.mtp_extra_per_depth_us;
             const double t_step = std::max(1.0, sw + sa + so + sb + depth * (c.t_mtp_draft_us + draft_extra) + extra
                                 + (depth > 0 ? (1.0 - p_all) * wl.mtp_rollback_us : 0.0));
