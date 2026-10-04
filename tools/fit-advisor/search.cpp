@@ -624,8 +624,23 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             double score = 0;
         };
         int n_solves = 0;
-        auto eval_key = [&](const std::vector<uint32_t> & part, uint32_t ub, uint32_t slots, bool draft) -> solved_key {
-            solved_key out;
+        const uint32_t n_layer_all = S.n_layer_all;
+
+        // ---- the memory model: a dozen probes up front instead of one or two per key. per ubatch and drafting choice
+        // three placements are probed: every tensor at home on the memory-proportional split (context per layer,
+        // compute of a card that runs layers, scratch), the same with every movable group on the CPU (the copies a
+        // card holds for offloaded weights at the prompt batch), and the fast-cards-only split with the empty cards
+        // holding expert groups (the compute of a card that is only a store). any placement's overheads follow
+        struct overhead_model {
+            bool ok = false;
+            std::vector<std::string> names;
+            std::vector<int64_t> free, margin, scratch, compute_layers, compute_copies, compute_store;
+            int64_t ctx_per_layer = 0;
+            int64_t host_ctx_per_layer = 0;
+            uint32_t n_ctx_train = 0;
+        };
+        std::map<std::pair<uint32_t, bool>, overhead_model> models;
+        auto base_alloc = [&](const std::vector<uint32_t> & part, uint32_t ub, uint32_t slots, bool draft) {
             fit_advisor_allocation base = fit_advisor_allocation::from_layer_split(inv, device_bufts, part, opts.n_ctx, slots);
             base.n_ubatch      = ub;
             base.draft_mtp     = draft;
@@ -635,68 +650,161 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             if (base.op_offload_min_batch_dev.empty() && wl_base.op_offload_min_batch > 0) {
                 base.op_offload_min_batch_dev.assign(nd, wl_base.op_offload_min_batch);
             }
-            const std::string name = cell_name(part, ub, slots) + (draft ? "-mtp" : "");
-            const fit_advisor_projection * pj = &S.probe_alloc(base, name);
-            best.n_cells++;
-            if (!pj->ok) {
-                LOG_INF("%s: key %-28s probe failed\n", __func__, name.c_str());
+            return base;
+        };
+        auto layers_on = [&](const fit_advisor_allocation & a, std::vector<uint32_t> & per, uint32_t & on_cpu) {
+            per.assign(nd, 0);
+            on_cpu = 0;
+            for (uint32_t il = 0; il < n_layer_all; il++) {
+                if (il >= inv.n_layer && !a.draft_mtp) continue; // MTP layers not loaded
+                const int d = a.layer_device(il, n_layer_all);
+                if (d >= 0 && (size_t) d < nd) per[d]++; else on_cpu++;
+            }
+        };
+        auto build_model = [&](uint32_t ub, bool draft) -> overhead_model {
+            overhead_model m;
+            const uint32_t slots = 1;
+            const std::vector<uint32_t> & part = partitions[0];
+            fit_advisor_allocation a1 = base_alloc(part, ub, slots, draft);
+            const fit_advisor_workload wl1 = S.workload(a1);
+            const fit_advisor_projection & p1 = S.probe_alloc(a1, cell_name(part, ub, slots) + (draft ? "-mtp" : "") + "-home");
+            if (!p1.ok) return m;
+            m.names.resize(nd); m.free.assign(nd, 0); m.margin.assign(nd, 0); m.scratch.assign(nd, 0);
+            m.compute_layers.assign(nd, 0); m.compute_copies.assign(nd, 0); m.compute_store.assign(nd, -1);
+            m.n_ctx_train = p1.n_ctx_train;
+            std::vector<uint32_t> per; uint32_t on_cpu;
+            layers_on(a1, per, on_cpu);
+            int64_t ctx_sum = 0; uint32_t layers_sum = 0;
+            for (size_t d = 0; d < nd && d < p1.devices.size(); d++) {
+                m.names[d] = p1.devices[d].name;
+                m.free[d] = p1.devices[d].free; m.margin[d] = p1.devices[d].margin;
+                m.scratch[d] = (int64_t) p1.devices[d].scratch;
+                m.compute_layers[d] = (int64_t) p1.devices[d].compute;
+                ctx_sum += (int64_t) p1.devices[d].context; layers_sum += per[d];
+            }
+            m.ctx_per_layer = layers_sum > 0 ? ctx_sum / layers_sum : 0;
+            m.host_ctx_per_layer = on_cpu > 0 ? (int64_t) p1.host.context / on_cpu : m.ctx_per_layer;
+            // every movable group on the CPU: the copies the cards hold for them
+            fit_advisor_allocation b1 = a1;
+            for (const auto & g : S.build_groups(wl1)) {
+                for (const size_t i : g.idx) b1.tensor_device[i] = fit_advisor_allocation::DEV_CPU;
+            }
+            const fit_advisor_projection & pb = S.probe_alloc(b1, cell_name(part, ub, slots) + (draft ? "-mtp" : "") + "-cpu");
+            if (pb.ok) {
+                for (size_t d = 0; d < nd && d < pb.devices.size(); d++) {
+                    m.compute_copies[d] = std::max<int64_t>(0, (int64_t) pb.devices[d].compute - m.compute_layers[d]);
+                    m.scratch[d] = std::max<int64_t>(m.scratch[d], (int64_t) pb.devices[d].scratch);
+                }
+            }
+            // a card without layers that holds expert stores: the fast-cards-only split, its empty cards filled
+            for (const auto & p2 : partitions) {
+                if (std::count(p2.begin(), p2.end(), 0u) == 0 || p2 == part) continue;
+                fit_advisor_allocation a2 = base_alloc(p2, ub, slots, draft);
+                std::vector<uint32_t> per2; uint32_t cpu2;
+                layers_on(a2, per2, cpu2);
+                std::vector<int64_t> room(nd, 0);
+                for (size_t d = 0; d < nd; d++) room[d] = per2[d] == 0 ? m.free[d] - m.margin[d] - (int64_t) (1024 * UNIT) : 0;
+                for (const auto & g : S.build_groups(S.workload(a2))) {
+                    if (inv.tensors[g.idx[0]].kind != FIT_ADVISOR_TENSOR_FFN_EXPS && nd > 1) continue;
+                    for (size_t d = 0; d < nd; d++) {
+                        if (per2[d] == 0 && room[d] >= (int64_t) g.bytes) {
+                            for (const size_t i : g.idx) a2.tensor_device[i] = (int) d;
+                            room[d] -= (int64_t) g.bytes;
+                            break;
+                        }
+                    }
+                }
+                const fit_advisor_projection & ps = S.probe_alloc(a2, cell_name(p2, ub, slots) + (draft ? "-mtp" : "") + "-store");
+                if (ps.ok) {
+                    for (size_t d = 0; d < nd && d < ps.devices.size(); d++) {
+                        if (per2[d] == 0) m.compute_store[d] = (int64_t) ps.devices[d].compute + (int64_t) ps.devices[d].scratch - m.scratch[d];
+                    }
+                }
+                break;
+            }
+            for (size_t d = 0; d < nd; d++) {
+                if (m.compute_store[d] < 0) m.compute_store[d] = *std::max_element(m.compute_layers.begin(), m.compute_layers.end());
+            }
+            m.ok = true;
+            return m;
+        };
+        auto model_for = [&](uint32_t ub, bool draft) -> const overhead_model & {
+            auto it = models.find({ ub, draft });
+            if (it == models.end()) {
+                it = models.emplace(std::make_pair(ub, draft), build_model(ub, draft)).first;
+            }
+            return it->second;
+        };
+        // the projection the memory model gives for an allocation: what the cost model and the capacities read
+        auto project = [&](const fit_advisor_allocation & a, const overhead_model & m) -> fit_advisor_projection {
+            fit_advisor_projection pj;
+            pj.ok = m.ok;
+            pj.n_ctx_train = m.n_ctx_train;
+            std::vector<uint32_t> per; uint32_t on_cpu;
+            layers_on(a, per, on_cpu);
+            std::vector<size_t> weights(nd, 0);
+            bool cpu_offload = false;
+            for (size_t i = 0; i < inv.tensors.size() && i < a.tensor_device.size(); i++) {
+                const auto & t = inv.tensors[i];
+                if (t.layer >= (int32_t) inv.n_layer && !a.draft_mtp) continue;
+                const int d = a.tensor_device[i];
+                if (d >= 0 && (size_t) d < nd) weights[d] += t.nbytes;
+                else if (t.layer >= 0 && a.layer_device((uint32_t) t.layer, n_layer_all) >= 0) cpu_offload = true;
+            }
+            pj.devices.resize(nd);
+            for (size_t d = 0; d < nd; d++) {
+                auto & pd = pj.devices[d];
+                pd.name    = m.names[d];
+                pd.free    = m.free[d];
+                pd.margin  = m.margin[d];
+                pd.model   = weights[d];
+                pd.context = (size_t) (m.ctx_per_layer * per[d]);
+                pd.compute = per[d] > 0 ? (size_t) (m.compute_layers[d] + (cpu_offload ? m.compute_copies[d] : 0))
+                                        : (weights[d] > 0 ? (size_t) m.compute_store[d] : 0);
+                pd.scratch = (size_t) m.scratch[d];
+            }
+            pj.host.context = (size_t) (m.host_ctx_per_layer * on_cpu);
+            return pj;
+        };
+        auto capacity_of = [&](const fit_advisor_projection & pj) {
+            std::vector<int64_t> cap(nd, 0);
+            for (size_t d = 0; d < nd && d < pj.devices.size(); d++) {
+                const auto & pd = pj.devices[d];
+                cap[d] = pd.free - (int64_t) (pd.context + pd.compute + pd.scratch) - pd.margin - (int64_t) (64 * UNIT);
+            }
+            return cap;
+        };
+
+        auto eval_key = [&](const std::vector<uint32_t> & part, uint32_t ub, uint32_t slots, bool draft, const std::vector<int64_t> * cap_override) -> solved_key {
+            solved_key out;
+            const overhead_model & m = model_for(ub, draft);
+            if (!m.ok) {
                 return out;
             }
+            fit_advisor_allocation base = base_alloc(part, ub, slots, draft);
+            const std::string name = cell_name(part, ub, slots) + (draft ? "-mtp" : "");
+            best.n_cells++;
             fit_advisor_solve_input in;
             in.inv = &inv; in.gp = &gp; in.devices = &cost_devs; in.pairs = &pairs; in.device_bufts = &device_bufts;
             const fit_advisor_workload wl = S.workload(base);
             in.wl   = &wl;
             in.base = base;
             in.move_draft_block = draft;
-            in.capacity.assign(nd, 0);
-            for (size_t d = 0; d < nd && d < pj->devices.size(); d++) {
-                const auto & pd = pj->devices[d];
-                in.capacity[d] = pd.free - (int64_t) (pd.context + pd.compute + pd.scratch) - pd.margin - (int64_t) (64 * UNIT);
-            }
-            fit_advisor_solve_result sol;
-            for (int round = 0; round < 3; round++) {
-                sol = fit_advisor_solve_placement(in);
-                n_solves++;
-                if (!sol.ok) {
-                    break;
-                }
-                // every solution is checked by the loader's own projection; the draft block's move changes the key,
-                // and a packed card can read a few MiB differently
-                const fit_advisor_projection & pj2 = S.probe_alloc(sol.alloc, name);
-                if (!pj2.ok) {
-                    sol.ok = false;
-                    sol.error = "probe of the solution failed";
-                    break;
-                }
-                bool over = false;
-                for (size_t d = 0; d < nd && d < pj2.devices.size(); d++) {
-                    const int64_t deficit = pj2.devices[d].margin - pj2.devices[d].projected_free();
-                    if (deficit > 0) {
-                        in.capacity[d] -= deficit + (int64_t) (32 * UNIT);
-                        over = true;
-                    }
-                }
-                pj = &pj2;
-                if (!over) {
-                    break;
-                }
-                if (round == 2) {
-                    sol.ok = false;
-                    sol.error = "the solution did not fit on probe after three rounds";
-                }
-            }
+            in.capacity = cap_override ? *cap_override : capacity_of(project(base, m));
+            fit_advisor_solve_result sol = fit_advisor_solve_placement(in);
+            n_solves++;
             if (!sol.ok) {
                 LOG_INF("%s: key %-28s %s\n", __func__, name.c_str(), sol.error.c_str());
                 return out;
             }
             out.wl   = S.workload(sol.alloc);
-            out.cost = fit_advisor_cost_estimate(inv, sol.alloc, *pj, gp, cost_devs, pairs, out.wl);
+            out.proj = project(sol.alloc, m);
+            out.cost = fit_advisor_cost_estimate(inv, sol.alloc, out.proj, gp, cost_devs, pairs, out.wl);
             if (!out.cost.ok) {
                 return out;
             }
             out.ok    = true;
             out.alloc = sol.alloc;
-            out.proj  = *pj;
             out.score = S.score(out.cost, out.wl);
             LOG_INF("%s: key %-28s gen %6.2f tok/s, pp %6.0f tok/s, request %7.2f s, %d groups, %s in %.1f s\n", __func__, name.c_str(),
                 out.cost.gen_tokens_per_s, out.cost.prompt_tokens_per_s, out.cost.t_request_us * 1e-6, sol.n_groups,
@@ -716,7 +824,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
             for (const uint32_t ub : opts.ubatch_options) {
                 for (const uint32_t slots : slot_options) {
                     for (const bool draft : draft_options) {
-                        solved_key r = eval_key(part, ub, slots, draft);
+                        solved_key r = eval_key(part, ub, slots, draft, nullptr);
                         if (r.ok && (!best_key.ok || r.score < best_key.score)) {
                             best_key = r; best_part = part; best_ub = ub; best_slots = slots; best_draft = draft;
                             LOG_INF("%s:   <- best so far\n", __func__);
@@ -745,7 +853,7 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
                         part[d + 1] = (uint32_t) ((int) part[d + 1] + shift);
                         if (std::find(partitions.begin(), partitions.end(), part) != partitions.end()) continue;
                         partitions.push_back(part); // never twice
-                        solved_key r = eval_key(part, best_ub, best_slots, best_draft);
+                        solved_key r = eval_key(part, best_ub, best_slots, best_draft, nullptr);
                         if (r.ok && r.score < best_key.score) {
                             best_key = r; best_part = part;
                             improved = true;
@@ -761,13 +869,21 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
         }
 
         // ---- polish: the solver optimised a linear proxy of the cost; a few passes of single-group moves under the
-        // full cost model, within the memory the probe allowed, take what the proxy could not see
+        // full cost model, within the memory the model allows, take what the proxy could not see
         {
+            const overhead_model & m = model_for(best_ub, best_draft);
             fit_advisor_allocation cur = best_key.alloc;
             fit_advisor_workload   wl  = best_key.wl;
             double cur_score = best_key.score;
             fit_advisor_cost cur_cost = best_key.cost;
+            fit_advisor_projection cur_proj = best_key.proj;
             const std::vector<searcher::group> groups = S.build_groups(wl);
+            auto fits = [&](const fit_advisor_projection & pj) {
+                for (size_t d = 0; d < nd && d < pj.devices.size(); d++) {
+                    if (pj.devices[d].projected_free() < pj.devices[d].margin + (int64_t) (64 * UNIT)) return false;
+                }
+                return true;
+            };
             int n_moves = 0;
             for (int pass = 0; pass < 3; pass++) {
                 bool any = false;
@@ -779,18 +895,13 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
                         for (const size_t i : g.idx) {
                             nxt.tensor_device[i] = to;
                         }
-                        std::vector<int64_t> over;
-                        if (!S.memory_over(nxt, wl, over)) continue;
-                        bool fits = true;
-                        for (size_t d = 0; d < over.size(); d++) {
-                            fits = fits && over[d] + (int64_t) (64 * UNIT) <= 0;
-                        }
-                        if (!fits) continue;
-                        const fit_advisor_cost c = fit_advisor_cost_estimate(inv, nxt, best_key.proj, gp, cost_devs, pairs, wl);
+                        const fit_advisor_projection pj = project(nxt, m);
+                        if (!fits(pj)) continue;
+                        const fit_advisor_cost c = fit_advisor_cost_estimate(inv, nxt, pj, gp, cost_devs, pairs, wl);
                         if (!c.ok) continue;
                         const double sc = S.score(c, wl);
                         if (sc < cur_score - 1.0) {
-                            cur = nxt; cur_score = sc; cur_cost = c; any = true; n_moves++;
+                            cur = nxt; cur_score = sc; cur_cost = c; cur_proj = pj; any = true; n_moves++;
                             break;
                         }
                     }
@@ -798,15 +909,43 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
                 if (!any) break;
             }
             if (n_moves > 0) {
-                // the polished allocation is probed like any other before it stands
-                const fit_advisor_projection & pj = S.probe_alloc(cur, alloc_name(cur));
-                if (pj.ok && pj.fits_all()) {
-                    LOG_INF("%s: polish moved %d groups under the full cost model: request %.2f -> %.2f s\n", __func__,
-                        n_moves, best_key.cost.t_request_us * 1e-6, cur_cost.t_request_us * 1e-6);
-                    best_key.alloc = cur; best_key.proj = pj; best_key.cost = cur_cost; best_key.score = cur_score;
-                } else {
-                    LOG_INF("%s: polish moved %d groups but the result does not fit on probe, keeping the solved one\n", __func__, n_moves);
+                LOG_INF("%s: polish moved %d groups under the full cost model: request %.2f -> %.2f s\n", __func__,
+                    n_moves, best_key.cost.t_request_us * 1e-6, cur_cost.t_request_us * 1e-6);
+                best_key.alloc = cur; best_key.proj = cur_proj; best_key.cost = cur_cost; best_key.score = cur_score;
+            }
+        }
+
+        // ---- the one real probe: the chosen allocation through the loader's own projection. if a card is over its
+        // margin the model missed something there; the key is re-solved with that card's capacity reduced by the
+        // shortfall, a few times at most
+        {
+            std::vector<int64_t> cap = capacity_of(project(base_alloc(best_part, best_ub, best_slots, best_draft), model_for(best_ub, best_draft)));
+            for (int round = 0; round < 4; round++) {
+                const fit_advisor_projection & pj = S.probe_alloc(best_key.alloc, alloc_name(best_key.alloc));
+                if (!pj.ok) {
+                    LOG_WRN("%s: the chosen allocation could not be probed\n", __func__);
+                    break;
                 }
+                bool over = false;
+                for (size_t d = 0; d < nd && d < pj.devices.size(); d++) {
+                    const int64_t deficit = pj.devices[d].margin - pj.devices[d].projected_free();
+                    if (deficit > 0) {
+                        cap[d] -= deficit + (int64_t) (32 * UNIT);
+                        over = true;
+                        LOG_INF("%s: %s is %.0f MiB over on probe, re-solving with less room there\n", __func__, pj.devices[d].name.c_str(), deficit / (1024.0 * 1024));
+                    }
+                }
+                if (!over) {
+                    best_key.proj = pj;
+                    best_key.cost = fit_advisor_cost_estimate(inv, best_key.alloc, pj, gp, cost_devs, pairs, best_key.wl);
+                    break;
+                }
+                solved_key r = eval_key(best_part, best_ub, best_slots, best_draft, &cap);
+                if (!r.ok) {
+                    LOG_WRN("%s: no placement fits the probed capacities, keeping the last one\n", __func__);
+                    break;
+                }
+                best_key = r;
             }
         }
 
