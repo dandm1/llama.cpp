@@ -88,6 +88,11 @@ struct fit_advisor_pair_rate {
     double split_us_bpp   = 0;
     size_t split_bytes_bpp = 0; // activation bytes moved in the prompt-sized measurement
     int    split_n_batch_pp = 0;
+    // cost of an excursion: one op of a chain on the source device whose weight sits on the destination, the chain
+    // continuing on the source; what a tensor placed away from its layer's device costs per step beyond its kernel.
+    // for a CPU destination that is the thread pool's wake and the synchronisation, not the link
+    double excursion_us_b1  = 0;
+    double excursion_us_bpp = 0;
 };
 
 struct fit_advisor_device_measurements {

@@ -797,7 +797,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
     }
     try {
         const json j = json::parse(f);
-        if (j.value("version", 0) != 7) {
+        if (j.value("version", 0) != 8) {
             LOG_WRN("%s: ignoring %s, unknown version\n", __func__, path.c_str());
             return false;
         }
@@ -811,6 +811,8 @@ bool fit_advisor_measurements::load(const std::string & path) {
                 pr.gb_s             = jp.value("gb_s", 0.0);
                 pr.split_us_b1      = jp.value("split_us_b1", 0.0);
                 pr.split_us_bpp     = jp.value("split_us_bpp", 0.0);
+                pr.excursion_us_b1  = jp.value("excursion_us_b1", 0.0);
+                pr.excursion_us_bpp = jp.value("excursion_us_bpp", 0.0);
                 pr.split_bytes_bpp  = jp.value("split_bytes_bpp", (size_t) 0);
                 pr.split_n_batch_pp = jp.value("split_n_batch_pp", 0);
                 pairs[key] = pr;
@@ -825,7 +827,7 @@ bool fit_advisor_measurements::load(const std::string & path) {
 
 std::string fit_advisor_measurements::to_json() const {
     json j;
-    j["version"] = 7;
+    j["version"] = 8;
     j["devices"] = json::object();
     for (const auto & [key, m] : devices) {
         j["devices"][key] = device_to_json(m);
@@ -835,6 +837,7 @@ std::string fit_advisor_measurements::to_json() const {
         j["pairs"][key] = {
             { "latency_us", r.latency_us }, { "gb_s", r.gb_s },
             { "split_us_b1", r.split_us_b1 }, { "split_us_bpp", r.split_us_bpp },
+            { "excursion_us_b1", r.excursion_us_b1 }, { "excursion_us_bpp", r.excursion_us_bpp },
             { "split_bytes_bpp", r.split_bytes_bpp }, { "split_n_batch_pp", r.split_n_batch_pp },
         };
     }
@@ -990,7 +993,8 @@ static double bench_sched_chain(ggml_backend_t ba, ggml_backend_t bb, int n_ops,
 
     std::vector<ggml_tensor *> w(n_ops);
     for (int i = 0; i < n_ops; i++) {
-        const bool on_b = all_on_b || (every > 0 && (i / every) % 2 == 1); // blocks of `every` ops alternate devices
+        // blocks of `every` ops alternate devices (every > 0), or every -every-th op alone sits on b (every < 0)
+        const bool on_b = all_on_b || (every > 0 && (i / every) % 2 == 1) || (every < 0 && i % (-every) == (-every) - 1);
         w[i] = ggml_new_tensor_2d(on_b ? ctx_b : ctx_a, GGML_TYPE_F16, k, k);
         ggml_format_name(w[i], "w%d", i);
     }
@@ -1083,6 +1087,22 @@ static double measure_split(ggml_backend_t ba, ggml_backend_t bb, int batch) {
     return std::max(0.0, (t_mixed - own) / n_cross);
 }
 
+// microseconds one excursion costs: every 8th op of a 48-op chain on the source has its weight on the destination
+// (6 excursions), against the ops run where they are without the excursions
+static double measure_excursion(ggml_backend_t ba, ggml_backend_t bb, int batch) {
+    constexpr int n_ops = 48;
+    constexpr int every = 8;
+    const double t_a     = bench_sched_chain(ba, bb, n_ops, 0, batch, false);
+    const double t_b     = bench_sched_chain(ba, bb, n_ops, 0, batch, true);
+    const double t_mixed = bench_sched_chain(ba, bb, n_ops, -every, batch, false);
+    if (t_a < 0 || t_b < 0 || t_mixed < 0) {
+        return 0;
+    }
+    const int n_b = n_ops / every;
+    const double own = (n_ops - n_b) * (t_a / n_ops) + n_b * (t_b / n_ops);
+    return std::max(0.0, (t_mixed - own) / n_b);
+}
+
 static std::string pair_key(ggml_backend_dev_t src, ggml_backend_dev_t dst, int n_threads) {
     const bool src_cpu = ggml_backend_dev_type(src) == GGML_BACKEND_DEVICE_TYPE_CPU;
     const bool dst_cpu = ggml_backend_dev_type(dst) == GGML_BACKEND_DEVICE_TYPE_CPU;
@@ -1122,12 +1142,14 @@ void fit_advisor_measurements::ensure_pairs(const std::vector<ggml_backend_dev_t
                 constexpr int n_batch_pp = 512;
                 r.split_us_b1      = measure_split(bsrc, bdst, 1);
                 r.split_us_bpp     = measure_split(bsrc, bdst, n_batch_pp);
+                r.excursion_us_b1  = measure_excursion(bsrc, bdst, 1);
+                r.excursion_us_bpp = measure_excursion(bsrc, bdst, n_batch_pp);
                 r.split_bytes_bpp  = (size_t) 256 * n_batch_pp * sizeof(float);
                 r.split_n_batch_pp = n_batch_pp;
             }
             if (have && !force) {
-                LOG_INF("%s: split %s -> %s -> %s: %.1f us at batch 1, %.1f us at batch %d\n", __func__,
-                    ggml_backend_dev_name(src), ggml_backend_dev_name(dst), ggml_backend_dev_name(src), r.split_us_b1, r.split_us_bpp, r.split_n_batch_pp);
+                LOG_INF("%s: split %s -> %s: crossing %.1f / %.1f us, excursion %.1f / %.1f us at batch 1 / %d\n", __func__,
+                    ggml_backend_dev_name(src), ggml_backend_dev_name(dst), r.split_us_b1, r.split_us_bpp, r.excursion_us_b1, r.excursion_us_bpp, r.split_n_batch_pp);
                 pairs[key] = r;
                 changed = true;
                 ggml_backend_free(bsrc);

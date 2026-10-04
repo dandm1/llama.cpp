@@ -261,6 +261,20 @@ double fit_advisor_hop_us(const fit_advisor_inventory & inv, const std::vector<f
     return r.latency_us + (r.gb_s > 0 ? bytes / (r.gb_s * 1e9) * 1e6 : 0) + launch;
 }
 
+double fit_advisor_excursion_us(const fit_advisor_inventory & inv, const std::vector<fit_advisor_cost_device> & devices,
+                                const fit_advisor_pair_table & pairs, int home, int dev, uint32_t batch) {
+    const size_t a = home < 0 ? devices.size() - 1 : (size_t) home;
+    const size_t b = dev  < 0 ? devices.size() - 1 : (size_t) dev;
+    if (a == b) {
+        return 0;
+    }
+    if (a < pairs.size() && b < pairs[a].size() && pairs[a][b].excursion_us_b1 > 0) {
+        const fit_advisor_pair_rate & r = pairs[a][b];
+        return batch > 4 && r.excursion_us_bpp > 0 ? r.excursion_us_bpp : r.excursion_us_b1;
+    }
+    return fit_advisor_hop_us(inv, devices, pairs, home, dev, batch) + fit_advisor_hop_us(inv, devices, pairs, dev, home, batch);
+}
+
 double fit_advisor_tensor_cost_us(const fit_advisor_inventory & inv, const fit_advisor_tensor & t, const fit_advisor_tensor_use & use,
                                   int dev_idx, const std::vector<fit_advisor_cost_device> & devices, uint32_t batch, int home_idx,
                                   const fit_advisor_workload * wl) {
@@ -477,8 +491,8 @@ fit_advisor_cost fit_advisor_cost_estimate(const fit_advisor_inventory & inv, co
             while (j + 1 < aways.size() && aways[j + 1].dev == aways[k].dev && aways[j + 1].node_idx <= aways[j].node_idx + 2) {
                 j++;
             }
-            // hop_us prices the round trip with the standard activation; add the op's own activation bytes over the link
-            boundary += hop_us(aways[k].home, aways[k].dev) + hop_us(aways[k].dev, aways[k].home) + wl.split_extra_us;
+            // the excursion as measured for the pair (or two hops), plus the op's own activation bytes over the link
+            boundary += fit_advisor_excursion_us(inv, devices, pairs, aways[k].home, aways[k].dev, batch) + wl.split_extra_us;
             n_splits_last++;
             const size_t a = aways[k].home < 0 ? devices.size() - 1 : (size_t) aways[k].home;
             const size_t b = aways[k].dev  < 0 ? devices.size() - 1 : (size_t) aways[k].dev;

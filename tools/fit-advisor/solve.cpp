@@ -136,12 +136,10 @@ fit_advisor_solve_result fit_advisor_solve_placement(const fit_advisor_solve_inp
         if (dev == home) {
             return 0;
         }
-        const double gen = fit_advisor_hop_us(inv, devices, *in.pairs, home, dev, batch_ver)
-                         + fit_advisor_hop_us(inv, devices, *in.pairs, dev, home, batch_ver) + wl.split_extra_us;
+        const double gen = fit_advisor_excursion_us(inv, devices, *in.pairs, home, dev, batch_ver) + wl.split_extra_us;
         double pp = 0;
         if (dev >= 0) {
-            pp = fit_advisor_hop_us(inv, devices, *in.pairs, home, dev, n_ub)
-               + fit_advisor_hop_us(inv, devices, *in.pairs, dev, home, n_ub) + wl.split_extra_us;
+            pp = fit_advisor_excursion_us(inv, devices, *in.pairs, home, dev, n_ub) + wl.split_extra_us;
         }
         return n_gen * gen + n_pp * pp;
     };
