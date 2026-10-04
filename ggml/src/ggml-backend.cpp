@@ -988,8 +988,10 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     // prefer the backend that already holds the op's activations: the weights are copied there once per
                     // batch either way, and the activations then need no copies at all. with several devices this keeps
-                    // the offloaded work of a layer on the layer's own device instead of piling it on the first one
-                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    // the offloaded work of a layer on the layer's own device instead of piling it on the first one.
+                    // GGML_SCHED_OFFLOAD_FIRST=1 restores the first willing backend, for comparison
+                    static const bool offload_first = getenv("GGML_SCHED_OFFLOAD_FIRST") != nullptr;
+                    for (int j = 0; j < GGML_MAX_SRC && !offload_first; j++) {
                         struct ggml_tensor * act = tensor->src[j];
                         if (act == NULL || act == src || (act->buffer != NULL && act->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
                             continue;
