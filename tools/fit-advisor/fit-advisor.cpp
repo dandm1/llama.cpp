@@ -971,6 +971,7 @@ int llama_fit_advisor(int argc, char ** argv) {
                             wl.mtp_draft_extra_by_dev_us[i] = draft_extra;
                         }
                         wl.mtp_extra_by_depth_us  = by_depth;
+                        wl.mtp_extra_partition    = sr.alloc.layers_per_device;
                         wl.mtp_extra_per_depth_us = std::max(0.0, extra);
                         wl.mtp_rollback_us        = vr.t_rollback_us;
                         changed = true;

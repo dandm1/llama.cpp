@@ -66,6 +66,8 @@ struct fit_advisor_workload {
                                          // sequence or an op away from its layer's device: what a timed plain step cost
                                          // beyond the kernels and transfers the model prices (validation). a real graph
                                          // loses far more to a split than the link's latency: a crossing measured ~1 ms
+    std::vector<uint32_t> mtp_extra_partition;  // the layer partition the per-depth extras were timed on: they hold
+                                                // for keys with that partition; other keys get the per-depth scalar
     std::vector<double> mtp_extra_by_depth_us; // [depth] -> the extra for that depth where it was timed, in place of
                                                // depth * mtp_extra_per_depth_us (the growth is not linear in the rows:
                                                // CPU kernels take an odd row count on a slower path)
