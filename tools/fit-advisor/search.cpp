@@ -617,7 +617,14 @@ fit_advisor_search_result fit_advisor_search(const fit_advisor_inventory & inv, 
                 for (size_t d = 0; d < nd && d < pj.devices.size(); d++) {
                     const int64_t deficit = pj.devices[d].margin - pj.devices[d].projected_free();
                     if (deficit > 0) {
-                        cap[d] -= deficit + (int64_t) (32 * UNIT);
+                        // the shortfall is in the overheads the model did not see, and the solution may have had slack
+                        // under its weight capacity; the capacity has to drop below what the solution placed there,
+                        // or the same solution comes back
+                        int64_t placed = 0;
+                        for (size_t i = 0; i < inv.tensors.size(); i++) {
+                            if (best_key.alloc.tensor_device[i] == (int) d) placed += (int64_t) inv.tensors[i].nbytes;
+                        }
+                        cap[d] = std::min(cap[d], placed) - deficit - (int64_t) (32 * UNIT);
                         over = true;
                         LOG_INF("%s: %s is %.0f MiB over on probe, re-solving with less room there\n", __func__, pj.devices[d].name.c_str(), deficit / (1024.0 * 1024));
                     }
