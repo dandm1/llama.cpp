@@ -140,6 +140,13 @@ bool common_integrity::inject(const std::string & name, std::string & error) {
             name.c_str(), e.device.c_str(), off);
         return true;
     }
-    error = "no tensor named " + name;
+    error = "no tensor named " + name + "; device tensors include";
+    int shown = 0;
+    for (const auto & e : entries) {
+        if (!e.host && e.bytes >= (size_t) 1024 * 1024 && shown < 4) {
+            error += std::string(shown ? ", " : " ") + ggml_get_name(e.tensor);
+            shown++;
+        }
+    }
     return false;
 }
