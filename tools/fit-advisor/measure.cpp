@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <random>
@@ -787,7 +788,7 @@ bool fit_advisor_device_measurements::has_attn(int head_size, int head_size_v, g
 }
 
 std::string fit_advisor_measurements::default_path() {
-    return fs_get_cache_directory() + "fit-advisor-measurements.json";
+    return (fs_get_cache_directory() / "fit-advisor-measurements.json").string();
 }
 
 bool fit_advisor_measurements::load(const std::string & path) {
@@ -845,7 +846,7 @@ std::string fit_advisor_measurements::to_json() const {
 }
 
 bool fit_advisor_measurements::save(const std::string & path) const {
-    fs_create_directory_with_parents(fs_get_cache_directory());
+    std::filesystem::create_directories(fs_get_cache_directory());
     std::ofstream f(path);
     if (!f.good()) {
         LOG_WRN("%s: cannot write %s\n", __func__, path.c_str());

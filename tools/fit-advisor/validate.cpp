@@ -229,7 +229,7 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
     };
 
     const int64_t t1 = ggml_time_us();
-    llama_batch batch = llama_batch_init((int32_t) n_batch, 0, (int32_t) n_slots);
+    common_batch batch(ctx); // entries may exceed n_batch, every decode below stays within it
     bool decode_ok = true;
 
     // every prompt token asks for logits: the reserve sizes the compute buffer and the scratch estimate for an
@@ -238,11 +238,11 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
     const int64_t t_prompt0 = ggml_time_us();
     for (uint32_t pos = 0; pos < n_prompt_tokens && decode_ok; pos += n_batch) {
         const uint32_t n = std::min(n_batch, n_prompt_tokens - pos);
-        common_batch_clear(batch);
+        batch.clear();
         for (uint32_t i = 0; i < n; i++) {
-            common_batch_add(batch, token_at(pos + i), (llama_pos) (pos + i), { 0 }, true);
+            batch.add(token_at(pos + i), (llama_pos) (pos + i), 0, true);
         }
-        const int ret = llama_decode(ctx, batch);
+        const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (ret != 0) {
             vr.error = "prompt decode failed with " + std::to_string(ret) + " at position " + std::to_string(pos);
             decode_ok = false;
@@ -258,12 +258,12 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
     }
 
     for (uint32_t step = 0; step < vr.n_gen_steps && decode_ok; step++) {
-        common_batch_clear(batch);
+        batch.clear();
         for (uint32_t s = 0; s < n_slots; s++) {
             const llama_pos pos = s == 0 ? (llama_pos) (n_prompt_tokens + step) : (llama_pos) step;
-            common_batch_add(batch, token_at(1000 + step * n_slots + s), pos, { (llama_seq_id) s }, true);
+            batch.add(token_at(1000 + step * n_slots + s), pos, (llama_seq_id) s, true);
         }
-        const int ret = llama_decode(ctx, batch);
+        const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (ret != 0) {
             vr.error = "generation decode failed with " + std::to_string(ret) + " at step " + std::to_string(step);
             decode_ok = false;
@@ -283,13 +283,13 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
         for (uint32_t s = 0; s < n_slots; s++) {
             pos_next[s] = s == 0 ? (llama_pos) (n_prompt_tokens + vr.n_gen_steps) : (llama_pos) vr.n_gen_steps;
         }
-        auto time_decode = [&](llama_context * c, llama_batch & b) -> double {
+        auto time_decode = [&](llama_context * c, common_batch & b) -> double {
             const int64_t t = ggml_time_us();
-            if (llama_decode(c, b) != 0) {
+            if (llama_process(c, LLAMA_PROCESS_TYPE_DECODE, b.get()) != 0) {
                 return -1;
             }
-            for (int32_t i = 0; i < b.n_tokens; i++) {
-                if (b.logits[i]) {
+            for (int32_t i = 0; i < b.size(); i++) {
+                if (b.tokens[i].output) {
                     llama_get_logits_ith(c, i); // the sampler reads every output row, which waits for the graph
                 }
             }
@@ -312,10 +312,10 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
         uint32_t token_seed = 3000;
         // a step of 1 + d rows on every slot, at the slots' next positions
         auto step_rows = [&](uint32_t d) -> double {
-            common_batch_clear(batch);
+            batch.clear();
             for (uint32_t s = 0; s < n_slots; s++) {
                 for (uint32_t k = 0; k <= d; k++) {
-                    common_batch_add(batch, token_at(token_seed++), pos_next[s] + (llama_pos) k, { (llama_seq_id) s }, true);
+                    batch.add(token_at(token_seed++), pos_next[s] + (llama_pos) k, (llama_seq_id) s, true);
                 }
             }
             const double t = time_decode(ctx, batch);
@@ -374,14 +374,14 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
         if (decode_ok && ctx_mtp) {
             // the draft context takes the token and the trunk's hidden row for it; the values do not matter to the kernels
             const int32_t n_embd = llama_model_n_embd(model);
-            llama_batch bd = llama_batch_init((int32_t) n_slots, n_embd, (int32_t) n_slots);
-            bd.token = (llama_token *) malloc(sizeof(llama_token) * n_slots);
-            std::fill(bd.embd, bd.embd + (size_t) n_slots * n_embd, 0.01f);
+            const std::vector<float> h_state((size_t) n_embd, 0.01f);
+            common_batch bd(ctx_mtp);
             std::vector<double> ts;
             for (int r = 0; r < reps + 1; r++) {
-                common_batch_clear(bd);
+                bd.clear();
                 for (uint32_t s = 0; s < n_slots; s++) {
-                    common_batch_add(bd, token_at(4000 + r * n_slots + s), (llama_pos) r, { (llama_seq_id) s }, true);
+                    const int32_t idx = bd.add(token_at(4000 + r * n_slots + s), (llama_pos) r, (llama_seq_id) s, true);
+                    bd.set_embd_state(idx, { h_state.data(), 1, (size_t) n_embd });
                 }
                 const double t = time_decode(ctx_mtp, bd);
                 if (t >= 0) {
@@ -389,9 +389,6 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
                 }
             }
             vr.t_draft_us = median_after_warmup(ts);
-            free(bd.token);
-            bd.token = nullptr;
-            llama_batch_free(bd);
         }
         if (ctx_mtp) {
             std::string by_depth;
@@ -436,7 +433,6 @@ fit_advisor_validate_result fit_advisor_validate(const common_params & params, c
         add_breakdown(ctx_mtp, false); // shares the weights
     }
 
-    llama_batch_free(batch);
     if (ctx_mtp) {
         llama_free(ctx_mtp);
     }
