@@ -1084,9 +1084,25 @@ private:
                 if (r.n_mismatch > 0) {
                     SRV_ERR("integrity: %zu of %zu tensors CHANGED since load (%.1f GiB checked in %.0f ms): %s\n",
                         r.n_mismatch, r.n_checked, r.bytes_checked / (1024.0*1024*1024), r.t_ms, r.mismatches[0].c_str());
-                } else {
-                    SRV_INF("integrity: ok, %zu tensors, %.1f GiB checked in %.0f ms\n",
-                        r.n_checked, r.bytes_checked / (1024.0*1024*1024), r.t_ms);
+                }
+                if (r.n_compute_fail > 0 || r.n_copy_fail > 0) {
+                    SRV_ERR("integrity: %zu device compute checks and %zu of %zu copy checks FAILED\n", r.n_compute_fail, r.n_copy_fail, r.n_copy);
+                }
+                if (r.n_mismatch == 0 && r.n_compute_fail == 0 && r.n_copy_fail == 0) {
+                    SRV_INF("integrity: ok, %zu tensors, %.1f GiB, %zu device computes, %zu copies checked in %.0f ms\n",
+                        r.n_checked, r.bytes_checked / (1024.0*1024*1024), integrity.devices.size(), r.n_copy, r.t_ms);
+                }
+                for (const auto & s : integrity.telemetry()) {
+                    // 0x20 sw thermal, 0x40 hw thermal, 0x04 sw power cap, 0x80 hw power brake
+                    const char * why = (s.throttle & 0x60) ? "THERMAL" : (s.throttle & 0x84) ? "power" : (s.throttle & ~0x1ull) ? "other" : "none";
+                    std::string mem = s.temp_mem >= 0 ? string_format(" mem %dC", s.temp_mem) : "";
+                    if ((s.throttle & 0x60) || s.replays_delta > 0) {
+                        SRV_WRN("integrity: %s %dC%s sm %d MHz mem %d MHz %.0f W throttle %s link gen%d x%d replays %lld (+%lld)\n",
+                            s.device.c_str(), s.temp_gpu, mem.c_str(), s.clk_sm, s.clk_mem, s.power_w, why, s.link_gen, s.link_width, s.replays, s.replays_delta);
+                    } else {
+                        SRV_INF("integrity: %s %dC%s sm %d MHz mem %d MHz %.0f W throttle %s link gen%d x%d replays %lld (+%lld)\n",
+                            s.device.c_str(), s.temp_gpu, mem.c_str(), s.clk_sm, s.clk_mem, s.power_w, why, s.link_gen, s.link_width, s.replays, s.replays_delta);
+                    }
                 }
             }
         });
