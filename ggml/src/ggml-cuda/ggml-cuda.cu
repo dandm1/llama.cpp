@@ -6042,7 +6042,7 @@ static size_t ggml_cuda_scratch_mul_mat(int device, const ggml_tensor * dst) {
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return ggml_cuda_scratch_cublas(cc, src0, src1, dst);
     }
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         return 0;
     }
     if (src0->ne[1] == 1 && ne11 > MMVF_MAX_BATCH_SIZE && dst->ne[2] == 1 && dst->ne[3] == 1 && src0->type == GGML_TYPE_F32) {
