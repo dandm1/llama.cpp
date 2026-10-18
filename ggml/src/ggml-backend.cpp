@@ -502,6 +502,64 @@ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, siz
     buf->iface.get_tensor(buf, tensor, data, offset, size);
 }
 
+uint64_t ggml_backend_hash_bytes(const void * data, size_t n, size_t pos) {
+    GGML_ASSERT(pos % 8 == 0);
+    const uint8_t * p = (const uint8_t *) data;
+    const size_t n_words = n / 8;
+    const uint64_t idx0 = pos / 8;
+    uint64_t acc = 0;
+    for (size_t i = 0; i < n_words; i++) {
+        uint64_t w;
+        memcpy(&w, p + i*8, 8); // the data is not necessarily aligned
+        acc ^= ggml_hash64_word(w, idx0 + i);
+    }
+    if (n % 8 != 0) {
+        uint64_t w = 0;
+        memcpy(&w, p + n_words*8, n % 8); // little-endian zero-extended tail, as the device kernel builds it
+        acc ^= ggml_hash64_word(w, idx0 + n_words);
+    }
+    return acc;
+}
+
+uint64_t ggml_backend_hash_final(uint64_t acc, size_t n_bytes) {
+    return ggml_hash64_final(acc, n_bytes);
+}
+
+uint64_t ggml_backend_tensor_hash(const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor);
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    GGML_ASSERT(buf != NULL && "tensor buffer not set");
+    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+
+    const size_t n = ggml_nbytes(tensor);
+
+    // the backend's own kernel, when it has one for this buffer
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buf->buft);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+    if (reg) {
+        auto fn = (ggml_backend_tensor_hash_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_tensor_hash");
+        uint64_t digest = 0;
+        if (fn && fn(tensor, &digest)) {
+            return digest;
+        }
+    }
+
+    if (ggml_backend_buffer_is_host(buf)) {
+        return ggml_hash64_final(ggml_backend_hash_bytes(tensor->data, n, 0), n);
+    }
+
+    // read to the host in pieces
+    const size_t chunk = std::min<size_t>(n, 64u*1024*1024);
+    std::vector<uint8_t> tmp(chunk);
+    uint64_t acc = 0;
+    for (size_t pos = 0; pos < n; pos += chunk) {
+        const size_t sz = std::min(chunk, n - pos);
+        ggml_backend_tensor_get(tensor, tmp.data(), pos, sz);
+        acc ^= ggml_backend_hash_bytes(tmp.data(), sz, pos);
+    }
+    return ggml_hash64_final(acc, n);
+}
+
 void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
             size_t n_copies, size_t stride_tensor, size_t stride_data) {
     GGML_ASSERT(tensor);

@@ -2816,6 +2816,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--integrity-check-interval"}, "SECONDS",
+        string_format("verify a checksum of every loaded weight tensor every N seconds and log an error when one changed (default: %d, 0 = off)", params.integrity_interval),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.integrity_interval = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_INTEGRITY_CHECK_INTERVAL"));
+    add_opt(common_arg(
+        {"--integrity-host-mib"}, "N",
+        string_format("host-resident weight bytes checked per integrity pass, in rotation (default: %zu, 0 = all every pass)", params.integrity_host_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.integrity_host_mib = (size_t) value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_INTEGRITY_HOST_MIB"));
+    add_opt(common_arg(
+        {"--integrity-inject"}, "TENSOR",
+        "test hook: flip one bit of this tensor after the baseline checksum, so the next integrity check must report it",
+        [](common_params & params, const std::string & value) {
+            params.integrity_inject = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

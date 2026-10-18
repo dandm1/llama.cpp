@@ -28,6 +28,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/hash.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -6276,6 +6277,31 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// digest of a tensor in a plain CUDA buffer, computed on its device (see ggml_backend_tensor_hash); split and host
+// buffers are left to the generic path
+static bool ggml_backend_cuda_tensor_hash(const ggml_tensor * tensor, uint64_t * digest) {
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (buf == nullptr || !ggml_backend_buffer_is_cuda(buf)) {
+        return false;
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buf->context;
+    const size_t n = ggml_nbytes(tensor);
+
+    ggml_cuda_set_device(ctx->device);
+    unsigned long long * d_acc = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_acc, sizeof(*d_acc)));
+    CUDA_CHECK(cudaMemsetAsync(d_acc, 0, sizeof(*d_acc), cudaStreamPerThread));
+    ggml_cuda_hash_bytes(tensor->data, n, d_acc, cudaStreamPerThread);
+    CUDA_CHECK(cudaGetLastError());
+    unsigned long long acc = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&acc, d_acc, sizeof(acc), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    CUDA_CHECK(cudaFree(d_acc));
+
+    *digest = ggml_hash64_final((uint64_t) acc, n);
+    return true;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6286,6 +6312,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_tensor_hash") == 0) {
+        return (void *)ggml_backend_cuda_tensor_hash;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

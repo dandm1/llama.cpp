@@ -28,6 +28,22 @@
 extern "C" {
 #endif
 
+// 64-bit digest of a byte range, used by ggml_backend_tensor_hash: every 8-byte word is mixed with its index and the
+// words are combined with xor, so the digest does not depend on the order or the grouping of the words. a device
+// kernel computing the same formula gives the same digest as the host (the CUDA kernel mirrors these three functions)
+static inline uint64_t ggml_hash64_mix(uint64_t x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+static inline uint64_t ggml_hash64_word(uint64_t word, uint64_t idx) {
+    return ggml_hash64_mix(word ^ ((idx + 1) * 0x9e3779b97f4a7c15ULL));
+}
+static inline uint64_t ggml_hash64_final(uint64_t acc, uint64_t n_bytes) {
+    return ggml_hash64_mix(acc ^ n_bytes);
+}
+
 void ggml_print_backtrace(void);
 
 uint64_t ggml_graph_next_uid(void);

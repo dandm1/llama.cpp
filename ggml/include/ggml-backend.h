@@ -97,6 +97,17 @@ extern "C" {
     GGML_API void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
     GGML_API void ggml_backend_tensor_memset(      struct ggml_tensor * tensor,     uint8_t value, size_t offset, size_t size);
 
+    // 64-bit digest of a tensor's bytes, computed on the device when the backend provides a hash (the backend reg
+    // proc "ggml_backend_tensor_hash", see ggml_backend_tensor_hash_t), otherwise read to the host in chunks.
+    // the same bytes give the same digest on every backend
+    GGML_API uint64_t ggml_backend_tensor_hash(const struct ggml_tensor * tensor);
+    // the building blocks, for callers that hash host memory in pieces (pos and n in bytes, pos a multiple of 8;
+    // n a multiple of 8 unless the piece ends the range): xor the pieces, then finalize with the total length
+    GGML_API uint64_t ggml_backend_hash_bytes(const void * data, size_t n, size_t pos);
+    GGML_API uint64_t ggml_backend_hash_final(uint64_t acc, size_t n_bytes);
+    // returns false when the tensor's buffer is not one the backend hashes itself
+    typedef bool (*ggml_backend_tensor_hash_t)(const struct ggml_tensor * tensor, uint64_t * digest);
+
     GGML_API void ggml_backend_synchronize(ggml_backend_t backend);
 
     GGML_API ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph);

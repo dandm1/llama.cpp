@@ -600,6 +600,9 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    int32_t     integrity_interval = 0;  // seconds between weight checksum verifications in the server, 0 = off
+    size_t      integrity_host_mib = 4096; // host-resident weight bytes checked per pass (rotating), 0 = all
+    std::string integrity_inject;        // test hook: flip a bit of this tensor after the baseline digest
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;

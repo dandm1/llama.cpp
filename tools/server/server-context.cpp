@@ -11,6 +11,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "integrity.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -19,7 +20,10 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <thread>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -1045,7 +1049,59 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // periodic weight checksums (--integrity-check-interval), on their own thread beside the decode loop
+    common_integrity  integrity;
+    std::thread       integrity_thread;
+    std::atomic<bool> integrity_stop{false};
+
+    void integrity_start() {
+        const int interval = params_base.integrity_interval;
+        if (interval <= 0) {
+            return;
+        }
+        const int n_threads = std::max(1, params_base.cpuparams.n_threads);
+        integrity.host_bytes_per_pass = params_base.integrity_host_mib * 1024 * 1024;
+        const double t_ms = integrity.init(model_tgt, n_threads);
+        SRV_INF("integrity: baseline of %zu tensors, %.1f GiB on devices + %.1f GiB on host, in %.0f ms; checking every %d s, host slice %zu MiB per pass\n",
+            integrity.entries.size(), integrity.bytes_device / (1024.0*1024*1024), integrity.bytes_host / (1024.0*1024*1024), t_ms,
+            interval, params_base.integrity_host_mib);
+        if (!params_base.integrity_inject.empty()) {
+            std::string err;
+            if (!integrity.inject(params_base.integrity_inject, err)) {
+                SRV_ERR("integrity: --integrity-inject failed: %s\n", err.c_str());
+            }
+        }
+        integrity_stop = false;
+        integrity_thread = std::thread([this, interval, n_threads]() {
+            while (!integrity_stop) {
+                for (int i = 0; i < interval * 10 && !integrity_stop; i++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if (integrity_stop) {
+                    break;
+                }
+                const auto r = integrity.verify(n_threads);
+                if (r.n_mismatch > 0) {
+                    SRV_ERR("integrity: %zu of %zu tensors CHANGED since load (%.1f GiB checked in %.0f ms): %s\n",
+                        r.n_mismatch, r.n_checked, r.bytes_checked / (1024.0*1024*1024), r.t_ms, r.mismatches[0].c_str());
+                } else {
+                    SRV_INF("integrity: ok, %zu tensors, %.1f GiB checked in %.0f ms\n",
+                        r.n_checked, r.bytes_checked / (1024.0*1024*1024), r.t_ms);
+                }
+            }
+        });
+    }
+
+    void integrity_stop_thread() {
+        integrity_stop = true;
+        if (integrity_thread.joinable()) {
+            integrity_thread.join();
+        }
+    }
+
     void destroy() {
+        integrity_stop_thread();
+
         spec.reset();
         spec_init.reset();
 
@@ -1237,6 +1293,8 @@ private:
             SRV_ERR("failed to init decision model: %s\n", e.what());
             return false;
         }
+
+        integrity_start();
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
